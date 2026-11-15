@@ -15,6 +15,9 @@ At startup (edge/policy/runtime.py from_env) this module:
 6. deletes each moved row from the source (secure_delete), so an interrupted run never duplicates a record;
 7. when nothing is left: renames the file to `decisions.sqlite.migrated-<UTC stamp>` (mode 0600).
 
+`purge_foreign_logs` (EO-07) keeps the 24 h retention on the per-kiosk logs of other kiosk ids, which this
+process never syncs, and reports what is still queued there (ALERT_ORPHANED_QUEUE).
+
 Anything it cannot move unambiguously (undecryptable / tampered rows, legacy tombstones whose seqs would clash
 with the per-kiosk chain, unknown kiosk or key) stays in the source file, which is then NOT archived, and the
 report carries an `error` for the operator. Never raises into startup: the caller gets a report.
@@ -34,6 +37,7 @@ from edge.offline.store import DecisionLog, SqliteFallbackState, compute_record_
 
 LEGACY_NAME = "decisions.sqlite"
 ARCHIVE_PREFIX = LEGACY_NAME + ".migrated-"
+LOG_PREFIX, LOG_SUFFIX = "decisions_", ".sqlite"  # per-kiosk logs: decisions_<KIOSK_ID>.sqlite
 _STAMP = "%Y%m%dT%H%M%SZ"
 
 
@@ -136,7 +140,7 @@ def _migrate(src: Path, data_dir: Path, data_key: str | bytes, log: DecisionLog,
                        for t in ("decision_log", "pending") if t in tables)
         target = log
         if has_rows:
-            others = sorted(p.name[len("decisions_"):-len(".sqlite")] for p in data_dir.glob("decisions_*.sqlite"))
+            others = sorted(p.name[len(LOG_PREFIX):-len(LOG_SUFFIX)] for p in data_dir.glob(f"{LOG_PREFIX}*{LOG_SUFFIX}"))
             kiosk = _identify_kiosk(db, cipher, [log.kiosk_id] + [k for k in others if k != log.kiosk_id])
             if kiosk is None:
                 rep["error"] = "UNKNOWN_KIOSK_OR_KEY: no known kiosk id / data key decrypts the legacy log; left in place"
@@ -225,4 +229,44 @@ def _merge_fallback(db: sqlite3.Connection, tables: set[str], fb: SqliteFallback
                 rep["fallback_rows"] += 1
 
 
-__all__ = ["ARCHIVE_PREFIX", "LEGACY_NAME", "migrate_legacy_log", "purge_old_archives"]
+def _foreign_kiosk(path: Path, active_kiosk: str) -> str | None:
+    name = path.name
+    if not (name.startswith(LOG_PREFIX) and name.endswith(LOG_SUFFIX)):
+        return None
+    kiosk = name[len(LOG_PREFIX):-len(LOG_SUFFIX)]
+    return kiosk if kiosk and kiosk != active_kiosk else None
+
+
+def purge_foreign_logs(data_dir: Path | str, data_key: str | bytes, active_kiosk: str, *, now: datetime,
+                       retention_hours: float = 24.0) -> list[dict[str, Any]]:
+    """EO-07: per-kiosk logs of OTHER kiosk ids (`decisions_<K>.sqlite`, e.g. after a KIOSK_ID switch or a legacy
+    migration) are never synced by this process. Apply the same SC2.5 24 h retention to them (unsynced rows
+    older than the window -> deleted + tombstone, real clock) and report what is still queued there, so the
+    caller raises ALERT_ORPHANED_QUEUE. Call at startup and on every tick. Never raises: a log that cannot be
+    opened is reported with an `error`. Returns one entry per foreign log that still holds anything."""
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    out: list[dict[str, Any]] = []
+    for path in sorted(Path(data_dir).glob(f"{LOG_PREFIX}*{LOG_SUFFIX}")):
+        kiosk = _foreign_kiosk(path, active_kiosk)
+        if kiosk is None:
+            continue
+        entry: dict[str, Any] = {"kiosk_id": kiosk, "file": path.name, "purged": 0, "queued": 0,
+                                 "tombstones": 0, "error": None}
+        try:
+            log = DecisionLog(path, data_key, kiosk, retention_hours=retention_hours)
+            try:
+                tomb = log.purge_expired(now)
+                entry["purged"] = int(tomb["count"]) if tomb else 0
+                entry["tombstones"] = len(log.tombstones())
+                entry["queued"] = log.queue_depth() - entry["tombstones"]
+            finally:
+                log.close()
+        except Exception as exc:  # noqa: BLE001 - one bad file must not stop the sweep (or startup)
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+        if entry["purged"] or entry["queued"] or entry["tombstones"] or entry["error"]:
+            out.append(entry)
+    return out
+
+
+__all__ = ["ARCHIVE_PREFIX", "LEGACY_NAME", "migrate_legacy_log", "purge_foreign_logs", "purge_old_archives"]

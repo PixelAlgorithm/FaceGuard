@@ -117,8 +117,9 @@ class FakeCloud:
         if not self.up:
             raise httpx.ConnectError("cloud down", request=request)
         if path != "/v1/health":
-            assert verify_request(request.method, path, request.content or b"", request.headers,
-                                  kiosk_key=TEST_KIOSK_KEY), "bad request signature"
+            # F5: the signed PATH includes "?query" (raw path on the wire); the bare path is no longer accepted
+            assert verify_request(request.method, request.url.raw_path.decode("ascii"), request.content or b"",
+                                  request.headers, kiosk_key=TEST_KIOSK_KEY), "bad request signature"
         if path == "/v1/health":
             return httpx.Response(200, json={"status": "ok"})
         if path == "/v1/revocations":

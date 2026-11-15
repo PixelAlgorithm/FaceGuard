@@ -36,10 +36,13 @@ def test_httpx_auth_signs_every_request():
     seen = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen["ok"] = verify_request(request.method, request.url.path, request.content, request.headers, kiosk_key=KEY)
+        seen["ok"] = verify_request(request.method, request.url.raw_path.decode(), request.content, request.headers,
+                                    kiosk_key=KEY)
+        seen["bare"] = verify_request(request.method, request.url.path, request.content, request.headers,
+                                      kiosk_key=KEY)
         return httpx.Response(200)
 
     with httpx.Client(base_url="https://c", transport=httpx.MockTransport(handler),
                       auth=KioskAuth("KIOSK_LIB_01", KEY, "api")) as c:
         c.post("/v1/sync?x=1", content=b"{}")
-    assert seen["ok"] is True
+    assert seen["ok"] is True and seen["bare"] is False  # F5: "?query" is part of the signed PATH

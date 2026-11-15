@@ -79,7 +79,8 @@ def test_X06_forced_offline_is_immediate_and_heartbeats_keep_running(make_rt, cl
     assert "OFFLINE_MODE" in rt.decide(attempt("att_x06"))["reason_codes"]
     n = len(cloud.calls)
     rt.heartbeat()
-    assert len(cloud.calls) == n + 1 and rt.monitor.successes >= 1  # probing continues underneath
+    # probing continues underneath; RBAC v2 D: the deny-only revocation feed is still pulled while forced
+    assert [c[1] for c in cloud.calls[n:]] == ["/v1/health", "/v1/revocations"] and rt.monitor.successes >= 1
 
 
 def test_X06_force_offline_env_at_startup(make_rt, cloud):
@@ -189,6 +190,9 @@ def test_X13_X14_demo_clock_trap_and_resign(make_rt, cloud, tmp_path):
     # X14: re-sign at demo now (07:50 IST) and install -> S01 result online
     b2 = load_example_bundle()
     b2["issued_at"], b2["expires_at"] = "2026-11-14T02:20:00Z", "2026-11-14T14:20:00Z"
+    # EO-09: an older issued_at at the SAME version is a rollback on reload too; scripts/sign_bundle.py bumps the
+    # version (installed + 1) by default, which is the documented X14 recovery
+    b2["bundle_version"] = int(b.get("bundle_version") or 0) + 1
     time.sleep(0.01)
     path.write_text(json.dumps(sign_bundle(b2, TEST_BUNDLE_KEY)), encoding="utf-8")
     rt.bundles._last_check = 0.0

@@ -40,7 +40,8 @@ def _verifies(c, value):
 
 
 def test_signs_and_restamps(tmp_path):
-    _r, b, _codes = run(tmp_path, "--now", "2026-11-14T04:30:00Z", "--extra-codes", "2", "--allow-doc-codes")
+    _r, b, _codes = run(tmp_path, "--now", "2026-11-14T04:30:00Z", "--extra-codes", "2", "--allow-doc-codes",
+                        "--demo-cards")
     assert verify_bundle(b, TEST_BUNDLE_KEY)
     body = {k: v for k, v in b.items() if k != "signature"}
     assert sign_fixture_bundle(body)["signature"]["value"] == b["signature"]["value"]  # independent check
@@ -55,7 +56,7 @@ def test_secrets_only_in_the_mode_600_codes_file(tmp_path):
     r, b, codes = run(tmp_path, "--extra-codes", "2", "--allow-doc-codes")
     text = codes.read_text(encoding="utf-8")
     assert stat.S_IMODE(os.stat(codes).st_mode) == 0o600
-    listed = re.findall(r"^\s+(OVR-\S+)\s+(s_guard\d+)\s+(\d{8})$", text, re.MULTILINE)
+    listed = re.findall(r"^\s+(OVR-\S+)\s+(s_guard\d+)\s+(\d{8}|\d{10})$", text, re.MULTILINE)
     assert {c[0] for c in listed} >= {"OVR-001", "OVR-002", "OVR-003"} and len(listed) == 5
     by_id = {c["code_id"]: c for c in b["override_codes"]["codes"]}
     for cid, _staff, code in listed:  # every listed code verifies against its PBKDF2 hash
@@ -80,7 +81,7 @@ def test_documented_codes_never_enter_a_signed_bundle_by_default(tmp_path):
     assert len(oc) >= 4 and not any(_verifies(c, v) for c in oc for v in DOC_VALUES)
     assert not {c["code_id"] for c in oc} & {"OVR-001", "OVR-002", "OVR-003"}
     text = codes.read_text(encoding="utf-8")
-    listed = re.findall(r"^\s+(OVR-\S+)\s+(s_guard\d+)\s+(\d{8})$", text, re.MULTILINE)
+    listed = re.findall(r"^\s+(OVR-\S+)\s+(s_guard\d+)\s+(\d{8}|\d{10})$", text, re.MULTILINE)
     by_id = {c["code_id"]: c for c in oc}
     assert {cid for cid, _s, _v in listed} == set(by_id)  # every bundle code is usable, nothing else listed
     for cid, staff, value in listed:

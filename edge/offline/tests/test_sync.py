@@ -81,7 +81,9 @@ def test_server_flags_are_surfaced(make_rt, cloud):
     cloud.flags = [{"attempt_id": "att_flagged", "type": "POST_HOC_REVOKED"}]
     rep = rt.sync_now()
     assert rep["flags"] == cloud.flags
-    assert rt.mode_status()["server_flags"][-1]["type"] == "POST_HOC_REVOKED"
+    # EO-13 / offline F6: the public mode_status carries counts only; the detail is authenticated (sync_detail)
+    assert rt.sync_detail()["server_flags"][-1]["type"] == "POST_HOC_REVOKED"
+    assert rt.mode_status()["server_flags_count"] >= 1
 
 
 def test_revocations_are_pulled_before_the_queue_is_replayed(make_rt, cloud):
