@@ -17,16 +17,29 @@ Goal: make every number on a slide traceable to a CSV row and a script, and stat
 (§5 below). The authoritative CSV column list is `eval/evallib/schema.py` (owned by `eval-metrics`).
 
 **Eval data path (D9, as built in `eval/capture.py`).** There is no `X-Eval-Label` header.
-1. Before each attempt, `capture.py` sets `POST /v1/admin/eval/context` (`X-Admin-Token` from `.env`, never
-   printed) with `{run_id, subject_id (pseudonymous), label, condition, split}`. `label` is the coarse edge
+0. **Credentials (RBAC, `eval/evallib/auth.py`).** `capture.py` and `snapshot_metrics.py` send
+   `Authorization: Bearer $FG_EVAL_API_KEY` (role `evaluator`) on the SSE feed, `GET /v1/metrics` and every
+   `/v1/admin/*` call; `scenarios/run_scenarios.py` uses `FG_OPS_API_KEY` (roles `security_officer` +
+   `evaluator`); its `--backend store` records D01/D02 as `NOT_RUN` without it. Mint a key once (shown once, never printed by the
+   tools): `edge/.venv/bin/python -m edge.auth create-api-key --name eval --role evaluator --expires-days 7
+   --print-key-only` (ops key: `--name ops --role security_officer --role evaluator`). In `capture.py`,
+   `snapshot_metrics.py` and `run_scenarios.py --backend api` a missing or refused credential (401/403) stops
+   the tool with exit code 5 (`EXIT_AUTH`), never a silent fallback. The legacy
+   `ADMIN_TOKEN` is used only with `FG_ALLOW_LEGACY_ADMIN_TOKEN=1` (and the edge's `AUTH_LEGACY_ADMIN_TOKEN=1`).
+   Credentials go only to a loopback edge, or to an https one with `--allow-remote-edge`. For the config
+   cross-check (`policy_version`, policy bars) `capture.py` reads `GET /v1/admin/mode/detail` (`store:read`):
+   the public `GET /v1/mode` is now only the badge subset. Full steps:
+   `eval/PROTOCOL.md` §5 pre-flight item 2.
+1. Before each attempt, `capture.py` sets `POST /v1/admin/eval/context` (`eval:admin`) with
+   `{run_id, subject_id (pseudonymous), label, condition, split}`. `label` is the coarse edge
    label (`bona_fide`, `print`, `screen_photo`, `video`, `mask_paper`, `mask_3d`, `injection`). The
    fine-grained `species` (§2.2) stays in the CSV, mapped by `eval/evallib/schema.py` `SPECIES_TO_LABEL`.
    After the row is written it clears the context (`DELETE /v1/admin/eval/context`).
-2. It consumes `GET /v1/events` (SSE, localhost-only, no token): **decision** events, followed through any
+2. It consumes `GET /v1/events` (SSE, `events:read`): **decision** events, followed through any
    step-up to a terminal decision, and the kiosk's **rendered** event. The `POST /v1/attempt/{id}/rendered`
    beacon gives the user-visible **face lock → rendered** latency, which is the slide number, shown next
    to the server's `latency_ms.total`. Fallback: `GET /v1/attempt/{id}`.
-3. **Rate limiter:** `capture.py` calls `POST /v1/admin/rate-limit/reset` **before every attempt** by default
+3. **Rate limiter:** `capture.py` calls `POST /v1/admin/rate-limit/reset` (`ratelimit:reset`) **before every attempt** by default
    (`--reset-rate-limit attempt`; `block` / `never` are options). Otherwise five consecutive attack DENYs
    would lock the kiosk (5 s now), and the next attempt would be decided by the limiter instead of the
    biometrics. Alternatively the eval profile sets `rate_limit.enabled: false`. Record which in
@@ -91,7 +104,7 @@ Say "iBeta Level 1-style". Never say certified or compliant.
 ### 2.1 Subjects and conditions
 - **8–12 consenting subjects** (team plus neighbouring teams). Aim for a spread of skin tones, glasses/no glasses, beard, hair covering. Record a coarse self-reported group only if the subject consents (for example `monk_bucket` light/medium/dark). Optional, never required.
 - **3 lighting conditions**: `office` (ambient overhead), `backlit` (window or lamp behind the subject), `dim` (lights partly off, < ~50 lux at the face).
-- Enrol every subject once (`kiosk/public/enroll.html`: consent checkbox, 5 frames at up to 1280 px, office lighting) **before** any test attempt. Enrolment frames are never used as probes. Erase with `DELETE /v1/enroll/{user_id}` after the event.
+- Enrol every subject once (`/register`, signed-in staff with `enrol:write`; `kiosk/public/enroll.html` only redirects there: consent checkbox, 5 frames at up to 1280 px, office lighting) **before** any test attempt. Enrolment frames are never used as probes. Erase with `DELETE /v1/enroll/{user_id}` after the event.
 
 ### 2.2 Attack species (PAI)
 Build each artefact from an enrolled subject's photo or video so that IAPMR can be measured. Keep each artefact under about $30.
@@ -202,7 +215,7 @@ the clock afterwards. Property P05 (schedule deny-type ⇒ DENY) and P04 hold.
 
 | What is shown | POLICY_TEST_CASES IDs | Live-run pass criterion |
 |---|---|---|
-| Connectivity detection, hysteresis, SYNCING | X01–X06 | Forced switch (`POST /v1/admin/mode {"force":"OFFLINE"}`) shows on the badge within one 2 s poll (`connectivity.status_poll_ms`). Natural detection (Wi-Fi off) = 3 consecutive misses (`misses_to_offline`) of `GET /v1/health` every `heartbeat_interval_s` 5 s with `heartbeat_timeout_ms` 2000 → about 12–17 s after the link drops. SYNCING uses OFFLINE rules. No crash. |
+| Connectivity detection, hysteresis, SYNCING | X01–X06 | Forced switch (`POST /v1/admin/mode {"force":"OFFLINE"}`, `mode:switch`; auto-reverts to AUTO after `max_minutes`, default 60) shows on the badge within one 2 s poll (`connectivity.status_poll_ms`). Natural detection (Wi-Fi off) = 3 consecutive misses (`misses_to_offline`) of `GET /v1/health` every `heartbeat_interval_s` 5 s with `heartbeat_timeout_ms` 2000 → about 12–17 s after the link drops. SYNCING uses OFFLINE rules. No crash. |
 | Cloud failure mid-attempt → that attempt OFFLINE (P7) | I07 | Never hangs, never ALLOWs by default. |
 | Strong pass, low/medium zone, fresh bundle → offline ALLOW | O01, O02 | `ACCESS_OK`, `OFFLINE_MODE`; stricter offline thresholds active. |
 | High-risk zone offline → STEP_UP, fallback | O03, O04, O05, O06, O07, O09 | `OFFLINE_HIGH_RISK_ZONE`, `OFFLINE_FALLBACK_REQUIRED`; never auto-ALLOW. |
@@ -210,7 +223,7 @@ the clock afterwards. Property P05 (schedule deny-type ⇒ DENY) and P04 hold.
 | Spoof offline → DENY (same as online) | O17, O27 | APCER offline is measured too. |
 | Expired bundle / stale templates | O19, O20, O21, O22, O23, O28 | STAFF_OVERRIDE only for allow paths; deny-type still DENY. |
 | Invalid bundle | O24, O25, O26 | A bad received bundle is rejected and the last valid bundle stays in force. No LVB → DENY `SCHEDULE_BUNDLE_INVALID` CONTACT_DESK. Clock rollback with an LVB → `SCHEDULE_BUNDLE_INVALID`, STAFF_OVERRIDE only. |
-| Fallback factors (TOTP replay, staff code single use + lockout, card) | O06, O08, O09, O10, O12, O29 | `FALLBACK_OK` / `FALLBACK_FAILED` as listed. |
+| Fallback factors (TOTP replay, staff code single use + lockout: 10-digit codes (legacy 8-digit accepted), 3 wrong per named `staff_id` → 300 s, device backstop 10 failures in 300 s → all overrides 300 s, locks survive a restart; card) | O06, O08, O09, O10, O12, O29 | `FALLBACK_OK` / `FALLBACK_FAILED` as listed. |
 | Minimum storage, encryption, 2 dp scores | D01, D02, D03 | Show decrypted record keys and the raw `sqlite3` file (no images, no embeddings, no plaintext IDs). |
 | Purge on ack, 24 h tombstone, hash chain | D04, D05, D06 | |
 | Reconnect: idempotent sync, conflicts, re-evaluation alerts, refresh | Y01–Y11 | Queue count → 0; replaying the same batch = no duplicates; revoked-while-offline user raises `ALERT_REVOKED_USER_ADMITTED`. |
@@ -389,7 +402,7 @@ The PAD DET curve uses the same `det_points` with genuine = bona fide `scores.pa
 
 **Before writing any chart code, invoke the `dataviz` skill** for palette, mark specs and stat-tile layout. Charts must work in light and dark mode on the projector.
 
-Data: `GET /v1/metrics` (aggregates from `metrics.json` + live attempts), `GET /v1/events` (SSE stream of decision + rendered events) and `GET /v1/mode` (badge, polled every 2 s). Poll metrics every 5 s.
+Data: `GET /v1/metrics` (`metrics:read`; aggregates from `metrics.json` + live attempts), `GET /v1/events` (`events:read`; SSE stream of decision + rendered events) and `GET /v1/mode` (public badge subset, polled every 2 s; the full status is `GET /v1/admin/mode/detail`, `store:read`). The dashboard sits behind the staff sign-in (`docs/API.md` §0.1). Poll metrics every 5 s.
 
 | Panel | Form | Content |
 |---|---|---|

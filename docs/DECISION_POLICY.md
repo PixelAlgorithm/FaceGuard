@@ -27,6 +27,12 @@ forced draw fires whatever the rate (§3.4); early cloud probe with
 `latency_budget_ms.rekognition_probe_deadline` 1500 ms and its identity-binding rule (§3.5); `STAFF_OVERRIDE`
 needs `staff_id`, revoked CARD hashes fail, an `ERASED` revocation deletes the user's local templates and
 TOTP secret (§7.2, §5.1).
+Audit fixes in the code (policy version unchanged, `2026-11-14.3`): a holiday on a window's start day also
+closes that window's part after midnight (F02, §5); live revocation slack (F03, §5); a held revocation still
+denies when the clock rolled back (F04, §9.5); persisted second-factor failure limits with a device backstop and
+the new code `FALLBACK_LOCKED` (§7.2, §9.6 R12); consumed / scoped / 10-digit override codes (§7.2); a lost
+revocation overlay never auto-ALLOWs (§7.2); offline overrides only on an allowlist of keys (§3); an
+identity switch on any embedded frame gives `MATCH_AMBIGUOUS` (§3.5). Known limits that stay open: §7.3.
 Scope: every decision the edge service (`edge/policy/`) returns, online and offline, plus the
 step-up resolution and the server-side re-evaluation of offline decisions.
 Companion files: `docs/SURPRISE_CHALLENGES.md` (rationale for SC1/SC2), `config/thresholds.yaml`
@@ -124,6 +130,19 @@ expires (§7.2, §9.4).
 
 All values live in `config/thresholds.yaml`; names in `code` are the YAML keys. "Online" is the base
 value; "Offline" is the value after deep-merging `offline.overrides`.
+
+**Offline overrides allowlist** (`edge/policy/thresholds.py` `OFFLINE_OVERRIDABLE`, audit F08). `offline.overrides`
+may set only these leaves; any other leaf is a `ConfigError` when the thresholds load
+(`_check_offline_scope`). Deny bars of device / moiré / depth / mask, step-up method sets, attempt counts,
+the rate limit and the fallback limits are therefore the same in both modes.
+
+| Leaves | Offline rule (checked at load) |
+|---|---|
+| `liveness.pad.pass_min`, `liveness.pad.min_pass_frames`, `liveness.flash.pass_min_r`, `match.local.allow_min_cosine`, `match.local.min_margin_top1_top2`, `challenge.random_rate` | offline value ≥ online value |
+| `liveness.pad.fail_max`, `liveness.flash.fail_max_r`, `match.local.deny_below_cosine` | offline value = online value |
+| `liveness.flash.enforce`, `liveness.moire.enforce`, `liveness.mask.m2_rgb_enforce` | may not be switched off offline while on online |
+| `liveness.flash.ambient_exception_enabled` | must be false offline |
+| `challenge.deformation_actions`, `challenge.secondary_actions` | **not overridable** offline (a narrower offline pool would weaken the randomness): any offline value is a `ConfigError` (`test_pf_thresholds.py::test_offline_cannot_narrow_the_challenge_action_pools`) |
 
 ### 3.1 Quality gate (per frame; a frame failing any check is dropped)
 
@@ -321,8 +340,15 @@ known RGB limit; depth M1 helps when the iPhone is present (depth is currently o
 
   Rekognition's own bands (table above) still apply: no UserMatches or top1 < 80 → `NOT_ENROLLED`
   (BIO_FAIL); 80 ≤ top1 < 99 → `MATCH_LOW`; runner-up ≥ 80 → `MATCH_AMBIGUOUS`.
-- **Identity consistency (both modes):** top1 on first and last usable frame must be the same user (local matcher,
-  `match.local.require_same_identity_first_last_frame`), else `MATCH_AMBIGUOUS`.
+- **Identity consistency (both modes; `edge/policy/identity.py` `local_summary`):** the embedded frames are the
+  usable frames that carry a local top-1 user and a finite top-1 cosine. The candidate is the top-1 user of the
+  first embedded frame; its top1 / top2 are the means over the embedded frames whose top-1 is the candidate.
+  With `match.local.require_same_identity_first_last_frame` true (shipped), the identity is **inconsistent** if
+  the last embedded frame's top-1 is a different user, **or any** embedded frame's top-1 is a different
+  enrolled user with cosine ≥ `match.local.deny_below_cosine` (0.30) (verify M01: a victim photo inside a
+  live-face burst). Inconsistent → `MATCH_AMBIGUOUS` (offline: UNSURE unless the result is already
+  `NOT_ENROLLED`; online: added to the Rekognition result). A different user below 0.30 on a middle frame,
+  or a frame without a match, does not break consistency (`edge/policy/tests/test_pf_identity.py`).
 - Rekognition runs in parallel with liveness and is time-boxed by `latency_budget_ms.rekognition_timeout`
   (700 ms, a hard total deadline; the sandbox is us-east-1, production would pin ap-south-1). Timeout,
   error or missing result → the whole attempt is OFFLINE (P7): offline thresholds, local matcher only,
@@ -420,6 +446,23 @@ user validity range or visitor pass not covering `t0`) → `ZONE_NOT_PERMITTED` 
 → `GRACE_WINDOW` (within `grace_minutes`=15 before a window start or after a window end;
 `grace_minutes_high_risk`=0) → `OUTSIDE_WINDOW`.
 
+- **Midnight-crossing windows and holidays (F02).** A window whose end is before its start belongs to the day
+  it starts on. A holiday on that start day closes the whole window, its part after midnight included: `t0`
+  inside that tail → `HOLIDAY` (not `OUTSIDE_WINDOW`), and the tail is never `IN_WINDOW` or a grace source.
+  A holiday on `t0`'s own date → `HOLIDAY` as before (it also closes the tail of the previous day's window).
+  The same window on a normal day still crosses midnight (`edge/policy/schedule.py` `_crossing_from`,
+  `test_pf_schedule.py`).
+- **Live revocation slack (F03).** For live edge decisions, a revocation the edge already holds counts when
+  its `revoked_at` ≤ `t0` + `revocation_slack_s`, with slack = `cache.clock_rollback_tolerance_s` (300 s)
+  (`edge/policy/engine.py` → `evaluate_schedule(..., revocation_slack_s=...)`; `PolicyRuntime._revocation_slack_s`,
+  also used for the gallery filter `entitled_user_ids`). An edge clock up to 300 s behind the cloud therefore
+  cannot ignore a revocation it has received. The slack only adds revocations. The cloud's re-evaluation at
+  sync keeps the strict default 0 (time-aware rule above, Y04).
+- **Clock rollback (F04).** When the cache is `INVALID` by clock rollback (LVB present), the schedule is not
+  evaluated, but a deny-only check still runs: **any** revocation the edge holds for the candidate (bundle
+  `revocations[]`, the user's `revoked` flag or the feed, whatever its `revoked_at`; `schedule.revoked_any`)
+  → `DENY` `SCHEDULE_REVOKED` + `SCHEDULE_BUNDLE_INVALID` + `OFFLINE_MODE`, CONTACT_DESK (§9.5 I4).
+
 Cache state of the LVB (computed in both modes; ONLINE requires `FRESH`, so `EXPIRED`/`INVALID` only
 reach the matrix offline): `FRESH` | `EXPIRED` (now > min(`expires_at`, `issued_at` +
 `cache.bundle_max_staleness_hours` 12 h)) | `INVALID` (**no LVB at all**, or the clock rolled back:
@@ -458,14 +501,14 @@ Required set (from the brief):
 | `INJECTION_VIRTUAL_CAMERA` | injection | virtual camera or frame-timing anomaly |
 | `CHALLENGE_FAILED` | step-up | challenge wrong/early/absent |
 | `MATCH_LOW` | identity | score in low-confidence (UNSURE) band |
-| `MATCH_AMBIGUOUS` | identity | margin too small, matcher disagreement, identity switch |
+| `MATCH_AMBIGUOUS` | identity | margin too small, matcher disagreement, identity switch (last embedded frame, or any embedded frame whose top-1 is another user at cosine ≥ 0.30, §3.5) |
 | `NOT_ENROLLED` | identity | no enrolled identity above deny threshold |
 | `SCHEDULE_OUTSIDE_WINDOW` | schedule | no window covers t0 (beyond grace) |
 | `SCHEDULE_GRACE_WINDOW` | schedule | within grace of a window |
 | `SCHEDULE_NO_ENTITLEMENT` | schedule | no active entitlement (unknown in bundle, expired validity, no visitor pass) |
 | `SCHEDULE_ZONE_NOT_PERMITTED` | schedule | role/user not permitted in this zone |
 | `SCHEDULE_HOLIDAY` | schedule | holiday/closure for this zone |
-| `SCHEDULE_REVOKED` | schedule | user revoked |
+| `SCHEDULE_REVOKED` | schedule | user revoked (time-aware with the live slack, §5; any held revocation on a rolled-back clock, §9.5 I4) |
 | `SCHEDULE_EXPIRED_CACHE` | mode | offline bundle beyond max staleness |
 | `OFFLINE_MODE` | mode | decision made offline (always present when mode=OFFLINE) |
 | `OFFLINE_HIGH_RISK_ZONE` | mode | high-risk zone while offline |
@@ -473,7 +516,8 @@ Required set (from the brief):
 | `FALLBACK_OK` | step-up | second factor / fallback verified |
 | `FALLBACK_FAILED` | step-up | second factor / fallback rejected |
 
-Added codes (allowed, closed list — no others):
+Added codes (allowed, closed list — no others; the required and added codes together are the 40 codes of
+`edge/policy/codes.py` `CODE_ORDER`):
 
 | Code | Stage | Why added |
 |---|---|---|
@@ -489,13 +533,15 @@ Added codes (allowed, closed list — no others):
 | `SCHEDULE_BUNDLE_INVALID` | mode | no last valid (verified) bundle at all, or clock rollback (now < LVB `issued_at` − 300 s) |
 | `RATE_LIMITED` | pre-check | ≥ `rate_limit.max_failures`=5 **attack-evidence** DENYs in `rate_limit.window_s`=180 s on this kiosk → `rate_limit.lockout_s`=5 s lockout (P11; operator 2026-11-14, was 60 s) |
 | `SYSTEM_ERROR` | any | exception / invalid input / unknown enum / log write failure → DENY (P1) |
+| `FALLBACK_LOCKED` | step-up | the submitted second-factor method is locked by its failure limit (§7.2); STEP_UP with `next_action.retry_after_s`, not counted as a factor failure (§9.6 R12) |
 
 **Ordering in `reason_codes`:** the order is `CODE_ORDER` in `edge/policy/codes.py`, which is
 `SYSTEM_ERROR` first, then stage order (pre-check, quality, injection, liveness hard, mask, liveness
 unsure [`LIVENESS_UNSURE`, `RANDOM_CHALLENGE`], identity, schedule, mode, step-up, final). Within the
 quality stage it follows the §3.1 order (`MULTIPLE_FACES`, `QUALITY_LOW_LIGHT`, `QUALITY_BLUR`,
 `QUALITY_POSE`, `QUALITY_DEPTH_INVALID`). The mode stage is ordered `SCHEDULE_EXPIRED_CACHE`,
-`SCHEDULE_BUNDLE_INVALID`, `OFFLINE_MODE`, `OFFLINE_HIGH_RISK_ZONE`, `OFFLINE_FALLBACK_REQUIRED`. Where
+`SCHEDULE_BUNDLE_INVALID`, `OFFLINE_MODE`, `OFFLINE_HIGH_RISK_ZONE`, `OFFLINE_FALLBACK_REQUIRED`; the step-up
+stage `CHALLENGE_FAILED`, `FALLBACK_OK`, `FALLBACK_FAILED`, `FALLBACK_LOCKED`. Where
 this differs from the row order of the tables above, `CODE_ORDER` wins. Tests compare **sets** (`docs/POLICY_TEST_CASES.md`), the UI shows the
 first code. The list above is closed: any other string in `reason_codes` is a bug (P02).
 
@@ -515,6 +561,8 @@ first code. The list above is closed: any other string in `reason_codes` is a bu
   `OFFLINE_MODE`; CONTACT_DESK; response `zone` = `"UNKNOWN"`; no schedule result.
 - `STEP_UP` after clock rollback with an LVB (I1b/I2b) → bio unsure codes + `SCHEDULE_BUNDLE_INVALID` +
   `OFFLINE_MODE` + `OFFLINE_FALLBACK_REQUIRED`; methods `[STAFF_OVERRIDE]`.
+- `DENY` for a held revocation after clock rollback (I4, F04) → bio unsure codes + `SCHEDULE_REVOKED` +
+  `SCHEDULE_BUNDLE_INVALID` + `OFFLINE_MODE`; CONTACT_DESK.
 - `DENY` from the rate limiter (A1) → `RATE_LIMITED` (+ `OFFLINE_MODE`) only.
 - `ALLOW` → `ACCESS_OK` (+ `FALLBACK_OK` if a SECOND_FACTOR step was passed) (+ `OFFLINE_MODE`).
   The step-up trigger codes move to `resolved_codes[]` (audit only). **Trigger codes** = the reason codes
@@ -523,6 +571,9 @@ first code. The list above is closed: any other string in `reason_codes` is a bu
   `[OFFLINE_HIGH_RISK_ZONE]`).
 - Step-up retry → `STEP_UP` with the original reason codes + `CHALLENGE_FAILED` or `FALLBACK_FAILED`
   (R6 / R8). The R11 cloud-verify re-issue keeps the codes of the last response unchanged and only drops `EMAIL_OTP`.
+- Step-up retry on a locked method (R12) → `STEP_UP` with the original reason codes +
+  `FALLBACK_LOCKED` (no `FALLBACK_FAILED`), `attempts_left` unchanged, `next_action.retry_after_s` = seconds
+  until the lock ends.
 - Step-up exhausted → `DENY` with `CHALLENGE_FAILED` or `FALLBACK_FAILED` (+ `OFFLINE_MODE`).
 
 ---
@@ -548,7 +599,8 @@ Field rules (the wire model is `docs/API.md` §1 `NextAction`, whose validator e
 - `methods`: non-null iff `SECOND_FACTOR` ∈ `steps` (§8.3).
 - `challenge`: non-null iff `type` = `CHALLENGE`: `{challenge_id, nonce, actions, step_window_ms,
   min_reaction_ms, expires_at}` (§7.1).
-- `retry_after_s`: `RATE_LIMITED` only. `hint`: `RECAPTURE` only, one of `move_closer`, `more_light`,
+- `retry_after_s`: `DENY` `RATE_LIMITED`, and `STEP_UP` `FALLBACK_LOCKED` (seconds until the lock ends,
+  ≥ 1; §7.2). `hint`: `RECAPTURE` only, one of `move_closer`, `more_light`,
   `hold_still`, `one_person`, `face_camera`.
 
 `attempts_left` = retries remaining **after** the currently requested submission
@@ -601,10 +653,10 @@ brief; the API enum stays `STEP_UP`.
 
 | Method | Online | Offline | Verification |
 |---|---|---|---|
-| `TOTP` | yes | yes | RFC 6238, SHA1, 6 digits, 30 s, ±1 step, per-user secret from enrolment, replay-protected (last used step per user) |
-| `CARD` | yes | yes (not high-risk) | simulated HID card / mobile credential ID; HMAC-SHA256(`CARD_ID_PEPPER`, card_id) == user `card_id_hash`, **and** the hash is not revoked (an LVB `revocations[]` item or a feed item with `type: CARD` and `target_id` = the hash → fails at once) |
+| `TOTP` | yes | yes | RFC 6238, SHA1, 6 digits, 30 s, ±1 step, per-user secret from enrolment, replay-protected (last used step per user); only if the user's verified bundle entry has `fallback.totp_enrolled`. Failure limit per candidate user (below) |
+| `CARD` | yes | yes (not high-risk) | simulated HID card / mobile credential ID; HMAC-SHA256(`CARD_ID_PEPPER`, card_id) == user `card_id_hash`, **and** the hash is not revoked (an LVB `revocations[]` item or a feed item with `type: CARD` and `target_id` = the hash → fails at once). Failure limit per candidate user (below) |
 | `EMAIL_OTP` | yes | no | SES via the cloud (`POST /v1/attempt/{id}/otp/send`, then `/fallback`), 6 digits, TTL 300 s; sent to the candidate's enrolled address (sandbox: the operator's verified address only). A wrong code is a failed submission (R8/R9). A cloud verify **timeout/error** is not attack evidence: the edge re-issues the same STEP_UP (HTTP 200) with `EMAIL_OTP` removed from `methods` for the rest of this step-up, `attempts_left` unchanged and no `FALLBACK_FAILED`; nothing is counted by the rate limiter (R11; the failure is recorded as a heartbeat miss). If the sandbox denies SES (`fallback.email_otp.enabled: false`), the method is simply not offered. |
-| `STAFF_OVERRIDE` | yes (not high-risk) | yes | `staff_id` required (a submission without it counts as a wrong code); one-time 8-digit code; PBKDF2-HMAC-SHA256(100 000 it., per-code salt) matches an unused code in the LVB **and** now < the code's `valid_until` (edge wall clock); marked consumed locally; 3 consecutive wrong codes → override locked 300 s (`fallback.staff_override.max_failures` / `lockout_s`, no hash check while locked) |
+| `STAFF_OVERRIDE` | yes (not high-risk) | yes | `staff_id` required (a submission without it can never match and counts only toward the device backstop); one-time code of `fallback.staff_override.code_length` = **10** digits (`legacy_code_lengths` [8] still accepted, for codes in bundles signed earlier); PBKDF2-HMAC-SHA256 (max(bundle `iterations`, `pbkdf2_iterations` 100 000), per-code salt) matches a code of **that** `staff_id` in the LVB that is not consumed locally, **not** listed in the signed bundle array `consumed_code_ids`, inside its optional signed scope, **and** now < the code's `valid_until` (edge wall clock); marked consumed locally. Failure limits per named staff member + device backstop (below) |
 
 A second factor must verify **for the candidate user** (top-1) — except `STAFF_OVERRIDE`, which
 verifies the staff member and is recorded with `staff_id` (for A3 there is no candidate at all:
@@ -620,6 +672,81 @@ replay (Y07).
 Override codes in a live bundle must never be the publicly documented test-fixture codes (`OVR-001`…`OVR-003`
 of `config/schedule.example.json`): `scripts/sign_bundle.py` drops them and the cloud's bundle upload rejects
 them. Live state 2026-11-14: the cloud-issued v45 still carries them (fix: v46+ with fresh codes, lead action).
+
+**Override code rules** (`edge/policy/fallback.py`):
+- **Consumed across kiosks** (SC2-D8): a code whose `code_id` is in the signed `consumed_code_ids` of the LVB
+  never matches. The cloud lists a code there after `/v1/sync` received a STAFF_OVERRIDE ALLOW with that
+  `code_id`. A code consumed locally never matches either.
+- **Optional per-code scope** (F09): a code entry may carry signed `zones` and / or `kiosk_ids` lists.
+  An attempt whose zone or kiosk id is not in a listed scope never matches that code (a malformed scope
+  never matches). A code without these keys is valid at every kiosk the bundle covers.
+- A code entry with a malformed salt never matches.
+
+**Second-factor failure limits** (`edge/policy/lockouts.py`, audit F05 / F06 / SC2-D9 / EO-12). The counters
+are persisted in the device-wide `fallback_state.sqlite` (`edge/offline/store.py` `SqliteFallbackState`,
+AES-GCM per row, keyed pseudonyms for user / staff / code ids) and run on **real UTC**, never the demo clock.
+An edge restart does not reset them. No code, hash or card check runs while a scope is locked.
+
+| Scope | Counts | Limit (`config/thresholds.yaml`) |
+|---|---|---|
+| `staff:<staff_id>` | a rejected STAFF_OVERRIDE whose `staff_id` is a staff member known to the LVB (`override_codes.codes[].staff_id`) | `fallback.staff_override.max_failures` 3 consecutive → `lockout_s` 300 s; a success or a served lock resets it |
+| `device:staff_override` (device backstop) | **every** rejected STAFF_OVERRIDE, unknown and missing staff ids included (those count only here) | `device_max_failures` 10 within `device_window_s` 300 s of the first → `device_lockout_s` 300 s: every override on this device is locked; a success never resets this window |
+| `totp:<user_id>` | a wrong or replayed TOTP code for the step-up candidate | `fallback.totp.max_failures` 5 consecutive → `lockout_s` 300 s |
+| `card:<user_id>` | a card that is not the candidate's, or a revoked card | `fallback.card.max_failures` 5 consecutive → `lockout_s` 300 s |
+
+- Not counted toward these limits: a method that was not offered (still R8), TOTP without enrolment or without
+  a cached secret, a card that cannot be verified (no pepper / no bundle), EMAIL_OTP.
+- A failure row that does not decrypt (tampered or written with another key) reads as **locked** (for one
+  lockout period from the first read, by the clamp below). A lock that
+  lies further ahead than its configured lockout (the real clock stepped backwards) is clamped to now +
+  lockout: still locked, never longer than configured.
+- A locked method gives `STEP_UP` + `FALLBACK_LOCKED` with `next_action.retry_after_s` (§9.6 R12). It is not
+  a factor failure: `attempts_left` is unchanged and nothing reaches the rate limiter.
+- The failure that starts a lock emits `ALERT_FALLBACK_LOCKOUT` with `lock` = `STAFF_OVERRIDE_STAFF` (subject =
+  the staff id), `STAFF_OVERRIDE_DEVICE` (no subject), `TOTP_USER` or `CARD_USER` (subject = the user id).
+- At start-up the runtime compares the state file's random `epoch` with the one the decision log recorded. A
+  different epoch (the file was deleted or replaced) emits `ALERT_FALLBACK_STATE_RESET`; consumed codes and
+  TOTP steps are always re-seeded from the decision log (`FALLBACK_STATE_RESEEDED` when something was
+  re-seeded without an epoch mismatch). Failure counters and locks are not re-seeded.
+- Both alerts are edge events (in memory), listed by `GET /v1/admin/alerts` (permission `audit:read`).
+
+**Lost revocation overlay** (EO-08). If the feed file `revocations.enc` was unreadable and quarantined, feed
+revocations may be missing (`revocations_state_lost`). Every would-be ALLOW then becomes `STEP_UP`
+`[SECOND_FACTOR]` with `OFFLINE_FALLBACK_REQUIRED` (+ `OFFLINE_MODE` offline; the code also appears online),
+methods `offline_default` / `online_default`. This runs before the random-challenge draw. STEP_UP and DENY
+are unchanged.
+
+### 7.3 Known limits (open, not fixed in code)
+
+- **Challenge evidence is client-asserted (F01, architectural).** The edge verifies blendshape peaks, timings,
+  landmark shift and `same_track` that the kiosk client measured and sent. It binds them to the issued
+  `challenge_id` / nonce / TTL and checks the last challenge frame's identity, but it does not measure the
+  deformation itself and does not run PAD / device / moiré on the challenge frames. A modified kiosk page or a
+  local process on the kiosk host can forge a passing challenge (`edge/policy/challenge.py` docstring). A
+  passed CHALLENGE is not server-verified liveness.
+- **Device backstop as a denial of service.** One anonymous person can lock every staff override on the
+  kiosk for 300 s with 10 wrong submissions, and again after each lock. Each lock raises
+  `ALERT_FALLBACK_LOCKOUT`. TOTP and CARD are not affected by this lock.
+- **Lockout rows are not tamper-proof against deletion.** A tampered row reads as locked, but someone with
+  write access to `fallback_state.sqlite` can delete a single failure row and so end that lock without an
+  alert. Deleting or replacing the whole file is detected (`ALERT_FALLBACK_STATE_RESET`), but its locks are
+  lost.
+- **DE-08 (depth M1).** `depth/checks.py` takes the M1 mouth residual as the maximum of the depth-surface
+  residual and a displacement computed from client-sent 2D landmarks, so forged landmarks can turn a rigid
+  mask from RIGID to DEFORMED. Not fixed: there is no depth calibration data yet to set a
+  depth-corroboration bound. Depth is currently disabled (§3.3), so this affects no shipped decision.
+- **PAD frames and identity frames are not tied (M01, medium).** The frames that pass PAD need not be the
+  frames that produced the match; the any-frame `MATCH_AMBIGUOUS` rule (§3.5) only catches a frame whose top-1
+  is a *different enrolled* user. Full fix = embed every PAD-live frame; its latency cost is not measured yet.
+- **Own-code rotation replaces old codes (DR2-04, RT2-10, RT2-11; deliberate).** `replace_existing` defaults to
+  true: old codes leave the cloud master at once, but an offline kiosk keeps them until its next bundle
+  refresh (a consumed code is still blocked fleet-wide via `consumed_code_ids`). There is no separate
+  codes/revoke route; replace codes by rotating.
+- **`ratelimit:reset` is held by `evaluator` (RT0-08, low).** Evaluator API keys can reset the attack-evidence
+  lockout with no `DEMO_MODE` or eval-context gate (bench and eval need it). Mint evaluator keys only for eval
+  runs, with a short expiry.
+- **Liveness exceptions (EM-M2, low).** PAD / texture exceptions are not caught inside the liveness branch;
+  `process_frames` turns them into DENY `SYSTEM_ERROR` (fail-secure, P1), so the attempt is lost, never allowed.
 
 ---
 
@@ -783,13 +910,15 @@ Always OFFLINE (an INVALID cache is never online-usable, MO3). Two cases:
 | I1b | PASS | LVB present, clock rolled back (now < `issued_at` − 300 s) | STEP_UP | `SCHEDULE_BUNDLE_INVALID`, +OM, +OFR | SF{stf} (`cache_untrusted`) |
 | I2b | UNSURE | LVB present, clock rolled back | STEP_UP | bio*, `SCHEDULE_BUNDLE_INVALID`, +OM, +OFR | CH? → SF{stf} |
 | I3 | FAIL | either | DENY | fail codes, +OM | as N12/N13 |
+| I4 | PASS or UNSURE | LVB present, clock rolled back, and the edge holds **any** revocation for the candidate (bundle, user flag or feed; any `revoked_at`) (F04) | DENY | (bio*), `SCHEDULE_REVOKED`, `SCHEDULE_BUNDLE_INVALID`, +OM | CONTACT_DESK |
 
 Without an LVB there is no zone, no risk (treated as high) and no verified override list, so a staff
 override could never verify: the honest answer is DENY + CONTACT_DESK. A bundle that fails verification
 while an LVB exists is simply rejected and the LVB stays in force — the attempt is evaluated normally
 (§5.1, O44). (If the template cache is also unavailable, identity is FAIL → `NOT_ENROLLED`.)
 `edge/policy/tests/test_matrix.py` tags I1b/I2b as `I1`/`I2` and the no-LVB rows via
-`test_no_last_valid_bundle_denies_contact_desk_r6`.
+`test_no_last_valid_bundle_denies_contact_desk_r6`. I4 is checked before I1b/I2b (`engine.combine`); test
+`test_pf_schedule.py::test_F04_clock_rollback_still_denies_a_revoked_candidate`.
 
 ### 9.6 Step-up resolution (all modes)
 
@@ -806,9 +935,12 @@ while an LVB exists is simply rejected and the LVB stays in force — the attemp
 | R9 | SECOND_FACTOR failed, no attempts left | DENY | `FALLBACK_FAILED` (+OM) | NONE |
 | R10 | step-up session expired (> `stepup.session_ttl_s` 120 s after the STEP_UP was issued, real clock; exactly 120 s is still open), or the pending challenge's own TTL passed | DENY | `CHALLENGE_FAILED` or `FALLBACK_FAILED` (the pending step) (+OM) | NONE |
 | R11 | EMAIL_OTP submitted, cloud verify times out / errors | STEP_UP | codes of the last response (unchanged) | SECOND_FACTOR, `methods` without `EMAIL_OTP` (for the rest of this step-up), attempts_left unchanged; heartbeat miss recorded |
+| R12 | SECOND_FACTOR with an offered method whose failure-limit scope is locked (§7.2; no code / hash check) | STEP_UP | original reason codes + `FALLBACK_LOCKED` | SECOND_FACTOR, attempts_left unchanged, `retry_after_s` = ceil(seconds until the lock ends), ≥ 1 |
 
 The step-up session keeps the mode it was opened in (P7). DENYs from R4, R5, R7, R9 and R10 are attack
-evidence and count toward A1 (P11); STEP_UP retries (R6, R8, R11) do not. R11 is handled before the
+evidence and count toward A1 (P11); STEP_UP retries (R6, R8, R11, R12) do not. R12 is not a factor failure.
+A user revocation received while the step-up was open turns its ALLOW into `DENY` `SCHEDULE_REVOKED`
+(+OM), CONTACT_DESK (any `revoked_at`, F11, `PolicyRuntime._revoked_before_allow`). R11 is handled before the
 policy is asked to verify anything (`edge/attempts.py` → `PolicyRuntime.drop_method`); if an EMAIL_OTP
 submission ever reached `resolve_fallback()` without a cloud verdict it would be an R8 failed
 submission (defence in depth, vector S48P).
@@ -973,10 +1105,18 @@ def _evaluate(signals, ctx, mode, now, cfg, retry_s, rng):
         return finish(DENY, bio_codes, NextAction("CONTACT_DESK" if bio_codes == ["NOT_ENROLLED"] else "NONE"))
     # 6. schedule (SC1) on the LVB, both modes; no cloud call
     sched = None
-    if lvb and cache != "INVALID":
-        sched = evaluate_schedule(ident.user_id, zone, signals.t0, lvb_with_revocation_feed(ctx), T.schedule)
+    merged = lvb_with_revocation_feed(ctx)
+    if lvb and cache != "INVALID":                            # F03: held revocations count up to t0 + slack
+        sched = evaluate_schedule(ident.user_id, zone, signals.t0, merged, T.schedule,
+                                  revocation_slack_s=T.cache.clock_rollback_tolerance_s)
+    elif lvb and revoked_any(merged, ident.user_id):          # F04: clock untrusted, deny-only check survives
+        sched = "REVOKED"
     # 7 + 8. mode restrictions + final decision (the matrix, §9)
     comb = combine(bio, bio_codes, causes, sched, cache, risk, mode, T, lvb=lvb is not None)
+    if comb.decision == ALLOW and ctx.revocations_incomplete:  # EO-08: lost feed overlay -> second factor
+        off = mode == "OFFLINE"
+        comb = Combined(STEP_UP, (["OFFLINE_MODE"] if off else []) + ["OFFLINE_FALLBACK_REQUIRED"], ["SECOND_FACTOR"],
+                        methods(T, "offline_default" if off else "online_default"))
     # 8b. random challenge: only a would-be ALLOW, exactly one draw (P12); rng None = OFF;
     #     rng.forced = FORCE / FORCE_NEXT demo control (fires whatever the rate)
     if comb.decision == ALLOW and rng.rng is not None and (rng.random() < T.challenge.random_rate or rng.forced):
@@ -1013,6 +1153,8 @@ def combine(bio, bio_codes, causes, sched, cache, risk, mode, T, *, lvb=True) ->
     om = ["OFFLINE_MODE"] if off else []
     if not lvb:                                               # I1a / I2a: nothing verified to trust
         return Combined(DENY, bio_codes + ["SCHEDULE_BUNDLE_INVALID"] + om, [], None)        # CONTACT_DESK
+    if off and cache == "INVALID" and sched == "REVOKED":     # I4 (F04): held revocation, clock rolled back
+        return Combined(DENY, bio_codes + ["SCHEDULE_REVOKED", "SCHEDULE_BUNDLE_INVALID"] + om, [], None)
     if off and cache == "INVALID":                            # I1b / I2b: LVB present, clock rolled back
         steps = (["CHALLENGE"] if "LIVENESS" in causes else []) + ["SECOND_FACTOR"]
         return Combined(STEP_UP, bio_codes + ["SCHEDULE_BUNDLE_INVALID"] + om + ["OFFLINE_FALLBACK_REQUIRED"],
@@ -1064,7 +1206,12 @@ def resolve_challenge(s, evidence, now_real, cfg, new_challenge_fn, wall_now):
 
 def resolve_fallback(s, sub, now_real, cfg, verifier, wall_now):
     if now_real > s.expires_at: return deny(s, ["FALLBACK_FAILED"])                           # R10
-    ok = sub.method in s.methods and verifier.verify(sub, s.candidate_user_id, s.mode, now_real, wall_now).ok
+    res = verifier.verify(sub, s.candidate_user_id, s.mode, now_real, wall_now, zone=s.zone, kiosk_id=s.kiosk_id) \
+        if sub.method in s.methods else None
+    if res is not None and not res.ok and res.locked_until is not None:   # R12: locked, nothing checked or counted
+        return retry(s, extra="FALLBACK_LOCKED", retry_after_s=max(1, ceil(res.locked_until - now_real)))
+    ok = res is not None and res.ok
+    # failure limits (§7.2) are counted inside verifier.verify on real UTC and persisted
     # TOTP/CARD/EMAIL_OTP bind to the candidate; STAFF_OVERRIDE binds to staff_id, needs wall_now < valid_until
     # and an unused code of the LVB, then consumes it. (EMAIL_OTP with the cloud verify unreachable never gets
     # here: the HTTP layer re-issues the STEP_UP without EMAIL_OTP via runtime.drop_method, R11.)

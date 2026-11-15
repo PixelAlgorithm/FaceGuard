@@ -3,7 +3,8 @@
 Consistent with `CLAUDE.md` §3 (decided architecture) and the lead decisions D1–D18 of 14 Nov 2026.
 Requirements: `docs/PROBLEM.md`. Decision rules and thresholds: `docs/DECISION_POLICY.md` +
 `config/thresholds.yaml` (**every number below that is a threshold is quoted from that YAML; if they
-differ, the YAML wins**). Endpoint contracts: `docs/API.md` v1.4 (+ `docs/contracts/admin_access.examples.json`). SC1/SC2 rationale:
+differ, the YAML wins**). Endpoint contracts: `docs/API.md` v1.4 (+ `docs/contracts/admin_access.examples.json`); authentication
+and roles: `docs/API.md` §0.1 (RBAC, v1.5) and §2.1 below. SC1/SC2 rationale:
 `docs/SURPRISE_CHALLENGES.md`. Test vectors: `docs/POLICY_TEST_CASES.md`.
 
 Depth comes from our own free SwiftUI app **DepthProbe** (`depth/ios/`) on the iPhone 16 Pro Max, which
@@ -47,7 +48,7 @@ iPhone, AWS login and credentials.
 | # | Component | Runs on | Tech | Responsibility | Works offline? | Owner |
 |---|---|---|---|---|---|---|
 | C1 | **Kiosk UI** | Kiosk browser (fullscreen Chromium) | React + Vite + TS + Tailwind; MediaPipe Face Landmarker (VIDEO mode, blendshapes + pose matrix on) | Camera capture, face lock, quality gate, colour-flash rendering (exactly 3 colours × ~233 ms), 5 frames over `liveness.flash.duration_ms` (700 ms) at up to 1280 px, virtual-camera check, challenge prompts, fallback entry (TOTP/staff/card/email OTP), decision screen (ALLOW / **REQUEST VERIFICATION** with subtitle "step-up" / DENY; API enum stays `STEP_UP`, D13) with reason text, ONLINE/OFFLINE badge (polls `GET /v1/mode` every 2 s), **DEMO CLOCK** badge when the demo clock is active, fire-and-forget early cloud probe (`POST /v1/attempt/{id}/probe` with the face-lock frame, never delays the capture), `POST /v1/attempt/{id}/rendered` beacon after the decision is painted. Code: `kiosk/src/kiosk/` (controller state machine, screens), `kiosk/src/capture/` (camera, MediaPipe, quality, flash, challenge trackers), `kiosk/src/api/` | Yes. Vite serves it on `http://localhost:5173` (IPv6 `[::1]` only, so `127.0.0.1:5173` refuses) with the MediaPipe WASM and model bundled locally | kiosk-frontend |
-| C2 | **Control Panel (Admin/Metrics Dashboard) + Register page** | Same React app: `/admin` (or `#/admin`) = Control Panel, `/register` = registration page, `/operator` = operator view | React | **Users & Access** (`kiosk/src/admin/panels/UsersAccessPanel.tsx`, `AccessEditor.tsx`, `StaffCodesPanel.tsx`; client `kiosk/src/api/access.ts`) over the edge access routes of `API.md` §3.18, all `X-Admin-Token`: `GET /v1/admin/access/users` (list; read-only from the installed bundle when OFFLINE), `PUT /v1/admin/access/users/{user_id}` (create / edit role, zones, extra hours, validity; re-admit an ERASED user; Restore), `POST /v1/admin/access/users/{user_id}/revoke`, `POST /v1/admin/access/codes/rotate` (staff override codes, shown once) and `POST /v1/admin/bundle/refresh`; the edge proxies them to the cloud master (`API.md` §4.9a) and installs the re-signed bundle in the same call. **Registration = PUT-then-enrol** (R-A; `kiosk/src/operator/RegisterApp.tsx`, `kiosk/src/shared/registerFlow.ts`, and the Control Panel enrol card `EnrolPanel.tsx`): (1) ONLINE check for people not yet in the schedule; (2) `PUT /v1/admin/access/users/{user_id}` `{display, role, consent: true}`, proceed only when `bundle.applied` and `user.in_bundle` are true (else `POST /v1/admin/bundle/refresh`, up to 3 tries 1 s apart); (3) `POST /v1/enroll` (consent + DPDP notice, 5 frames at up to 1280 px; also the stand-alone `kiosk/public/enroll.html`). `GET /v1/admin/users` lists local enrolments; `DELETE /v1/enroll/{user_id}` erases (cloud `deleted` / `queued` / `not_configured` / `failed`). Also live metrics (p50/p95, decisions per reason, per attack species), demo controls (`/v1/admin/mode`, `/v1/admin/clock`, `/v1/admin/rate-limit/reset`, `/v1/admin/eval/context`), store/sync view (`/v1/admin/store`, `/v1/admin/sync`) and a live feed from `GET /v1/events`. Code: `kiosk/src/admin/` | Partly. Reads, local enrolment of people already in the installed bundle, erasure (cloud part queued) and the dashboards work offline; creating / changing / revoking access, rotating codes and registering new people need ONLINE (the cloud signs the schedule); Rekognition indexing only happens ONLINE (`cloud_state`) | kiosk-frontend |
+| C2 | **Control Panel (Admin/Metrics Dashboard) + Register page** | Same React app: `/admin` = Control Panel (the old `#/admin` hash route was removed), `/register` = registration page, `/operator` = operator view | React | **Users & Access** (`kiosk/src/admin/panels/UsersAccessPanel.tsx`, `AccessEditor.tsx`, `StaffCodesPanel.tsx`; client `kiosk/src/api/access.ts`) over the edge access routes of `API.md` §3.18, each guarded by its own permission (`access:read`, `access:edit`, `access:revoke`, `codes:rotate`, `bundle:refresh`; route table `API.md` §0.1.4, model §2.1): `GET /v1/admin/access/users` (list; read-only from the installed bundle when OFFLINE), `PUT /v1/admin/access/users/{user_id}` (create / edit role, zones, extra hours, validity; re-admit an ERASED user; Restore), `POST /v1/admin/access/users/{user_id}/revoke`, `POST /v1/admin/access/codes/rotate` (staff override codes, shown once) and `POST /v1/admin/bundle/refresh`; the edge proxies them to the cloud master (`API.md` §4.9a) and installs the re-signed bundle in the same call. **Registration = PUT-then-enrol** (R-A; `kiosk/src/operator/RegisterApp.tsx`, `kiosk/src/shared/registerFlow.ts`, and the Control Panel enrol card `EnrolPanel.tsx`): (1) ONLINE check for people not yet in the schedule; (2) `PUT /v1/admin/access/users/{user_id}` `{display, role, consent: true}`, proceed only when `bundle.applied` and `user.in_bundle` are true (else `POST /v1/admin/bundle/refresh`, up to 3 tries 1 s apart); (3) `POST /v1/enroll` (consent + DPDP notice, 5 frames at up to 1280 px; also the stand-alone `kiosk/public/enroll.html`). `GET /v1/admin/users` lists local enrolments; `DELETE /v1/enroll/{user_id}` erases (cloud `deleted` / `queued` / `not_configured` / `failed`). Also live metrics (p50/p95, decisions per reason, per attack species), demo controls (`/v1/admin/mode`, `/v1/admin/clock`, `/v1/admin/rate-limit/reset`, `/v1/admin/eval/context`), store/sync view (`/v1/admin/store`, `/v1/admin/sync`), a live feed from `GET /v1/events`, and the Staff & roles, API keys and Audit log panels (`StaffPanel.tsx`, `ApiKeysPanel.tsx`, `AuditLogPanel.tsx`). **Sign-in:** every page sits behind `LoginGate` (`kiosk/src/shared/auth/`): `/admin` needs any signed-in principal, `/operator` needs `events:read`, `/register` needs `enrol:write`; buttons without the permission are disabled. The session token lives in `sessionStorage` `hid.session` only on those routes. Code: `kiosk/src/admin/` | Partly. Reads, local enrolment of people already in the installed bundle, erasure (cloud part queued) and the dashboards work offline; creating / changing / revoking access, rotating codes and registering new people need ONLINE (the cloud signs the schedule); Rekognition indexing only happens ONLINE (`cloud_state`) | kiosk-frontend |
 | C3 | **Edge API** | Kiosk laptop, `127.0.0.1:8000`, plus a second listener on `0.0.0.0:EDGE_LAN_PORT` (8001) that serves **only** `GET /v1/depth/pending` and `POST /v1/depth/frames` | FastAPI, Python 3.11, Pydantic v2, uvicorn | Session/nonce issue, attempt orchestration, parallel fan-out, early cloud probe (`POST /v1/attempt/{id}/probe`, in the code, live after an edge restart), response assembly, `latency_ms`, event stream, depth endpoints for DepthProbe. Code: `edge/app.py` (routes + LAN listener), `edge/schemas.py` (HTTP models), `edge/attempts.py` (orchestration), `edge/session.py` (attempt ids, nonces, flash sequence), `edge/cloud_client.py`, `edge/enroll.py`, `edge/events.py`, `edge/metrics.py`, `edge/depth_bridge.py` | Yes | edge-ml |
 | C4 | **Edge Liveness Engine** | Edge process (thread pool) | onnxruntime: MiniFASNetV2 (2.7× crop) + MiniFASNetV1SE (4.0× crop), 80×80, raw 0-255 BGR, output index 1 = real (startup self-test); RetinaFace MNv2 detector; YOLOX-Tiny COCO detector (phone/laptop/TV, Apache-2.0); numpy FFT moiré; flash-reflection correlation | Passive PAD score, device-in-frame, moiré, flash match (advisory, §3.2), mask cues, depth fusion. Signals only, no decisions. Code: `edge/ml/{detect,quality,pad,device,moire,flash,mask,onnx,registry}.py`, `edge/perception.py` | Yes | edge-ml |
 | C5 | **Edge Local Matcher** | Edge process | ArcFace w600k_r50 (InsightFace buffalo_l recogniser, non-commercial weights; CoreML EP when it matches CPU) 512-d embeddings, cosine vs Fernet-encrypted template cache (`edge/data/templates.fernet`, this kiosk's entitled users only) | 1:N match top-1/top-2. It always runs and is the sole identity source offline. Online behaviour is in §4.2. Code: `edge/ml/matcher.py`, `edge/ml/templates.py` | Yes | edge-ml |
@@ -123,11 +124,115 @@ LAN listener on `0.0.0.0:EDGE_LAN_PORT` (8001 in `.env.example`). It serves **on
 `DEPTH_DEVICE_TOKEN`. Each pending request carries a single-use `depth_nonce` that `/frames` must echo;
 a mismatch or a reuse is rejected as 403 `FORBIDDEN`. The main API stays on `127.0.0.1:8000`, and a busy
 LAN port never takes the kiosk API down (`GET /v1/health` → `detail.lan_listener`). Depth is evidence
-that can only add spoof or mask cues, and depth maps stay in RAM. (1c) `GET /v1/events` and
-`GET /v1/metrics` are localhost-only and need no admin token; every `/v1/admin/*` and `/v1/enroll`
-route needs `X-Admin-Token`. (2) Edge ↔ Cloud — TLS 1.2+, per-kiosk
-API key + HMAC request signature, replay window 60 s. (3) Cloud ↔ AWS services — the event IAM role /
-instance profile, least privilege.
+that can only add spoof or mask cues, and depth maps stay in RAM. (1c) Staff ↔ Edge — every
+non-public route needs a staff session or an API key that holds the route's permission (RBAC): that
+includes `GET /v1/events` (`events:read`), `GET /v1/metrics` (`metrics:read`), every `/v1/admin/*`
+route and `/v1/enroll`. Only the kiosk attempt flow (`POST /v1/session/start`, `/v1/attempt/{id}/*`),
+`GET /v1/health`, `GET /v1/mode`, `GET /v1/auth/status` and `POST /v1/auth/login` are public; `/v1/depth/*`
+takes `X-Depth-Token` only. Details in §2.1. (2) Edge ↔ Cloud — TLS 1.2+, per-kiosk API key + HMAC request
+signature, replay window 60 s; cloud admin routes also need a cloud API key (§2.1). (3) Cloud ↔ AWS
+services — the event IAM role / instance profile, least privilege.
+
+### 2.1 Trust boundaries and access control
+
+**What RBAC protects.** RBAC protects the **HTTP surface only**. The edge OS account, the project `.env`
+and `EDGE_DATA_DIR` are fully trusted: anyone who can read them holds every edge secret
+(`EDGE_DATA_KEY`, the kiosk HMAC key, `CLOUD_EDGE_PROXY_KEY`). A compromised kiosk laptop therefore
+means a compromised `edge_proxy` cloud key. Deployment rules:
+
+| Rule | Why |
+|---|---|
+| Run the edge as a dedicated OS user that owns `.env` (mode `0600`) and `EDGE_DATA_DIR` (mode `0700`) | The edge tightens `EDGE_DATA_DIR` to `0700` / files `0600` at startup (`tighten_data_dir`, `edge/app.py`); a group- or world-readable `.env` makes `/v1/health` degraded (`env_file_permissive`) |
+| Run the public kiosk browser as a different, non-admin OS user in locked kiosk mode: no `file://`, no devtools, no downloads | The public screen must not be able to read the edge files or a staff token |
+| Open staff consoles (`/admin`, `/operator`, `/register`) in a separate browser profile | Staff tokens never share storage with the public kiosk page |
+
+`GET /v1/health` `degraded_reasons` covers the security posture as well as models and policy:
+
+| Reason | Meaning (code) |
+|---|---|
+| `demo_mode` | `DEMO_MODE=1` (never on a production kiosk) |
+| `env_file_permissive` | project `.env` mode & `0o077` ≠ 0 (`edge/app.py` `env_file_permissive`) |
+| `legacy_admin_token` | `AUTH_LEGACY_ADMIN_TOKEN=1`: the shared `X-Admin-Token` is accepted |
+| `auth_unavailable` | no auth service, or the staff store is `MISSING` / `UNAVAILABLE` |
+| `auth_bruteforce` | ≥ 20 failed sign-ins in the last 10 min (`edge/auth/login.py` `BRUTEFORCE_*`) |
+
+**Principals.** Full tables (credentials, public routes, roles, route → permission, error reasons) are in
+`docs/API.md` §0.1; they are not repeated here.
+
+| Principal | Credential | Where it is accepted |
+|---|---|---|
+| Staff session | `Authorization: Bearer fgs_<token>` from `POST /v1/auth/login` (MFA for `AUTH_MFA_REQUIRED_ROLES`, default `admin,security_officer`) | edge HTTP routes |
+| Edge API key | `Authorization: Bearer fgk_<key_id>.<secret>` (1–3 roles, never `admin`, expires in 1–90 days) | edge HTTP routes, for automation (eval, bench) |
+| Legacy shared token | `X-Admin-Token` == `ADMIN_TOKEN`, **only** with `AUTH_LEGACY_ADMIN_TOKEN=1`; principal `legacy:admin_token` = all edge permissions except `staff:manage` and `codes:rotate_any`; every use logged as a warning and audited | edge HTTP routes (deprecated) |
+| Kiosk HMAC | `X-Kiosk-Id`, `X-Timestamp`, `X-Api-Key`, `X-Signature` (edge → cloud, unchanged) | every cloud route |
+| Depth device | `X-Depth-Token` == `DEPTH_DEVICE_TOKEN` | `/v1/depth/*` on the LAN listener only |
+| CLI operator | OS access to the edge account: `python -m edge.auth <command>` | staff store directly; audited as `cli:<os user>` |
+
+**Edge auth modules (`edge/auth/`, as built).**
+
+| Module | Role |
+|---|---|
+| `rbac.py` | The single permission catalog: edge permissions and roles (`admin`, `security_officer`, `enroller`, `auditor`, `evaluator`), cloud roles (`admin`, `edge_proxy`, `auditor`), `KEY_FORBIDDEN_PERMISSIONS`, `ROUTE_PERMISSIONS` / `PUBLIC_ROUTES` / `DEPTH_DEVICE_ROUTES` for every edge route (a test walks `app.routes`), `RBAC_VERSION`. Stdlib only. `cloud/infra/build_artifact.sh` copies an explicit allow-list (`__init__.py`, `rbac.py`, `tokens.py`) into the cloud artifact and fails the build if the stage cannot import `edge.auth.rbac`; `cloud/app/rbac.py` imports it (never a copy) and refuses to start without it |
+| `tokens.py` | `fgs_` / `fgk_` formats; the server keeps only SHA-256 digests; credentials are never accepted in a query string |
+| `store.py` | Encrypted staff store `staff.fernet` (Fernet key = HKDF-SHA256(`EDGE_DATA_KEY`, `faceguard staff-store v1`), or `STAFF_STORE_KEY`). Every mutation, edge or CLI: `flock(staff.lock)` (5 s, else 503 `AUTH_BUSY` / CLI exit 75) → re-read → apply → atomic write → `generation` + 1 → the HMAC'd `staff.marker` (persisted generation floor). A generation lower than the marker's or one already seen, a wrong key, a corrupt file or an invalid marker → `UNAVAILABLE`; no file but a marker or an audit history → `MISSING`; both fail closed (503 `AUTH_UNAVAILABLE`, the legacy token does not bypass it) |
+| `sessions.py` | In-memory sessions keyed by the token digest; idle 30 min / absolute 12 h on `time.monotonic()`; only non-GET requests, `X-FG-Activity: 1` and `POST /v1/auth/activity` extend a session. An edge restart signs everyone out |
+| `audit.py` | Append-only `audit.jsonl` (`0600`, rotated to `audit.jsonl.1..N`), each line HMAC-SHA256-chained under HKDF(`EDGE_DATA_KEY`, `faceguard audit-chain v1`); the chain continues across rotation; denials aggregated per (actor, route, reason, minute) |
+| `login.py` + `ratelimit.py` | Global cap and per-username progressive delay checked **before** any scrypt work; unknown usernames throttled identically; scrypt runs on a dedicated 2-thread pool `auth-kdf` with non-blocking admission (both busy → 429 `RATE_LIMITED`), never the decision thread pool, so sign-ins cannot starve the kiosk decision path |
+| `deps.py` | FastAPI dependency per route: 401 `UNAUTHORIZED`, 403 `FORBIDDEN` `MISSING_PERMISSION`, 503 `AUTH_UNAVAILABLE` |
+| `staff_ops.py`, `cli.py` | Staff / API-key / MFA administration (re-auth, role ceiling, last-admin rule) over HTTP (`staff:manage`) and the CLI |
+
+**Edge request guards** (`edge/app.py` `_add_guards`, `edge/http_guards.py`), outermost first on the main
+app: `TrustedHostMiddleware` (Host must be `127.0.0.1`, `localhost` or `[::1]`, plus exact names in
+`EDGE_EXTRA_ALLOWED_HOSTS`; blocks DNS rebinding) → per-route body caps (413) → `OriginGuardMiddleware`
+(a non-GET request with an `Origin` not in the kiosk origins → 403 `FORBIDDEN` `ORIGIN_NOT_ALLOWED`) → CORS
+for the kiosk origins (headers `Content-Type`, `Authorization`, `X-FG-Activity`, plus `X-Admin-Token`
+only while the legacy flag is on; exposes `X-Latency-Ms`, `Retry-After`). `/docs` and `/openapi.json`
+exist only with `DEMO_MODE=1`. The SSE feed `GET /v1/events` re-checks the session before every event and
+at every heartbeat and closes with `event: auth` `{"reason":"SESSION_ENDED"}`.
+
+**Actor.** The edge always derives the actor from the principal: `staff:<staff_id>`, `key:<key_id>` or
+`legacy:admin_token`; a client `actor` field is ignored. It travels in the HMAC-signed body (POST / PUT)
+or the signed query (`DELETE ...?actor=`).
+
+**Cloud admin model** (`cloud/app/rbac.py`). The kiosk HMAC stays mandatory on every cloud route; admin
+routes need a cloud API key on top: `Authorization: Bearer fgk_...` looked up in `CLOUD_API_KEYS_JSON`
+(`X-Admin-Token` only with cloud `AUTH_LEGACY_ADMIN_TOKEN=1`). Every admin-credential failure is 403
+`FORBIDDEN` (401 means the kiosk HMAC failed) with reason `ADMIN_KEY_INVALID`, `ADMIN_KEY_EXPIRED`,
+`MISSING_PERMISSION`, `KIOSK_NOT_BOUND` or `LEGACY_DISABLED`. An `edge_proxy` key (`schedule:read`,
+`access:read`, `access:edit`, `revocations:write`, `codes:rotate`) must list exactly one `kiosk_id`
+(startup `ConfigError` otherwise), and it must equal the HMAC kiosk. The edge authorises the human first,
+then proxies; the cloud records the asserted actor with `actor_assurance` `edge_asserted` and **never
+uses it for authorisation**. Keys are minted with `python -m cloud.tools.apikey`.
+
+**Outbound credential** (`edge/cloud_client.py`): `CLOUD_EDGE_PROXY_KEY` set → `Authorization: Bearer`;
+else the legacy `CLOUD_ADMIN_TOKEN` → `X-Admin-Token`. It never falls back to `ADMIN_TOKEN` (the inbound
+edge secret).
+
+**Offline.** Staff sign-in is local (staff store + scrypt + TOTP on the edge, no cloud call), so it works
+**OFFLINE**. Routes that change the cloud master (access edit / revoke, code rotation, bundle refresh,
+registration of new people) still need ONLINE. Staff override codes are attributable:
+`POST /v1/admin/access/codes/rotate` needs a staff session (API key → 403 `MISSING_PERMISSION`, keys never hold `codes:rotate`; legacy token → 403 `NO_STAFF_IDENTITY`);
+`codes:rotate` may only rotate the caller's own `staff_id` (else 403 `STAFF_ID_NOT_OWN`, at most 4 codes
+per call); only `codes:rotate_any` (admin) may target another staff id.
+
+**Honest limits (open).**
+
+| Limit | Status |
+|---|---|
+| Bundle signing | Still symmetric **HMAC-SHA256**: a stolen kiosk key could forge bundles. Ed25519 (kiosk holds only the public key) is the production follow-up |
+| Bundle anti-rollback at boot | Newer-only ordering is enforced for installs and file reloads, but there is no persisted version floor: at boot the edge accepts the validly signed file on disk |
+| Staff sessions | In memory only: an edge restart signs everyone out |
+| Store rollback check | The `generation` floor is persisted in the HMAC'd `staff.marker` sidecar; restoring an older `staff.fernet` together with its own older marker, or deleting the marker, is not detected |
+| Challenge evidence | Measured by the kiosk client (F01, architectural); the edge cannot verify it server-side |
+| Kiosk HMAC does not cover `Authorization` | The request signature covers method, path + query, timestamp and body hash only, so a captured signed GET (or an intercepted, undelivered non-GET) could be replayed with a different bearer within the 60 s window. Follow-up: signature v2 over the auth headers (`docs/API.md` §0.1.9) |
+| `edge_proxy` holds `access:edit` unscoped | The cloud does not scope a kiosk key's `access:edit` by zone; only the edge limits it to `admin` staff. A stolen kiosk key can edit any user's access |
+| PAD vs identity frames (M01, medium) | PAD-passing frames and identity frames need not be the same; the any-frame `MATCH_AMBIGUOUS` rule only catches a frame whose top-1 is a different enrolled user. Full fix = embed every PAD-live frame (latency not measured) |
+| Step-up routes rely on the attempt id (M1/M2, low) | `/fallback`, `/challenge`, `/otp/send` and `session/start` `recapture_of` are guarded only by the unguessable `attempt_id` (no per-attempt step-up secret); mitigated because the SSE feed and any attempt listing need `events:read` |
+| DepthProbe LAN channel (DE-02, EAE-08, low) | One static `X-Depth-Token` over plaintext HTTP on `0.0.0.0`; the first poller claims each job; same process as the kiosk API; no connection / idle limits (a body cap exists). Depth is disabled by default |
+| Own-code rotation (DR2-04, RT2-10, RT2-11; deliberate) | `replace_existing` defaults to true: old codes leave the master at once, offline kiosks keep them until their next bundle refresh (consumed codes stay blocked fleet-wide); no separate codes/revoke route, replace via rotate |
+| `ratelimit:reset` for `evaluator` (RT0-08, low) | Evaluator API keys can reset the kiosk lockout with no `DEMO_MODE` / eval-context gate (bench and eval need it); mint evaluator keys only for eval runs, short expiry |
+| Liveness exceptions (EM-M2, low) | PAD / texture exceptions are not caught in the liveness branch; `process_frames` turns them into DENY `SYSTEM_ERROR` (fail-secure) |
+| Deferred (RBAC v2 §H) | Central staff directory synced cloud → edges; KV-managed cloud API keys with admin routes; audit-chain anchoring to the cloud; per-zone `enrol:write_high_risk`; server-side challenge measurement; automated per-kiosk HMAC key provisioning (the cloud already reads per-kiosk keys from `KIOSK_KEYS_JSON`) |
 
 ---
 
@@ -321,7 +426,7 @@ sequenceDiagram
 
   Note over E: Connectivity Monitor: heartbeat misses (or forced) -> mode = OFFLINE
   K->>E: GET /v1/mode (every 2 s)
-  E-->>K: OFFLINE (badge shown), bundle version + expires_at, queue depth
+  E-->>K: OFFLINE (badge shown), cache_state, forced_until, queue depth (public badge subset)
   K->>E: POST /v1/session/start
   E-->>K: attempt_id, nonce, flash_sequence (3 colours)
   K->>E: POST /v1/attempt/{id}/frames
@@ -365,7 +470,7 @@ Offline restrictions (summary; authoritative: `DECISION_POLICY.md` §8 and §9.3
 | Cache INVALID | Only when there is **no LVB**, or the clock rolled back (now < LVB `issued_at` − `cache.clock_rollback_tolerance_s` 300 s). No LVB → BIO_PASS/UNSURE → `DENY` `SCHEDULE_BUNDLE_INVALID`, CONTACT_DESK, zone `"UNKNOWN"` in the response. Clock rollback with an LVB → no schedule evaluation, STEP_UP `SCHEDULE_BUNDLE_INVALID` + `OFFLINE_FALLBACK_REQUIRED`, methods `stepup.methods.cache_untrusted` = STAFF_OVERRIDE only. |
 | Revocations | Revocation list inside the signed bundle plus the revocation feed (pulled on each successful heartbeat). Time-aware: a revocation applies when `revoked_at` ≤ t0, and REVOKED is checked first → `DENY` `SCHEDULE_REVOKED`. Revoked users' templates are purged at refresh, so offline they come out `NOT_ENROLLED`. |
 | Random challenge | `challenge.random_rate` **0.30** offline (`offline.overrides.challenge.random_rate`; online 0.15). |
-| Enrolment | As built: local enrolment into the encrypted template cache still works offline (admin token + consent). The cloud/Rekognition index is only written when the edge is ONLINE (`cloud_indexed` false otherwise; the deployed cloud also needs the e-mail field). Re-enrolment **appends** on the edge (≤ 24 templates, first 5 pinned, new frames must resemble the original; erase to replace); the deployed cloud still replaces the user's faces until the redeploy. |
+| Enrolment | As built: local enrolment into the encrypted template cache still works offline (a staff session or API key with `enrol:write` + consent; staff sign-in is local, §2.1). The cloud/Rekognition index is only written when the edge is ONLINE (`cloud_indexed` false otherwise; the deployed cloud also needs the e-mail field). Re-enrolment **appends** on the edge (≤ 24 templates, first 5 pinned, new frames must resemble the original; erase to replace); the deployed cloud still replaces the user's faces until the redeploy. |
 | Email OTP / Face Liveness | Unavailable offline; replaced by TOTP / staff code / card. |
 | Rate limit | Same as online (D3, R1). Only attack-evidence DENYs count: `SPOOF_*`, `MASK_CUE_RIGID` / strong-mask DENY, `INJECTION_VIRTUAL_CAMERA`, `CHALLENGE_FAILED`, `FALLBACK_FAILED` (YAML `rate_limit.counted_code_prefixes` + `counted_codes`; a DENY carrying a `SCHEDULE_*` code is not counted). Schedule, identity, quality, `SYSTEM_ERROR` and `RATE_LIMITED` DENYs are never counted. `rate_limit.max_failures` 5 in `window_s` 180 s → `lockout_s` **5 s** (operator request; was 60) of `DENY RATE_LIMITED` (`retry_after_s`) + alert. `rate_limit.enabled` (true by default; the eval profile may disable it). Reset via `POST /v1/admin/rate-limit/reset`. |
 
@@ -397,7 +502,7 @@ sequenceDiagram
     SA->>S: delete acked records (purge-on-ack), retry the rest with backoff 1 -> 60 s, +/-20 % jitter
   end
   C-)CW: metrics + alarms for ALERT_* (e.g. ALERT_REVOKED_USER_ADMITTED)
-  SA->>C: GET /v1/schedule/{kiosk_id} (If-None-Match: version) + GET /v1/revocations
+  SA->>C: GET /v1/schedule/{kiosk_id} (If-None-Match: last ETag v{version}-{issued_at}) + GET /v1/revocations
   C-->>SA: new HMAC-signed bundle (or 304), revocations, template delta
   SA->>S: verify signature, replace bundle + template cache atomically
   CM->>CM: SYNCING -> ONLINE (require_sync_before_online)
@@ -420,8 +525,13 @@ the OFFLINE rules (`GET /v1/mode` reports the state; the decision `mode` is OFFL
 consecutive successes; `SYNCING → ONLINE` only when the queue is acknowledged and a fresh bundle +
 revocations are installed; a miss during SYNCING → OFFLINE.
 
-Canonical mode endpoints (D7): `GET /v1/mode` (polled by the kiosk badge every 2 s) and
-`POST /v1/admin/mode {"force": "OFFLINE" | "AUTO"}` (admin token). The forced switch is immediate.
+Canonical mode endpoints (D7):
+
+| Endpoint | Auth | What it does |
+|---|---|---|
+| `GET /v1/mode` | public | Badge subset only (polled by the kiosk every 2 s): `mode`, `state`, `reason`, `forced`, `forced_until`, `kiosk_id`, `sync_queue_depth`, `demo_clock`, `template_cache.count`, `cache_state`, `cloud_match.degraded` |
+| `GET /v1/admin/mode/detail` | `store:read` | Full runtime status (bundle, rate limit, policy bars, last sync) |
+| `POST /v1/admin/mode {"force": "OFFLINE" \| "AUTO", "reason"?, "max_minutes"?}` | `mode:switch` | The forced switch is immediate. A forced OFFLINE **auto-reverts to AUTO** after `max_minutes` (1–240, default 60: `connectivity.forced_offline_default_min` / `forced_offline_max_min`; `edge/policy/runtime_ops.py` `forced_state`). Only `DEMO_MODE=1` with `reason` `"DEMO"` and no `max_minutes` stays forced without a deadline; env `FORCE_OFFLINE=1` is also unlimited |
 
 ---
 
@@ -461,7 +571,11 @@ The template cache is a single Fernet token.
 | `tombstones` | `{count, first_seq, last_seq, chain_head}` | Until synced → `ALERT_RECORDS_PURGED_UNSYNCED` |
 | `meta` | `chain_head` and similar | — |
 | `fallback_state.sqlite` → `fb_totp`, `fb_consumed` | last accepted TOTP step per (pseudonymous) user; consumed override codes | replay protection |
-| in memory only | attempt nonces (single-use, TTL 10 s), depth nonces, step-up sessions, rate-limit window | process lifetime |
+| `staff.fernet` (`edge/auth/store.py`) | staff accounts (username, `staff_id`, roles, scrypt password hash, MFA secret, status, `session_epoch`) + edge API keys (`key_id`, SHA-256 of the secret, roles, expiry) + `generation`; one Fernet token, key = HKDF(`EDGE_DATA_KEY`, `faceguard staff-store v1`) or `STAFF_STORE_KEY`; written `0600` atomically | store lifetime (accounts are disabled, keys revoked via the CLI or `staff:manage`) |
+| `staff.lock` (`edge/auth/store.py`) | `flock` file that serialises store mutations between the edge and the CLI | — |
+| `staff.marker` (`edge/auth/store.py`) | `{generation, mac}` (0600, HMAC-SHA256): persisted rollback floor and proof that a store existed (`MISSING`) | store lifetime |
+| `audit.jsonl` → `audit.jsonl.1..N` (`edge/auth/audit.py`) | staff audit lines `{ts_utc, seq, prev_mac, mac, actor, action, target, outcome, client_ip, detail[, count]}`, HMAC-chained; secrets scrubbed | rotated at `AUTH_AUDIT_MAX_BYTES` (5 MiB), `AUTH_AUDIT_KEEP` (5) files kept |
+| in memory only | attempt nonces (single-use, TTL 10 s), depth nonces, step-up sessions, rate-limit window, **staff sessions** (restart signs everyone out), login throttle counters, MFA tickets | process lifetime |
 
 **Never stored on the edge**: raw frames (RAM only for the attempt), face crops, depth maps (RAM only,
 dropped after the attempt), embeddings of unknown people, display names in the log, TOTP values, raw
@@ -473,7 +587,8 @@ card IDs, Rekognition responses.
 
 | Area | Control |
 |---|---|
-| Transport | Kiosk ↔ Edge localhost only (DepthProbe: LAN listener `EDGE_LAN_PORT`, `/v1/depth/*` only, `X-Depth-Token`). Edge ↔ Cloud TLS 1.2+ (API Gateway HTTPS if allowed, else self-signed cert with fingerprint pinning); headers `X-Kiosk-Id`, `X-Timestamp`, `X-Signature` = HMAC-SHA256(kiosk_key, method + path + timestamp + sha256(body)); ±60 s skew; `X-Api-Key`. |
+| Transport | Kiosk ↔ Edge localhost only (DepthProbe: LAN listener `EDGE_LAN_PORT`, `/v1/depth/*` only, `X-Depth-Token`). Edge ↔ Cloud TLS 1.2+ (API Gateway HTTPS if allowed, else self-signed cert with fingerprint pinning); headers `X-Kiosk-Id`, `X-Timestamp`, `X-Signature` = HMAC-SHA256(kiosk_key, `METHOD\nPATH\ntimestamp\nsha256(body)`), where PATH is the raw path **plus `?query`** when there is one (`edge/offline/signing.py`; the cloud accepts a bare-path signature for a query request only with `CLOUD_ACCEPT_BARE_PATH_SIG=1`, transition); ±60 s skew; `X-Api-Key`. |
+| Access control | Edge: RBAC on every non-public route (staff session `fgs_` or API key `fgk_` with the route's permission; legacy `X-Admin-Token` only with `AUTH_LEGACY_ADMIN_TOKEN=1`), Host allow-list, foreign-Origin 403, CORS for the kiosk origins; MFA for `admin` / `security_officer`; HMAC-chained staff audit log. Cloud: kiosk HMAC on every route + a cloud API key on admin routes (`edge_proxy` bound to one kiosk). The edge OS account, `.env` and `EDGE_DATA_DIR` are fully trusted. §2.1, `docs/API.md` §0.1 |
 | Anti-replay | Server-issued single-use `nonce` (TTL 10 s) bound to `attempt_id` and the random colour sequence (expired → 410 `NONCE_EXPIRED`, reused → 409 `NONCE_REUSED`, wrong → 403 `FORBIDDEN`). With `liveness.flash.enforce: true`, frames whose flash response does not match the issued sequence → `SPOOF_FLASH_MISMATCH`. **Currently ADVISORY (§3.2): the mismatch is measured and reported but does not decide.** |
 | Injection | Virtual-camera label denylist (`injection.virtual_camera_label_patterns`), frame-interval checks (`min/max_frame_interval_ms`). Unknown camera label → `LIVENESS_UNSURE`. (The flash lag window is an enforcement-time check and is advisory today.) |
 | Rigid masks | Mandatory mouth/cheek step in every challenge. Random challenge (`challenge.random_rate` 0.15 online / 0.30 offline, `RANDOM_CHALLENGE`; forceable or switchable off in DEMO_MODE). Depth M1 once depth is enabled after H4. Silicone masks remain a known RGB limit. |
@@ -556,17 +671,18 @@ instances. Keep IaC in `cloud/infra/` (the account will be wiped). `teardown.sh`
 |---|---|---|
 | Edge (live demo instance) | `uvicorn edge.app:app --host 127.0.0.1 --port 8000` | Loads and SHA-256-verifies all ONNX models, runs the MiniFASNet self-test (index 1 = real, raw 0-255 BGR), warms up. `GET /v1/health` reports `self_test` and `detail.lan_listener`. **Agents test on their own port, never the live :8000 edge.** |
 | Depth LAN listener | same process, `0.0.0.0:${EDGE_LAN_PORT}` (8001) | `/v1/depth/pending` + `/v1/depth/frames` only, `X-Depth-Token` |
-| Kiosk | `cd kiosk && npm run dev` → `http://localhost:5173/?mock=0`, admin `…/admin?mock=0`, enrolment `…/enroll.html` | CORS on the edge allows only `localhost:5173` / `127.0.0.1:5173`. `npm run build` gives a fully offline `dist/` |
+| Kiosk | `cd kiosk && npm run dev` → `http://localhost:5173/`, staff `…/admin`, `…/operator`, enrolment `…/register` (`/enroll.html` only redirects; `?mock=` works only in a dev build or with `VITE_ALLOW_MOCK=1`) | CORS on the edge allows only `EDGE_CORS_ORIGINS` (default `localhost:5173` / `127.0.0.1:5173`). `npm run build` gives a fully offline `dist/` |
 | Schedule bundle | Live: the **cloud-issued v45** (`KIOSK_MAIN_01` / MAIN_GATE only), refreshed from the cloud. First setup only: `python scripts/sign_bundle.py` (`config/schedule.demo.json` → `edge/data/bundle.signed.json`, v42; `issued_at` = now, `expires_at` = now + 12 h). Never re-run it with its defaults while v45 is installed (v42 is rejected as older and `DEMO_CODES.txt` is overwritten); a replacement needs `--version 46`+ | The edge picks up a re-signed file within about 1 s without a restart; an unverifiable file is rejected (R6) |
 | Cloud | `uvicorn cloud.app.main:app` on EC2 behind API Gateway (deployed) or laptop-hosted on port 9000 | edge `CLOUD_API_URL`; empty → permanently OFFLINE (`not_configured`) |
 | DepthProbe | iPhone app v0.3.0 (sideloaded; v0.3.1 IPA built) | settings `http://<Mac IP>:8001` + `DEPTH_DEVICE_TOKEN` |
 
 Demo: toggle offline with `POST /v1/admin/mode {"force":"OFFLINE"}` (immediate; the badge shows it at
-the next 2 s poll) or by disabling Wi-Fi (natural detection about 12–17 s, §6).
+the next 2 s poll; needs `mode:switch`; auto-reverts to AUTO after 60 min unless `max_minutes` is given,
+§6) or by disabling Wi-Fi (natural detection about 12–17 s, §6).
 
 **Eval data path (D9):** `POST /v1/admin/eval/context` tags the following attempts
 (`run_id`, `subject_id`, coarse `label`, `condition`, `split`); `GET /v1/events` streams decision +
-rendered events to `eval/capture.py`, which resets the rate limiter before every attempt by default
+rendered events to `eval/capture.py` (credential: an `evaluator` API key in `FG_EVAL_API_KEY`), which resets the rate limiter before every attempt by default
 (`--reset-rate-limit attempt`); the
 `POST /v1/attempt/{id}/rendered` beacon supplies the user-visible face-lock → rendered latency. FAR/FRR
 come from `eval/collect_faces.py` + `eval/compare.py` on consenting team photos (`eval/captures/`,
