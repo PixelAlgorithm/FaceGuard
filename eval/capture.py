@@ -2,7 +2,7 @@
 
 The operator never types scores or decisions. capture.py takes the LABEL (species), SUBJECT and CONDITION
 (lighting, distance) from a pre-shuffled plan, CLI flags or an interactive prompt, sets the edge eval context
-(POST /v1/admin/eval/context, X-Admin-Token from the project .env - never printed), arms, waits for the next NEW
+(POST /v1/admin/eval/context), arms, waits for the next NEW
 attempt on GET /v1/events (SSE "decision" events), follows it through any step-up (challenge / second factor /
 recapture) to a terminal ALLOW / DENY, joins the kiosk "rendered" event (client_latency_ms = face lock ->
 decision rendered, the user-visible decision time), appends exactly one row, then clears the context.
@@ -17,6 +17,10 @@ face_lock_at_ms (+-50 ms) and identical scores: the second is dropped as a dupli
 `duplicates_dropped`, row note `dup_dropped:<id>`). RANDOM_CHALLENGE first decisions are step-ups (followed to the
 terminal decision; liveness_result stays PASS when the signals passed).
 Only whitelisted scalar fields are written: never images, crops, embeddings or names.
+Auth (RBAC): every authenticated call (SSE GET /v1/events, /v1/admin/*) sends `Authorization: Bearer
+$FG_EVAL_API_KEY` (an evaluator API key, from the environment or the project .env; never printed). The legacy
+ADMIN_TOKEN (X-Admin-Token) is used only with FG_ALLOW_LEGACY_ADMIN_TOKEN=1. No usable credential, or a 401/403
+from the edge, stops the run with a clear error and exit code 5 (no silent fallback).
 
 Usage (from eval/; edge at --edge, default http://127.0.0.1:8000):
   uv run python capture.py --plan plans/test_plan.csv --run-id R-test-1 --operator E          # recommended
@@ -46,6 +50,7 @@ from pathlib import Path
 import httpx
 
 from evallib import EVAL_DIR, PROJECT_DIR, RESULTS_DIR, THRESHOLDS_PATH
+from evallib import auth as A
 from evallib import config as ecfg
 from evallib import io as eio
 from evallib import schema as S
@@ -571,38 +576,23 @@ class Tracker:
 
 # ===================================================================== edge admin (eval context, rate limit)
 
-def load_admin_token(env_file: Path = PROJECT_DIR / ".env") -> str | None:
-    """ADMIN_TOKEN from the environment or the project .env. The value is never printed or logged."""
-    if os.environ.get("ADMIN_TOKEN"):
-        return os.environ["ADMIN_TOKEN"]
-    try:
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            k, sep, v = line.partition("=")
-            if sep and k.strip() == "ADMIN_TOKEN":
-                v = v.split(" #")[0].strip().strip('"').strip("'")
-                return v or None
-    except OSError:
-        return None
-    return None
-
-
 class EdgeAdmin:
-    def __init__(self, edge: str, token: str | None):
-        self.edge, self.token = edge.rstrip("/"), token
+    """Admin calls with the run's credential. A 401/403 raises evallib.auth.AuthFailure (the run stops)."""
+
+    def __init__(self, edge: str, cred: A.EdgeCredential):
+        self.edge, self.cred = edge.rstrip("/"), cred
         self.counts: Counter = Counter()
 
     def _call(self, method: str, path: str, body: dict | None = None) -> bool:
-        if not self.token:
-            self.counts[f"{path}:no_token"] += 1
-            return False
         try:
-            r = httpx.request(method, self.edge + path, json=body, headers={"X-Admin-Token": self.token}, timeout=3.0)
-            ok = 200 <= r.status_code < 300
-            self.counts[f"{method} {path}:{'ok' if ok else r.status_code}"] += 1
-            return ok
+            r = httpx.request(method, self.edge + path, json=body, headers=self.cred.headers(), timeout=3.0)
         except (httpx.HTTPError, OSError) as e:
             self.counts[f"{method} {path}:{type(e).__name__}"] += 1
             return False
+        ok = 200 <= r.status_code < 300
+        self.counts[f"{method} {path}:{'ok' if ok else r.status_code}"] += 1
+        A.raise_for_auth(r.status_code, method, path, self.cred, _json_or_none(r))
+        return ok
 
     def set_context(self, lab: Label) -> bool:
         return self._call("POST", "/v1/admin/eval/context", lab.context())
@@ -612,6 +602,13 @@ class EdgeAdmin:
 
     def reset_rate_limit(self) -> bool:
         return self._call("POST", "/v1/admin/rate-limit/reset")
+
+
+def _json_or_none(r: httpx.Response) -> object:
+    try:
+        return r.json()
+    except ValueError:
+        return None
 
 
 # ===================================================================== transports
@@ -626,9 +623,12 @@ class EventSource(threading.Thread):
     `eval` key and no `rendered` event (rows note `eval_tags_not_in_poll_response`)."""
 
     def __init__(self, edge: str, q: queue.Queue, transport: str = "auto", poll_s: float = 0.25,
-                 events_path: str = "/v1/events", attempt_path: str = ATTEMPT_PATH):
+                 events_path: str = "/v1/events", attempt_path: str = ATTEMPT_PATH,
+                 cred: A.EdgeCredential | None = None):
         super().__init__(daemon=True)
         self.edge, self.q, self.transport = edge.rstrip("/"), q, transport
+        self.cred = cred
+        self.auth_error: str | None = None  # set on SSE 401/403 or a final `event: auth`; the run stops
         self.poll_s, self.events_path, self.attempt_path = poll_s, events_path, attempt_path
         self.stop = threading.Event()
         self.status = "starting"
@@ -659,9 +659,14 @@ class EventSource(threading.Thread):
         while not self.stop.is_set():
             if mode in ("sse", "auto"):
                 try:
-                    headers = {"Accept": "text/event-stream"} | ({"Last-Event-ID": last_id} if last_id else {})
+                    headers = ({"Accept": "text/event-stream"} | (self.cred.headers() if self.cred else {})
+                               | ({"Last-Event-ID": last_id} if last_id else {}))
                     with httpx.stream("GET", self.edge + self.events_path, headers=headers,
                                       timeout=httpx.Timeout(3.0, read=None)) as r:
+                        if r.status_code in A.AUTH_FAILURE_CODES:
+                            r.read()
+                            return self._auth_failed(A.failure_message(
+                                r.status_code, "GET", self.events_path, self.cred, _json_or_none(r)))
                         if r.status_code == 404 and mode == "auto":
                             mode = "poll"
                             continue
@@ -669,6 +674,10 @@ class EventSource(threading.Thread):
                         self.status, self.mode_used, backoff = "connected (sse)", "sse", 0.5
                         for typ, data, eid in iter_sse(r.iter_lines()):
                             last_id = eid or last_id
+                            if typ == "auth":  # edge closes the stream: credential expired / revoked / lost
+                                return self._auth_failed(
+                                    f"edge closed GET {self.events_path} with `event: auth` (credential expired, "
+                                    f"revoked or lost events:read; {self.cred.describe() if self.cred else 'none'})")
                             self.push(typ, data)
                             if self.stop.is_set():
                                 return
@@ -686,6 +695,10 @@ class EventSource(threading.Thread):
                 self.poll_followed()
                 time.sleep(self.poll_s)
             return
+
+    def _auth_failed(self, message: str) -> None:
+        self.auth_error, self.status = message, "auth refused"
+        self.stop.set()
 
     def poll_followed(self) -> int:
         """GET /v1/attempt/{id} for every followed id; pushes changed responses. Returns responses pushed."""
@@ -822,7 +835,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, default=RESULTS_DIR / "attempts.csv")
     ap.add_argument("--runs-dir", type=Path, default=None, help="run manifests (default: <out dir>/runs)")
     ap.add_argument("--subjects", type=Path, default=EVAL_DIR / "subjects.csv")
-    ap.add_argument("--env-file", type=Path, default=PROJECT_DIR / ".env", help="source of ADMIN_TOKEN")
+    ap.add_argument("--env-file", type=Path, default=PROJECT_DIR / ".env", help="fallback source of FG_EVAL_API_KEY (and of ADMIN_TOKEN with FG_ALLOW_LEGACY_ADMIN_TOKEN=1)")
+    ap.add_argument("--allow-remote-edge", action="store_true",
+                    help="allow a non-loopback edge (https only); credentials never go to remote plain http")
     ap.add_argument("--run-id", default=None)
     ap.add_argument("--operator", default="")
     ap.add_argument("--zone", default="LIBRARY")
@@ -859,10 +874,19 @@ def main(argv: list[str] | None = None) -> int:
     seen = {r["attempt_id"] for r in existing}
     done = {(r["run_id"], r["plan_seq"]) for r in existing}
     runs_dir = a.runs_dir or a.out.parent / "runs"
-    admin = EdgeAdmin(a.edge, load_admin_token(a.env_file))
-    if not admin.token:
-        print("WARNING: no ADMIN_TOKEN (env or .env): edge eval context cannot be set; rows still use operator labels")
-    health, mode = _get_json(a.edge + "/v1/health"), _get_json(a.edge + "/v1/mode")
+    try:
+        A.check_edge_url(a.edge, a.allow_remote_edge)
+        cred = A.load_credential(A.EVAL_KEY_ENV, a.env_file)
+    except A.AuthFailure as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return A.EXIT_AUTH
+    admin = EdgeAdmin(a.edge, cred)
+    print(f"edge credential: {cred.describe()}")
+    try:
+        health, mode = _get_json(a.edge + "/v1/health"), mode_detail(a.edge, cred)
+    except A.AuthFailure as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return A.EXIT_AUTH
     switches = ecfg.shipped_switches(eio.load_yaml(THRESHOLDS_PATH) or {}, THRESHOLDS_PATH)
     edge_diff = ecfg.compare_with_edge(switches, mode)
     lockout_s = switches["rate_limit"]["lockout_s"]
@@ -877,24 +901,26 @@ def main(argv: list[str] | None = None) -> int:
                                 "rate_limit_enabled_config": switches["rate_limit"]["enabled"],
                                 "edge_rate_limit_at_start": (mode or {}).get("rate_limit")},
         "dedup": {"face_lock_window_ms": DUP_WINDOW_MS, "rule": "same face_lock_at_ms (+-window) AND identical scores"},
-        "edge_health_at_start": health, "edge_mode_at_start": mode, "admin_token_present": bool(admin.token),
+        "edge_health_at_start": health, "edge_mode_at_start": mode, "edge_credential": cred.describe(),
         "timeouts_s": {"first_decision": a.first_timeout, "stepup": a.stepup_timeout, "render_wait": a.render_wait},
     })
     for d in edge_diff:
         print(f"WARNING: config cross-check: {d}")
     q: queue.Queue = queue.Queue()
-    src = EventSource(a.edge, q, a.transport)
-    src.start()
+    src = EventSource(a.edge, q, a.transport, cred=cred)
     tr = Tracker(seen, a.first_timeout * 1000, a.stepup_timeout * 1000, a.render_wait * 1000)
     written: Counter = Counter()
     prev: Label | None = None
-    seq, block = 0, None
-    if a.reset_rate_limit != "never":
-        admin.reset_rate_limit()
+    seq, block, rc = 0, None, 0
     labels: Iterator[Label] | None = labels_from_plan(a.plan, a, reg, done) if a.plan else None
     print(f"capture run {a.run_id} -> {a.out}  (edge {a.edge}; Ctrl-C to stop)")
     try:
+        admin.clear_context()  # preflight: verifies the credential (eval:admin) before anything is armed
+        src.start()
+        if a.reset_rate_limit != "never":
+            admin.reset_rate_limit()
         while True:
+            _check_stream_auth(src)
             seq += 1
             if labels is not None:
                 lab = next(labels, None)
@@ -924,9 +950,9 @@ def main(argv: list[str] | None = None) -> int:
             _drain_unarmed(q, tr)
             if src.needs_manual_id:
                 tr.render_wait_ms = 0  # no 'rendered' events without SSE
-            if admin.token and a.reset_rate_limit == "attempt":
+            if a.reset_rate_limit == "attempt":
                 admin.reset_rate_limit()
-            if admin.token and not admin.set_context(lab):
+            if not admin.set_context(lab):
                 print("  WARNING: POST /v1/admin/eval/context failed - edge tags will be missing for this attempt")
             tr.arm(lab, now_ms())
             print(f"  armed - waiting for the edge ({src.status}) ...")
@@ -942,6 +968,7 @@ def main(argv: list[str] | None = None) -> int:
                         row = tr.force_no_response()
                         break
                     tr.manual_ids.add(typed)
+                _check_stream_auth(src)
                 src.follow(tr.ids | tr.manual_ids)
                 try:
                     kind, recv, ev = q.get(timeout=0.2)
@@ -968,8 +995,7 @@ def main(argv: list[str] | None = None) -> int:
                     print("  rate limiter reset: " + ("ok" if admin.reset_rate_limit() else "FAILED"))
                 elif key == "q":
                     quit_after = True
-            if admin.token:
-                admin.clear_context()
+            admin.clear_context()
             for line in tr.log:
                 print("  note: " + line)
             tr.log.clear()
@@ -991,15 +1017,27 @@ def main(argv: list[str] | None = None) -> int:
                 break
     except KeyboardInterrupt:
         print("\nstopped")
+    except A.AuthFailure as e:
+        print(f"\nERROR: {e}\nrun stopped; rows already written are kept", file=sys.stderr)
+        rc = A.EXIT_AUTH
     finally:
         src.stop.set()
-        if admin.token:
-            admin.clear_context()
-        man.close(counts=dict(written) | dict(tr.counts), admin_calls=dict(admin.counts),
+        if rc != A.EXIT_AUTH:
+            try:
+                admin.clear_context()
+            except A.AuthFailure as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                rc = A.EXIT_AUTH
+        man.close(auth_failed=rc == A.EXIT_AUTH, counts=dict(written) | dict(tr.counts), admin_calls=dict(admin.counts),
                   transport_used=src.mode_used, non_decision_events=src.non_decision, poll_calls=dict(src.poll_calls),
                   duplicates_dropped=len(tr.duplicates), duplicates=tr.duplicates)
     print(f"done: {dict(written)}  duplicates dropped: {len(tr.duplicates)}  manifest {man.path}")
-    return 0
+    return rc
+
+
+def _check_stream_auth(src: EventSource) -> None:
+    if src.auth_error:
+        raise A.AuthFailure(src.auth_error)
 
 
 def _ask_attempt_id() -> str:
@@ -1028,6 +1066,23 @@ def _drain_unarmed(q: queue.Queue, tr: Tracker) -> None:
             tr.feed_rendered(recv, ev)
         else:
             tr.feed(recv, ev)  # tracker is IDLE -> marked seen/ignored
+
+
+def mode_detail(edge: str, cred: A.EdgeCredential) -> dict | None:
+    """GET /v1/admin/mode/detail (store:read: policy_version, policy_bars, rate_limit, ...) for the config
+    cross-check; an older edge without the route (404) -> the public GET /v1/mode. 401/403 -> AuthFailure."""
+    edge = edge.rstrip("/")
+    try:
+        r = httpx.get(edge + A.MODE_DETAIL_PATH, headers=cred.headers(), timeout=2.0)
+    except (httpx.HTTPError, OSError) as e:
+        return {"error": type(e).__name__}
+    A.raise_for_auth(r.status_code, "GET", A.MODE_DETAIL_PATH, cred, _json_or_none(r))
+    if r.status_code == 404:
+        return _get_json(edge + A.PUBLIC_MODE_PATH)
+    obj = _json_or_none(r)
+    if r.status_code == 200 and isinstance(obj, dict):
+        return obj
+    return {"http_status": r.status_code}
 
 
 def _get_json(url: str) -> dict | None:

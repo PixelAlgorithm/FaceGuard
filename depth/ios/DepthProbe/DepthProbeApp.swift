@@ -3,7 +3,8 @@ import SwiftUI
 /// DepthProbe: a deliberately dumb client. It captures 1-3 front TrueDepth depth frames when the kiosk
 /// edge service asks (long-poll), and uploads them; all liveness math runs in Python on the edge
 /// (depth/checks.py). Nothing is stored on the phone. It connects by itself whenever it is on screen;
-/// `depthprobe://config?url=...&token=...` (QR from depth/ios/pair.sh) sets the edge URL + token.
+/// `depthprobe://config?url=...&token=...` (QR from depth/ios/pair.sh) sets the edge URL + token after the
+/// operator confirms it in the app.
 @main
 struct DepthProbeApp: App {
     @StateObject private var model = ProbeModel()
@@ -13,7 +14,7 @@ struct DepthProbeApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(model)
-                .onOpenURL { url in model.applyConfigLink(url) }
+                .onOpenURL { url in model.receiveConfigLink(url) }  // operator confirms in-app (DE-04)
         }
         .onChange(of: scenePhase, initial: true) { _, phase in
             switch phase {

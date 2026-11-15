@@ -355,6 +355,31 @@ def _scores(rows: list[dict], split: str, genuine: int) -> np.ndarray:
     return np.array([float(r["score"]) for r in rows if r["split"] == split and int(r["genuine"]) == genuine])
 
 
+def _impostor_units(rows: list[dict], split: str) -> dict:
+    """Independence units behind the impostor comparisons of one split (DE-07): each probe image is compared
+    with every other gallery subject, so comparisons are not independent Bernoulli trials. The claim gate uses
+    distinct UNORDERED subject pairs ({A,B}: A's probes vs B's gallery and B's probes vs A's gallery are one
+    identity pair, T-02), the most conservative unit available."""
+    imp = [r for r in rows if r["split"] == split and int(r["genuine"]) == 0]
+    return {"comparisons": len(imp), "probe_images": len({r["probe_attempt_id"] for r in imp}),
+            "subject_pairs": len({_pair_key(r) for r in imp})}
+
+
+def _pair_key(r: dict) -> tuple[str, str]:
+    a, b = r["probe_subject"], r["gallery_subject"]
+    return (a, b) if a <= b else (b, a)
+
+
+def _pair_level_fmr(rows: list[dict], split: str, t: float) -> dict:
+    """FMR over unordered impostor subject pairs: a pair is a false match if ANY of its comparisons is >= t."""
+    pairs: dict[tuple[str, str], bool] = {}
+    for r in rows:
+        if r["split"] == split and int(r["genuine"]) == 0:
+            key = _pair_key(r)
+            pairs[key] = pairs.get(key, False) or float(r["score"]) >= t
+    return st.rate(sum(pairs.values()), len(pairs))
+
+
 def _rank1(rows: list[dict], split: str) -> dict:
     best: dict[str, tuple[float, str, str]] = {}
     for r in rows:
@@ -388,6 +413,8 @@ def match_block(cmp_rows: list[dict], th: dict, calib_split: str, report_split: 
             src = "config/thresholds.yaml match.rekognition.allow_min_similarity / 100"
         g_dev, i_dev = _scores(m, calib_split, 1), _scores(m, calib_split, 0)
         g_test, i_test = _scores(m, report_split, 1), _scores(m, report_split, 0)
+        live = [r for r in m if r["source"] == "live"]
+        g_test_live, i_test_live = _scores(live, report_split, 1), _scores(live, report_split, 0)
         cal = detlib.calibrate_threshold(i_dev, pctl)
         cal["split"] = calib_split
         cal["sources"] = dict(Counter(r["source"] for r in m if r["split"] == calib_split and r["genuine"] == "0"))
@@ -420,6 +447,7 @@ def match_block(cmp_rows: list[dict], th: dict, calib_split: str, report_split: 
             "test": {
                 "split": report_split,
                 "at_configured_online": at(t_on, g_test, i_test),
+                "at_configured_online_live": at(t_on, g_test_live, i_test_live),
                 "at_configured_offline": at(t_off, g_test, i_test),
                 "at_calibrated": at(t_cal, g_test, i_test),
                 "at_calibrated_offline": at(t_cal + delta if not math.isnan(t_cal) else NAN, g_test, i_test),
@@ -444,8 +472,16 @@ def match_block(cmp_rows: list[dict], th: dict, calib_split: str, report_split: 
                 "errors": err, "class_mix": {"genuine": cfg["fnmr"]["n"], "impostor": cfg["fmr"]["n"]},
                 "note": "HID-style 'face-auth accuracy' translation; depends on the genuine:impostor mix - read FMR "
                         "and FNMR."}
-        n_imp = blk["counts"][report_split]["impostor"]
-        blk["test"]["fmr_claim_supportable"] = n_imp >= blk["trials_needed_fmr_0p2pct"]["0_errors"]
+        units = _impostor_units(live, report_split)
+        needed = blk["trials_needed_fmr_0p2pct"]["0_errors"]
+        blk["test"]["impostor_units_live"] = units
+        if not math.isnan(t_on):
+            blk["test"]["fmr_subject_pair_level_live"] = _pair_level_fmr(live, report_split, t_on)
+        blk["test"]["fmr_claim_supportable"] = units["subject_pairs"] >= needed
+        blk["test"]["fmr_claim_basis"] = (
+            f"{units['subject_pairs']} distinct unordered live impostor subject pairs (from {units['comparisons']} "
+            f"comparisons of {units['probe_images']} probe images) vs {needed} needed at 0 errors; comparisons "
+            "sharing a probe image or subject are not independent trials and LFW padding is excluded")
         if make_plots and (len(g_test) and len(i_test) or len(g_dev) and len(i_dev)):
             pts = []
             for lab, rec in (("configured", blk["test"]["at_configured_online"]),
@@ -549,6 +585,30 @@ def scenario_block(scn_rows: list[dict], cases: dict[str, dict], attempts: list[
 
 # ===================================================================== targets
 
+FAR_DEPENDENT_STATUS = "NOT CONFIRMED (dependent comparisons; see fmr_claim_basis)"
+
+
+def _far_row(arc_test: dict, fmr: dict | None, target: float, err_status, pad: dict | None) -> dict:
+    """FAR target row (T-01): status from the subject-pair-level FMR (independent units), never from the
+    comparison-level CP bound; the comparison-level rate is shown for information only."""
+    pair = arc_test.get("fmr_subject_pair_level_live")
+    info = None if not fmr or not fmr["n"] else {"rate": fmr["rate"], "ub95": fmr["ub95"], "text": fmr["text"]}
+    if pair and pair.get("n"):
+        measured = {"rate": pair["rate"], "ub95": pair["ub95"], "n": pair["n"], "text": pair["text"],
+                    "unit": "unordered live impostor subject pairs",
+                    "what": "matcher FMR at configured threshold, test split, live only (LFW excluded); a pair is a "
+                            "false match if any of its comparisons is >= threshold",
+                    "comparison_level": info}
+        status = err_status(pair, target)
+    else:
+        measured = None if info is None else {**info, "comparison_level": info,
+                                              "what": "comparison-level only; comparisons are not independent"}
+        status = "NO_DATA" if info is None else FAR_DEPENDENT_STATUS
+    return {"target": "False acceptance rate (FAR)", "target_value": target, "measured": measured,
+            "status": status, "basis": arc_test.get("fmr_claim_basis"),
+            "iso_view": None if not pad else f"live attacks reaching ALLOW {pad['far_transaction_attacks']['text']}"}
+
+
 def target_rows(pad: dict | None, match: dict, lat: dict | None, targets: dict) -> list[dict]:
     rows = []
 
@@ -576,24 +636,21 @@ def target_rows(pad: dict | None, match: dict, lat: dict | None, targets: dict) 
         f"BPCER {pad['bpcer']['text']}",
     })
     arc = match.get("arcface") or {}
-    fnmr = ((arc.get("test") or {}).get("at_configured_online") or {}).get("fnmr")
+    arc_test = arc.get("test") or {}
+    op = arc_test.get("at_configured_online_live") or arc_test.get("at_configured_online") or {}
+    fnmr = op.get("fnmr")
     rows.append({
         "target": "Face authentication accuracy", "target_value": targets["face_auth_accuracy"],
         "measured": None if not fnmr or not fnmr["n"] else {
-            "accuracy": 1 - fnmr["rate"], "lb95": 1 - fnmr["ub95"],
+            "accuracy": 1 - fnmr["rate"], "lb95": 1 - fnmr["ub95"], "n": fnmr["n"],
             "text": f"1 - FNMR at configured threshold: {fnmr['n'] - fnmr['k']}/{fnmr['n']} = "
-                    f"{st.pct(1 - fnmr['rate'], up=False)} (95% LB = {st.pct(1 - fnmr['ub95'], up=False)})"},
+                    f"{st.pct(1 - fnmr['rate'], up=False)} (95% LB = {st.pct(1 - fnmr['ub95'], up=False)})",
+            "what": "live genuine comparisons only (LFW excluded), test split; probe images of one subject are not "
+                    "independent trials, so the LB is optimistic for a small cohort"},
         "status": err_status(fnmr, 1 - targets["face_auth_accuracy"]),
         "iso_view": None if not pad else f"live rank-1 {pad['rank1_live']['text']}",
     })
-    fmr = ((arc.get("test") or {}).get("at_configured_online") or {}).get("fmr")
-    rows.append({
-        "target": "False acceptance rate (FAR)", "target_value": targets["far"],
-        "measured": None if not fmr or not fmr["n"] else {"rate": fmr["rate"], "ub95": fmr["ub95"], "text": fmr["text"],
-                                                          "what": "matcher FMR at configured threshold, test split"},
-        "status": err_status(fmr, targets["far"]),
-        "iso_view": None if not pad else f"live attacks reaching ALLOW {pad['far_transaction_attacks']['text']}",
-    })
+    rows.append(_far_row(arc_test, op.get("fmr"), targets["far"], err_status, pad))
     frr = (pad or {}).get("frr_transaction")
     rows.append({
         "target": "False rejection rate (FRR)", "target_value": targets["frr"],

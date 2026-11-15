@@ -219,23 +219,20 @@ def test_sanitize_removes_blobs():
     assert set(row) == set(S.ATTEMPT_COLUMNS)
 
 
-def test_admin_token_from_env_file(tmp_path, monkeypatch):
-    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
-    f = tmp_path / ".env"
-    f.write_text("FOO=1\nADMIN_TOKEN=dummy-secret-123   # comment\n")
-    assert C.load_admin_token(f) == "dummy-secret-123"
-    assert C.load_admin_token(tmp_path / "missing") is None
 
 
 # ------------------------------------------------------------------ end-to-end against a fake edge
 
-TOKEN = "DUMMY-ADMIN-TOKEN-xyz"
+TOKEN = "DUMMY-ADMIN-TOKEN-xyz"  # legacy X-Admin-Token (only with FG_ALLOW_LEGACY_ADMIN_TOKEN=1)
+KEY = "fgk_dummy001." + "K" * 43  # evaluator API key (Authorization: Bearer)
 
 
 class FakeEdge(BaseHTTPRequestHandler):
     events: ClassVar[list] = []
     admin_log: ClassVar[list] = []
     poll_log: ClassVar[list] = []
+    auth_log: ClassVar[list] = []
+    admin_status: ClassVar[int] = 0  # forced status for admin routes (e.g. 403); 0 = normal
 
     def log_message(self, *a):  # quiet
         pass
@@ -248,12 +245,20 @@ class FakeEdge(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _authed(self):
+        FakeEdge.auth_log.append((self.path, self.headers.get("Authorization"), self.headers.get("X-Admin-Token")))
+        return (self.headers.get("Authorization") == f"Bearer {KEY}"
+                or self.headers.get("X-Admin-Token") == TOKEN)
+
     def _admin(self, method):
-        ok = self.headers.get("X-Admin-Token") == TOKEN
+        ok = self._authed()
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length)) if length else None
         FakeEdge.admin_log.append((method, self.path, ok, body))
-        return self._json({"ok": ok}, 200 if ok else 401)
+        if ok and FakeEdge.admin_status:
+            return self._json({"error": {"code": "FORBIDDEN", "reason": "MISSING_PERMISSION",
+                                         "required": ["eval:admin"]}}, FakeEdge.admin_status)
+        return self._json({"ok": ok} if ok else {"error": {"code": "UNAUTHORIZED"}}, 200 if ok else 401)
 
     def do_POST(self):
         return self._admin("POST")
@@ -278,6 +283,8 @@ class FakeEdge(BaseHTTPRequestHandler):
         if self.path.startswith("/v1/events"):
             if getattr(self.server, "no_sse", False):
                 return self._json({"error": "not found"}, 404)
+            if not self._authed():
+                return self._json({"error": {"code": "UNAUTHORIZED", "reason": "CREDENTIAL_INVALID"}}, 401)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
@@ -297,6 +304,8 @@ def _serve(events, no_sse=False):
     FakeEdge.events = events
     FakeEdge.admin_log = []
     FakeEdge.poll_log = []
+    FakeEdge.auth_log = []
+    FakeEdge.admin_status = 0
     srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeEdge)
     srv.t0 = time.time()
     srv.no_sse = no_sse
@@ -315,7 +324,9 @@ EVENTS = [(0.8, "decision", ALLOW_EV | {"attempt_id": "att_E1", "eval": TAGS_DIM
 
 @pytest.mark.parametrize("transport,no_sse", [("sse", False), ("auto", True)])
 def test_end_to_end_capture(tmp_path, fixtures, transport, no_sse, monkeypatch, capsys):
-    monkeypatch.setenv("ADMIN_TOKEN", TOKEN)
+    monkeypatch.setenv("FG_EVAL_API_KEY", KEY)
+    monkeypatch.setenv("ADMIN_TOKEN", TOKEN)  # present but ignored: no FG_ALLOW_LEGACY_ADMIN_TOKEN
+    monkeypatch.delenv("FG_ALLOW_LEGACY_ADMIN_TOKEN", raising=False)
     typed = iter(["att_E1", "att_E2"])  # poll-only mode: the operator types the ids from the admin live feed
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(typed))
     srv = _serve(EVENTS, no_sse=no_sse)
@@ -346,7 +357,7 @@ def test_end_to_end_capture(tmp_path, fixtures, transport, no_sse, monkeypatch, 
         assert all("EVAL_TAG" not in r["notes"] for r in rows)
         assert S.validate_attempts(rows, header, results_file=False)[0] == []
         man = json.loads((tmp_path / "runs" / "DUMMY-CAP.json").read_text())
-        assert man["kind"] == "capture" and man["counts"]["ALLOW"] == 2 and man["admin_token_present"] is True
+        assert man["kind"] == "capture" and man["counts"]["ALLOW"] == 2 and man["edge_credential"].startswith("API key key:dummy001")
         assert man["transport_used"] == ("sse" if transport == "sse" else "poll")
         assert man["edge_health_at_start"]["status"] == "ok" and len(man["thresholds_sha256"]) == 64
         assert man["shipped_switches"]["flash"]["state"] in ("ADVISORY", "ENFORCED")
@@ -358,10 +369,12 @@ def test_end_to_end_capture(tmp_path, fixtures, transport, no_sse, monkeypatch, 
                             "condition": "dim", "split": "test"}
         assert any(m == "DELETE" for m, *_ in FakeEdge.admin_log)
         assert any(p == "/v1/admin/rate-limit/reset" for _, p, *_ in FakeEdge.admin_log)
-        # the admin token never leaks into output, manifest or CSV
-        printed = capsys.readouterr().out
-        for blob in (printed, out.read_text(), (tmp_path / "runs" / "DUMMY-CAP.json").read_text()):
-            assert TOKEN not in blob
+        # every authenticated call used the Bearer key, never the legacy header
+        assert FakeEdge.auth_log and all(a == f"Bearer {KEY}" and x is None for _, a, x in FakeEdge.auth_log)
+        # neither secret leaks into output, manifest or CSV
+        cap = capsys.readouterr()
+        for blob in (cap.out, cap.err, out.read_text(), (tmp_path / "runs" / "DUMMY-CAP.json").read_text()):
+            assert TOKEN not in blob and KEY not in blob
         raw = out.read_text()
         assert "embedding" not in raw and "QUJD" not in raw and "DUMMY NAME" not in raw
     finally:
@@ -369,7 +382,7 @@ def test_end_to_end_capture(tmp_path, fixtures, transport, no_sse, monkeypatch, 
 
 
 def test_no_response_when_edge_silent(tmp_path, fixtures, monkeypatch):
-    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
+    monkeypatch.setenv("FG_EVAL_API_KEY", KEY)
     srv = _serve([])
     try:
         out = tmp_path / "attempts.csv"
@@ -379,6 +392,121 @@ def test_no_response_when_edge_silent(tmp_path, fixtures, monkeypatch):
                        "--first-timeout", "1", "--env-file", str(tmp_path / "no.env")]) == 0
         _, rows = eio.read_csv(out)
         assert len(rows) == 1 and rows[0]["decision"] == "NO_RESPONSE" and rows[0]["attempt_class"] == "attack"
+    finally:
+        srv.shutdown()
+
+
+def _flags_run(tmp_path, fixtures, port, run_id="DUMMY-AUTH"):
+    return C.main(["--edge", f"http://127.0.0.1:{port}", "--transport", "sse", "--out", str(tmp_path / "a.csv"),
+                   "--subjects", str(fixtures / "subjects_DUMMY.csv"), "--subject", "DUMMY_S03",
+                   "--species", "print", "--count", "1", "--no-prompt", "--run-id", run_id,
+                   "--first-timeout", "3", "--env-file", str(tmp_path / "no.env")])
+
+
+def _clear_cred_env(monkeypatch):
+    for k in ("FG_EVAL_API_KEY", "FG_ALLOW_LEGACY_ADMIN_TOKEN", "ADMIN_TOKEN"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_no_credential_exits_before_any_call(tmp_path, fixtures, monkeypatch, capsys):
+    _clear_cred_env(monkeypatch)
+    monkeypatch.setenv("ADMIN_TOKEN", TOKEN)  # legacy token without the opt-in flag is not used
+    srv = _serve([])
+    try:
+        assert _flags_run(tmp_path, fixtures, srv.server_port) == 5
+        assert not FakeEdge.admin_log and not FakeEdge.auth_log
+        err = capsys.readouterr().err
+        assert "FG_EVAL_API_KEY" in err and TOKEN not in err
+    finally:
+        srv.shutdown()
+
+
+def test_legacy_token_only_with_opt_in_flag(tmp_path, fixtures, monkeypatch):
+    _clear_cred_env(monkeypatch)
+    monkeypatch.setenv("ADMIN_TOKEN", TOKEN)
+    monkeypatch.setenv("FG_ALLOW_LEGACY_ADMIN_TOKEN", "1")
+    srv = _serve([])
+    try:
+        assert _flags_run(tmp_path, fixtures, srv.server_port, "DUMMY-LEG") == 0
+        assert FakeEdge.auth_log and all(x == TOKEN and a is None for _, a, x in FakeEdge.auth_log)
+    finally:
+        srv.shutdown()
+
+
+def test_wrong_key_on_sse_or_admin_exits_with_clear_error(tmp_path, fixtures, monkeypatch, capsys):
+    _clear_cred_env(monkeypatch)
+    bad = "fgk_wrong001." + "W" * 43
+    monkeypatch.setenv("FG_EVAL_API_KEY", bad)
+    srv = _serve([])
+    try:
+        assert _flags_run(tmp_path, fixtures, srv.server_port) == 5
+        err = capsys.readouterr().err
+        assert "HTTP 401" in err and "key:wrong001" in err and bad not in err
+        assert not (tmp_path / "a.csv").exists() or "DUMMY" not in (tmp_path / "a.csv").read_text()
+    finally:
+        srv.shutdown()
+
+
+def test_admin_403_stops_the_run(tmp_path, fixtures, monkeypatch, capsys):
+    _clear_cred_env(monkeypatch)
+    monkeypatch.setenv("FG_EVAL_API_KEY", KEY)
+    srv = _serve([])
+    FakeEdge.admin_status = 403
+    try:
+        assert _flags_run(tmp_path, fixtures, srv.server_port) == 5
+        err = capsys.readouterr().err
+        assert "HTTP 403" in err and "MISSING_PERMISSION" in err and "eval:admin" in err
+        man = json.loads((tmp_path / "runs" / "DUMMY-AUTH.json").read_text())
+        assert man["auth_failed"] is True
+    finally:
+        srv.shutdown()
+
+
+def test_sse_401_mid_run_stops_without_silent_retry(tmp_path, fixtures, monkeypatch, capsys):
+    """Admin calls pass but the stream is refused: the run must stop, not poll/retry silently."""
+    _clear_cred_env(monkeypatch)
+    monkeypatch.setenv("FG_EVAL_API_KEY", KEY)
+    srv = _serve([])
+    orig = FakeEdge._authed
+    monkeypatch.setattr(FakeEdge, "_authed", lambda self: orig(self) and not self.path.startswith("/v1/events"))
+    try:
+        t0 = time.time()
+        assert _flags_run(tmp_path, fixtures, srv.server_port) == 5
+        assert time.time() - t0 < 3.0  # stopped on the 401, did not wait for the first-decision timeout
+        assert "GET /v1/events: HTTP 401" in capsys.readouterr().err
+    finally:
+        srv.shutdown()
+
+
+AUTH_END_EVENTS = [(0.1, "decision", ALLOW_EV | {"attempt_id": "att_PRE"}),  # before arming: ignored
+                   (0.3, "auth", {"reason": "SESSION_ENDED"})]
+AUTH_END_FIRST_TIMEOUT_S = 20  # generous: the test must not depend on machine load
+
+
+def test_sse_auth_event_mid_stream_stops_the_run(tmp_path, fixtures, monkeypatch, capsys):
+    """T-07: the edge ends the stream with `event: auth` (key expired / revoked / lost events:read):
+    the run stops with exit 5 at once, never reconnects or waits for the first-decision timeout."""
+    _clear_cred_env(monkeypatch)
+    monkeypatch.setenv("FG_EVAL_API_KEY", KEY)
+    monkeypatch.setenv("ADMIN_TOKEN", TOKEN)  # present but unused (no legacy opt-in)
+    srv = _serve(AUTH_END_EVENTS)
+    try:
+        t0 = time.time()
+        rc = C.main(["--edge", f"http://127.0.0.1:{srv.server_port}", "--transport", "sse",
+                     "--out", str(tmp_path / "a.csv"), "--subjects", str(fixtures / "subjects_DUMMY.csv"),
+                     "--subject", "DUMMY_S03", "--species", "print", "--count", "1", "--no-prompt",
+                     "--run-id", "DUMMY-AEV", "--first-timeout", str(AUTH_END_FIRST_TIMEOUT_S),
+                     "--env-file", str(tmp_path / "no.env")])
+        assert rc == 5
+        # stopped on the auth event, well before the first-decision timeout (NO_RESPONSE row, rc 0)
+        assert time.time() - t0 < AUTH_END_FIRST_TIMEOUT_S / 2
+        assert not (tmp_path / "a.csv").exists()
+        cap = capsys.readouterr()
+        assert "event: auth" in cap.err and "key:dummy001" in cap.err
+        for blob in (cap.out, cap.err):
+            assert KEY not in blob and TOKEN not in blob
+        man = json.loads((tmp_path / "runs" / "DUMMY-AEV.json").read_text())
+        assert man["auth_failed"] is True
     finally:
         srv.shutdown()
 
@@ -475,3 +603,13 @@ def test_event_source_polls_followed_ids_only(monkeypatch):
     kind, _, ev = q.get_nowait()
     assert kind == "decision" and ev["attempt_id"] == "att_P1" and ev["via"] == "poll"
     assert src.poll_calls["200"] == 2 and src.poll_calls["409"] == 2
+
+
+def test_credential_never_sent_to_a_remote_http_edge(tmp_path, fixtures, monkeypatch, capsys):
+    """DE-11: EDGE_URL / --edge pointing at a LAN host over http is refused before any request."""
+    _clear_cred_env(monkeypatch)
+    monkeypatch.setenv("FG_EVAL_API_KEY", KEY)
+    rc = C.main(["--edge", "http://192.0.2.10:8000", "--out", str(tmp_path / "a.csv"),
+                 "--subjects", str(fixtures / "subjects_DUMMY.csv"), "--subject", "DUMMY_S03",
+                 "--species", "print", "--count", "1", "--no-prompt", "--run-id", "DUMMY-RM"])
+    assert rc == 5 and "loopback" in capsys.readouterr().err

@@ -8,6 +8,7 @@ from __future__ import annotations
 import csv
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -147,3 +148,57 @@ def test_listener_matches_edge_for_depthprobe_v03(server):
     req = urllib.request.Request(url, headers={"X-Depth-Token": TOKEN})
     with urllib.request.urlopen(req, timeout=5) as resp:
         assert resp.status == 204
+
+
+# ------------------------------------------------------------------ DE-12: calibration server hardening
+
+def test_concurrent_duplicate_uploads_are_measured_once(server, monkeypatch):
+    """Two uploads with the same nonce race: exactly one is processed and logged, the other gets 409."""
+    from depth import calibrate
+
+    server.enqueue(label="print")
+    job = fake_probe.poll_pending(_edge(server), 2.0, TOKEN)
+    body, ctype, _ = fake_probe.build_upload(job, scene="flat", rng=np.random.default_rng(0))
+    real = calibrate.process_upload
+
+    def slow(*a, **kw):  # keep the first upload in flight while the second one is checked
+        time.sleep(0.3)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(calibrate, "process_upload", slow)
+    codes: list[int] = []
+
+    def post():
+        codes.append(server.handle_frames(ctype, body)[0])
+
+    threads = [threading.Thread(target=post) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+    assert sorted(codes) == [200, 409]
+    assert len(read_rows(server.csv_path)) == 1
+
+
+def test_csv_cells_cannot_inject_spreadsheet_formulas(tmp_path):
+    from depth.calibrate import CSV_FIELDS, append_row
+
+    path = tmp_path / "c.csv"
+    append_row(path, {"device": '=HYPERLINK("http://x","y")', "notes": "+cmd", "subject": "@x",
+                      "label": "-1+1", "d1_plane_rms_mm": -1.5})
+    row = next(csv.DictReader(path.open()))
+    assert row["device"].startswith("'=") and row["notes"] == "'+cmd" and row["subject"] == "'@x"
+    assert row["label"] == "'-1+1" and row["d1_plane_rms_mm"] == "-1.5"  # numbers untouched
+    assert set(row) == set(CSV_FIELDS)
+
+
+def test_non_integer_content_length_is_a_422(server):
+    import http.client
+
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    conn.putrequest("POST", "/v1/depth/frames")
+    conn.putheader("X-Depth-Token", TOKEN)
+    conn.putheader("Content-Length", "abc")
+    conn.endheaders()
+    resp = conn.getresponse()
+    assert resp.status == 422 and b"VALIDATION_ERROR" in resp.read()

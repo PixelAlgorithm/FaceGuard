@@ -42,6 +42,7 @@ from depth.checks import (
     compute_m1,
     empty_signal,
     fuse_depth_mm,
+    intrinsics_plausible,
 )
 
 PHASES = ("PASSIVE", "CHALLENGE")
@@ -102,7 +103,11 @@ def _per_frame_list(v: Any, parse: Any) -> list[Any] | None:
     return [parse(item) for item in v]
 
 
-def _intrinsics(v: Any) -> dict[str, float] | None:
+def _intrinsics(v: Any, width: int, height: int, source: Any) -> dict[str, float] | None:
+    """fx, fy, cx, cy (+ ref_width/ref_height) as floats, physically plausible (else DepthProtocolError).
+
+    `intrinsics_source: "fov"` (the phone had no calibration data and guessed fx from the video FOV) adds
+    `estimated: 1.0`: D1-D3 still use them, D4 (absolute IPD scale) is not reported (DE-10)."""
     if v is None:
         return None
     if not isinstance(v, Mapping):
@@ -114,6 +119,11 @@ def _intrinsics(v: Any) -> dict[str, float] | None:
                 out[k] = float(v[k])
     except (KeyError, TypeError, ValueError) as exc:
         raise DepthProtocolError("intrinsics needs numeric fx, fy, cx, cy") from exc
+    rw, rh = out.get("ref_width", float(width)), out.get("ref_height", float(height))
+    if not intrinsics_plausible(out["fx"], out["fy"], out["cx"], out["cy"], rw, rh):
+        raise DepthProtocolError("intrinsics out of physical range")
+    if source == "fov":
+        out["estimated"] = 1.0
     return out
 
 
@@ -160,7 +170,7 @@ def parse_meta(raw: str | bytes | Mapping[str, Any]) -> dict[str, Any]:
         dtype=dtype,
         width=width,
         height=height,
-        intrinsics=_intrinsics(meta.get("intrinsics")),
+        intrinsics=_intrinsics(meta.get("intrinsics"), width, height, meta.get("intrinsics_source")),
         face_box_norm=_box(meta.get("face_box_norm")),
         landmarks_norm=_landmarks(meta.get("landmarks_norm")),
         face_box_norm_frames=_per_frame_list(meta.get("face_box_norm_frames"), _box),

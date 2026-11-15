@@ -14,6 +14,11 @@ whitelisted scalar fields capture.py writes (never images, crops, embeddings or 
   uv run python snapshot_metrics.py --fixture tests/fixtures/edge_snapshot_DUMMY.json --out-root /tmp/snap
 
 Writes <out-root>/<UTC ts>/: edge_metrics.json, edge_mode.json, edge_health.json, attempts.json, SNAPSHOT.md.
+
+Auth (RBAC): `GET /v1/metrics` needs metrics:read, sent as `Authorization: Bearer $FG_EVAL_API_KEY` (evaluator key,
+environment or project .env; never printed). Legacy ADMIN_TOKEN only with FG_ALLOW_LEGACY_ADMIN_TOKEN=1. A missing
+credential or a 401/403 exits 5 with a clear error and writes nothing. The other routes are public (no credential
+sent). --fixture runs need no credential.
 """
 
 from __future__ import annotations
@@ -23,11 +28,13 @@ import json
 import sys
 from collections import Counter
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 
 import capture as C
 from evallib import RESULTS_DIR, THRESHOLDS_PATH
+from evallib import auth as A
 from evallib import config as ecfg
 from evallib import io as eio
 from evallib import schema as S
@@ -41,12 +48,13 @@ ATTEMPT_FIELDS = ("attempt_id", "decision", "stage", "reason_codes", "resolved_c
 class Source:
     """HTTP GETs against the edge, or canned responses from a DUMMY fixture (dry run)."""
 
-    def __init__(self, edge: str, fixture: Path | None = None):
-        self.edge = edge.rstrip("/")
+    def __init__(self, edge: str, fixture: Path | None = None, cred: A.EdgeCredential | None = None):
+        self.edge, self.cred = edge.rstrip("/"), cred
         self.fx = json.loads(fixture.read_text(encoding="utf-8")) if fixture else None
         self.calls: Counter = Counter()
 
-    def get(self, path: str) -> tuple[int, dict | None]:
+    def get(self, path: str, authed: bool = False) -> tuple[int, dict | None]:
+        """GET; `authed` sends the credential and raises evallib.auth.AuthFailure on 401/403."""
         if self.fx is not None:
             key = path.split("?")[0]
             if key.startswith("/v1/attempt/"):
@@ -56,15 +64,19 @@ class Source:
             self.calls[f"fixture {key.split('/att_')[0]}:{200 if obj is not None else 404}"] += 1
             return (200, obj) if obj is not None else (404, None)
         try:
-            r = httpx.get(self.edge + path, timeout=3.0)
+            headers = self.cred.headers() if authed and self.cred else {}
+            r = httpx.get(self.edge + path, headers=headers, timeout=3.0)
         except (httpx.HTTPError, OSError) as e:
             self.calls[f"GET {path.split('/att_')[0]}:{type(e).__name__}"] += 1
             return 0, None
         self.calls[f"GET {path.split('/att_')[0]}:{r.status_code}"] += 1
         try:
-            obj = r.json() if r.status_code == 200 else None
+            body = r.json()
         except ValueError:
-            obj = None
+            body = None
+        if authed:
+            A.raise_for_auth(r.status_code, "GET", path.split("?")[0], self.cred, body)
+        obj = body if r.status_code == 200 else None
         return r.status_code, obj if isinstance(obj, dict) else None
 
 
@@ -180,6 +192,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--fixture", type=Path, default=None, help="dry run: canned responses (DUMMY), no network")
     ap.add_argument("--out-root", type=Path, default=RESULTS_DIR / "runs")
     ap.add_argument("--max-attempts", type=int, default=500)
+    ap.add_argument("--allow-remote-edge", action="store_true",
+                    help="allow a non-loopback edge (https only); credentials never go to remote plain http")
+    ap.add_argument("--env-file", type=Path, default=A.DEFAULT_ENV_FILE,
+                    help="fallback source of FG_EVAL_API_KEY (and of ADMIN_TOKEN with FG_ALLOW_LEGACY_ADMIN_TOKEN=1)")
     a = ap.parse_args(argv)
 
     dummy = a.fixture is not None
@@ -191,10 +207,23 @@ def main(argv: list[str] | None = None) -> int:
         csv_rows = {r["attempt_id"]: r for r in eio.read_csv(a.attempts)[1]}
     ids = list(dict.fromkeys(ids))[: a.max_attempts]
 
-    src = Source(a.edge, a.fixture)
+    try:
+        if not dummy:
+            A.check_edge_url(a.edge, a.allow_remote_edge)
+        cred = None if dummy else A.load_credential(A.EVAL_KEY_ENV, a.env_file)
+        src = Source(a.edge, a.fixture, cred)
+        _, metrics = src.get("/v1/metrics" + (f"?since={quote(a.since, safe='')}" if a.since else ""), authed=True)
+    except A.AuthFailure as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return A.EXIT_AUTH
     _, health = src.get("/v1/health")
-    _, mode = src.get("/v1/mode")
-    _, metrics = src.get("/v1/metrics" + (f"?since={a.since}" if a.since else ""))
+    try:
+        code, mode = src.get(A.MODE_DETAIL_PATH, authed=True)  # store:read; config cross-check fields
+    except A.AuthFailure as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return A.EXIT_AUTH
+    if code == 404:  # older edge (or fixture) without the detail route: public badge subset
+        _, mode = src.get(A.PUBLIC_MODE_PATH)
     attempts: dict[str, dict] = {}
     missing: dict[str, int] = {}
     for aid in ids:
@@ -213,7 +242,8 @@ def main(argv: list[str] | None = None) -> int:
     out = a.out_root / (("DUMMY-" if dummy else "") + f"snapshot_{ts}")
     out.mkdir(parents=True, exist_ok=True)
     meta = {"taken_at_utc": eio.utc_now_iso(), "command": eio.command_line(), "edge": a.edge,
-            "fixture": str(a.fixture) if a.fixture else None, "dummy": dummy, "switches": sw,
+            "fixture": str(a.fixture) if a.fixture else None, "dummy": dummy,
+            "edge_credential": cred.describe() if cred else None, "switches": sw,
             "edge_config_diff": ecfg.compare_with_edge(sw, mode), "calls": dict(src.calls),
             "n_requested": len(ids), "n_found": len(attempts), "n_missing": len(missing), "missing": missing,
             "attempts_csv": str(a.attempts) if a.attempts else None,

@@ -148,7 +148,11 @@ def build(m: dict, metrics_path: Path, chart_files: dict, runs_rel: str) -> tupl
     for t in m.get("hid_targets", []):
         tv = t["target_value"]
         tgt = f"< {tv / 1000:.0f} s" if "Decision time" in t["target"] else pct_up(tv) if tv < 0.5 else pct_dn(tv)
-        meas = (t.get("measured") or {}).get("text") or "not measured"
+        mrec = t.get("measured") or {}
+        meas = mrec.get("text") or "not measured"
+        if mrec.get("unit"):  # FAR: independent units; comparison-level rate for information only
+            cmp_txt = (mrec.get("comparison_level") or {}).get("text")
+            meas += f" per {mrec['unit']}" + (f"; comparison-level {cmp_txt} (not independent)" if cmp_txt else "")
         add(f"| {t['target']} | {tgt} | {meas} | {t['status']} | {t.get('iso_view') or '-'} |")
     add("")
 
@@ -259,7 +263,8 @@ def build(m: dict, metrics_path: Path, chart_files: dict, runs_rel: str) -> tupl
         add("|---|---|---|---|---|")
         for split_key, label in (("test", "test (reported)"), ("dev_tuned_on", "dev (tuned on)")):
             blk = b.get(split_key) or {}
-            for op_key, op in (("at_configured_online", "configured (online)"),
+            for op_key, op in (("at_configured_online_live", "configured (online), live impostors only"),
+                               ("at_configured_online", "configured (online), all sources"),
                                ("at_configured_offline", "configured (offline)"), ("at_calibrated", "calibrated (dev)"),
                                ("at_calibrated_offline", "calibrated + offline delta")):
                 rec = blk.get(op_key)
@@ -273,8 +278,10 @@ def build(m: dict, metrics_path: Path, chart_files: dict, runs_rel: str) -> tupl
             f"{cal.get('split')} impostor scores{'; ' + cal['warning'] if cal.get('warning') else ''}.")
         t = b["test"]
         add(f"EER (test) {pct_up(t['eer']['eer'])}; rank-1 (test) {t['rank1']['text']}; "
-            f"0.2% FMR claim supportable on test N: {t['fmr_claim_supportable']} (needs "
-            f"{b['trials_needed_fmr_0p2pct']['0_errors']} impostor comparisons at 0 errors).")
+            f"0.2% FMR claim supportable: {t['fmr_claim_supportable']} "
+            f"({t.get('fmr_claim_basis') or 'needs ' + str(b['trials_needed_fmr_0p2pct']['0_errors'])})."
+            + (f" Subject-pair-level live FMR: {rate_cell(t['fmr_subject_pair_level_live'])}."
+               if t.get("fmr_subject_pair_level_live") else ""))
         if t.get("verification_accuracy_at_configured"):
             va = t["verification_accuracy_at_configured"]
             add(f"Verification accuracy at the configured threshold: {pct_dn(va['accuracy'])} (95% CI "

@@ -67,14 +67,14 @@ What zero errors can support (one-sided 95 %, computed by `evallib.stats.trials_
 
 | Claim | 0 errors | 1 error | 2 errors |
 |---|---|---|---|
-| FAR / FMR <= 0.2 % | 1,497 impostor comparisons | 2,371 | 3,146 |
+| FAR / FMR <= 0.2 % | 1,497 independent impostor trials (6.6: distinct unordered live subject pairs) | 2,371 | 3,146 |
 | FRR <= 0.6 % | 498 genuine transactions | 789 | 1,048 |
 | APCER <= 5 % per species | 59 | 93 | 124 |
 | APCER <= 2 % per species | 149 | 236 | 313 |
 | BPCER <= 15 % (iBeta cap) | 19 | 30 | 40 |
 
 Conclusion we say out loud: live FRR at 0.6 % cannot be confirmed in one day; FMR at 0.2 % can be supported only
-offline with >= 1,497 impostor comparisons (section 6.7).
+offline with >= 1,497 independent impostor trials (section 6.6), which a team-sized cohort cannot reach.
 
 ## 4. Presentation attack instruments (species) - what the operator physically does
 
@@ -105,7 +105,18 @@ masks. Injection is reported separately from PAD (ISO/IEC 30107-3 and FIDO exclu
 Pre-flight (once per session):
 
 1. Edge healthy: `curl -s 127.0.0.1:8000/v1/health` shows `status: ok` and the PAD self-test passed.
-2. `ADMIN_TOKEN` present in the project `.env` (capture.py reads it; it is never printed or logged).
+2. Edge API keys (RBAC; mint them once on the kiosk laptop, they are shown once and never printed by the tools):
+   `../edge/.venv/bin/python -m edge.auth create-api-key --name eval --role evaluator --expires-days 7 --print-key-only`
+   -> `FG_EVAL_API_KEY` (capture.py, snapshot_metrics.py: SSE `GET /v1/events`, `/v1/admin/eval/context`,
+   `/v1/admin/rate-limit/reset`, `GET /v1/metrics`, `GET /v1/admin/mode/detail` for the config cross-check:
+   the public `GET /v1/mode` is only the badge subset), and
+   `... create-api-key --name ops --role security_officer --role evaluator --expires-days 7 --print-key-only`
+   -> `FG_OPS_API_KEY` (scenarios/run_scenarios.py `--backend store|api`: `GET /v1/admin/store`,
+   `POST /v1/admin/mode`). Put them in the environment or the project `.env`. The tools send
+   `Authorization: Bearer <key>`; a missing key or a 401/403 stops the tool with a clear error and exit code 5
+   (no silent fallback). The legacy shared `ADMIN_TOKEN` is used only with `FG_ALLOW_LEGACY_ADMIN_TOKEN=1`
+   (and the edge's `AUTH_LEGACY_ADMIN_TOKEN=1`). Revoke the keys after the session
+   (`python -m edge.auth revoke-api-key --key-id <id>`).
 3. Eval profile recorded automatically (`evallib/config.py` `shipped_switches`, written into the run manifest
    `results/runs/<run_id>.json` `shipped_switches`, into `RUN_INFO.md` and `SUMMARY.md`): thresholds sha256 +
    `policy_version`, `liveness.flash.enforce` (shipped **false = ADVISORY**: replay-species APCER is measured
@@ -241,6 +252,16 @@ in the run manifest `rate_limit_handling` and in the `RUN_INFO.md` capture-run t
   public-figure web images, no formal licence - research use only; identities split dev/test by hash.
 - **FMR / FNMR at the operating threshold** = `match.local.allow_min_cosine` from `config/thresholds.yaml`
   (online; offline override reported too), test split, accept rule `score >= threshold`, CP bounds.
+  The headline (`at_configured_online_live`, and the HID FAR row) uses **live impostors only**; the pooled
+  value with LFW padding is reported next to it, never instead of it.
+- **Dependence**: one probe image is compared with every other gallery subject, so impostor comparisons are
+  not independent Bernoulli trials and the CP bound on comparisons is optimistic. `metrics.py` reports
+  `impostor_units_live` (comparisons, probe images, subject pairs), a subject-pair-level FMR (a pair is a false
+  match if any of its comparisons is >= threshold) and gates `fmr_claim_supportable` on the number of distinct
+  **unordered** live impostor subject pairs ({A,B} counted once; >= 1,497 at 0 errors), with the basis spelled
+  out in `fmr_claim_basis`. The HID FAR row takes its status from the subject-pair-level FMR, never from the
+  comparison-level CP bound (shown for information only). The face-auth accuracy (FNMR) row uses live genuine
+  comparisons only; probe images of one subject are not independent, so its lower bound is optimistic.
 - **Calibration (DECISION_POLICY 3.5)**: suggested `allow_min_cosine` = 99.8th percentile (numpy linear) of the
   **dev** impostor scores, with N; flagged if N < 500 (the percentile is then not resolvable below the max).
   Offline suggestion = calibrated + `offline.match_offline_delta`. FMR/FNMR at the calibrated value are then
@@ -335,7 +356,7 @@ document at run time. `scenarios/run_scenarios.py` records one row per ID in `sc
 |---|---|---|
 | `pytest` | all gate IDs | runs the edge (and cloud, if its venv exists) pytest suites with JUnit XML; an ID is PASS if every test whose name contains the ID passed, FAIL if any failed, NOT_RUN if no test references it |
 | `store` | D01-D03 | inspects the edge offline store file: no plaintext JSON payloads, no user ids / names / JPEG markers in the raw bytes |
-| `api` | X02, X04 | `POST /v1/admin/mode` force OFFLINE / AUTO and polls `GET /v1/mode` (mode, `sync_queue_depth`), timing recorded |
+| `api` | X06 (partial; + X07 only when records were queued) | Reads `GET /v1/mode` first; if an operator already forced OFFLINE it does not toggle (X06/X07 NOT_RUN "edge already forced OFFLINE by an operator; not toggled"). Otherwise `POST /v1/admin/mode` force OFFLINE (reason, `max_minutes` auto-revert), polls `GET /v1/mode` (mode, `forced`, `sync_queue_depth`), then AUTO. X06 is NOT_RUN (partial) when the badge is right and FAIL when it is wrong or slower than 3 s: next-attempt OFFLINE_MODE and background heartbeats are not exercised (the tool never drives attempts on the live kiosk). AUTO is always restored once the OFFLINE POST was sent, even if it timed out. X02 / X04 are never recorded from a forced toggle |
 | `live` | demo IDs (`Q01`, `S04`, `S01`/`S02`, `S13`, `O01`, `O04`/`O06`, `O17`, `L01`, `L05`) | operator runs them on the kiosk with `capture.py --scenario <ID>`; metrics compares the logged final decision with the document |
 
 Pass/fail is only ever taken from a recorded run; an ID without one is reported `NOT_RUN`. The H5 checkpoint
@@ -354,10 +375,11 @@ uv run python capture.py --plan plans/dev_plan.csv  --run-id R-dev-1  --operator
 uv run python capture.py --plan plans/test_plan.csv --run-id R-test-1 --operator E
 ../edge/.venv/bin/python collect_faces.py webcam --subject S01 --n 12 --lighting office --consent-confirmed
 ../edge/.venv/bin/python compare.py --out results/comparisons.csv
-uv run python scenarios/run_scenarios.py --backend pytest
+uv run python scenarios/run_scenarios.py --backend pytest       # no credential needed
+FG_OPS_API_KEY=... uv run python scenarios/run_scenarios.py --backend store   # D01-D03 (store:read)
 uv run python metrics.py                                   # -> results/metrics.json, det_*.png, RUN_INFO.md
 uv run python summary.py                                   # -> results/SUMMARY.md, dashboard.json, charts
-uv run python snapshot_metrics.py --attempts results/attempts.csv --run-id R-test-1   # edge aggregates snapshot
+uv run python snapshot_metrics.py --attempts results/attempts.csv --run-id R-test-1   # edge aggregates (metrics:read)
 uv run python calibrate.py --split dev                     # -> results/calibration/CALIBRATION_dev.md
 ```
 
@@ -365,14 +387,23 @@ Dry runs (DUMMY fixtures, never into `results/`):
 `uv run python snapshot_metrics.py --fixture tests/fixtures/edge_snapshot_DUMMY.json --attempts tests/fixtures/attempts_DUMMY.csv --run-id DUMMY-R1 --out-root /tmp/snap`;
 `uv run python calibrate.py --attempts tests/fixtures/attempts_DUMMY.csv --exclusions tests/fixtures/exclusions_DUMMY.csv --split test --out-dir /tmp/calib`.
 
+Edge latency (scratch edge, never :8000; provisions its own 1-day evaluator+enroller key, `--auth legacy` for a
+random scratch ADMIN_TOKEN instead): `edge/.venv/bin/python scripts/bench_latency.py --runs 40 --port 8096`
+(from the project root). Curl smoke: `EDGE_URL=http://127.0.0.1:<scratch port> scripts/smoke_edge.sh`
+(port 8000 refused unless `SMOKE_LIVE=1`, 8001 always refused; the URL is parsed, so `:08000` or `:8000?x` count as 8000).
+
+Credentials (all commands above): capture.py and snapshot_metrics.py need `FG_EVAL_API_KEY`, run_scenarios.py
+`--backend store|api` needs `FG_OPS_API_KEY` (pre-flight item 2); exit code 5 = credential missing or refused.
+
 DUMMY demo (never written into `results/`):
 `uv run python metrics.py --attempts tests/fixtures/attempts_DUMMY.csv --comparisons tests/fixtures/comparisons_DUMMY.csv --scenarios tests/fixtures/scenarios_DUMMY.csv --exclusions tests/fixtures/exclusions_DUMMY.csv --out-dir /tmp/eval_dummy`
 
 ## 10. Known limits and open points
 
 - Team-sourced, small cohort; per-species N of 30 bounds APCER only below ~9.5 % at 0 errors (3/N ~ 10 %).
-- 0.2 % FAR / 0.6 % FRR cannot be confirmed live today; matcher FMR is supported only with >= 1,497 impostor
-  comparisons (test split) and only for the local ArcFace matcher (Rekognition not cross-matched).
+- 0.2 % FAR / 0.6 % FRR cannot be confirmed live today; matcher FMR is supported only with >= 1,497
+  independent unordered live impostor subject pairs (test split; 6.6) and only for the local ArcFace matcher
+  (Rekognition not cross-matched).
 - The skill's SC tables (S1-x / S2-x) are superseded by POLICY_TEST_CASES IDs; documented heartbeat detection is
   about 15-17 s (3 misses x 5 s), not the 5 s mentioned in older demo text.
 - Licences: InsightFace w600k_r50 (buffalo_l) recognition weights are non-commercial research only;

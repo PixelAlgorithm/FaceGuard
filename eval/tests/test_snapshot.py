@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import ClassVar
 
 import pytest
 
@@ -58,3 +61,83 @@ def test_redact_keeps_document_but_drops_flagged_values():
     assert out["template_cache"] == SN.REDACTED and out["x"] == [{"embedding": SN.REDACTED}, SN.REDACTED]
     left = SN.privacy_scan(out, "m")  # only the (now empty) key names remain flagged; no value survives
     assert left and all(f.endswith("forbidden key") for f in left) and "QUJD" not in json.dumps(out)
+
+
+# ------------------------------------------------------------------ auth against a local fake edge
+
+KEY = "fgk_dummy002." + "S" * 43
+
+
+class _Edge(BaseHTTPRequestHandler):
+    seen: ClassVar[list] = []
+    metrics_status: ClassVar[int] = 200
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        _Edge.seen.append((self.path, self.headers.get("Authorization"), self.headers.get("X-Admin-Token")))
+        code, obj = 200, {"status": "ok"}
+        if self.path == "/v1/admin/mode/detail":
+            ok = self.headers.get("Authorization") == f"Bearer {KEY}"
+            code, obj = (200, {"mode": "ONLINE", "policy_version": "DUMMY"}) if ok else (401, {})
+        if self.path.startswith("/v1/metrics"):
+            ok = self.headers.get("Authorization") == f"Bearer {KEY}"
+            code = _Edge.metrics_status if ok else 401
+            obj = {"attempts": 1, "decisions": {}} if code == 200 else {
+                "error": {"code": "FORBIDDEN" if code == 403 else "UNAUTHORIZED", "reason": "MISSING_PERMISSION"}}
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@pytest.fixture
+def edge():
+    _Edge.seen, _Edge.metrics_status = [], 200
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Edge)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield srv
+    srv.shutdown()
+
+
+def _live(tmp_path, edge):
+    return SN.main(["--edge", f"http://127.0.0.1:{edge.server_port}", "--out-root", str(tmp_path / "snap"),
+                    "--env-file", str(tmp_path / "no.env")])
+
+
+def _no_cred(monkeypatch):
+    for k in ("FG_EVAL_API_KEY", "FG_ALLOW_LEGACY_ADMIN_TOKEN", "ADMIN_TOKEN"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_metrics_sent_with_bearer_only_to_metrics(tmp_path, edge, monkeypatch, capsys):
+    _no_cred(monkeypatch)
+    monkeypatch.setenv("FG_EVAL_API_KEY", KEY)
+    assert _live(tmp_path, edge) == 0
+    authed = sorted(p for p, a, _ in _Edge.seen if a)
+    assert authed == ["/v1/admin/mode/detail", "/v1/metrics"] and all(x is None for *_, x in _Edge.seen)
+    (snap,) = list((tmp_path / "snap").iterdir())
+    assert json.loads((snap / "edge_mode.json").read_text())["policy_version"] == "DUMMY"
+    (out,) = list((tmp_path / "snap").iterdir())
+    blob = "".join(f.read_text() for f in out.iterdir()) + capsys.readouterr().out
+    assert KEY not in blob and "key:dummy002" in (out / "attempts.json").read_text()
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_metrics_auth_failure_exits_5_and_writes_nothing(tmp_path, edge, monkeypatch, capsys, status):
+    _no_cred(monkeypatch)
+    monkeypatch.setenv("FG_EVAL_API_KEY", KEY if status == 403 else "fgk_wrong002." + "W" * 43)
+    _Edge.metrics_status = status
+    assert _live(tmp_path, edge) == 5
+    assert not (tmp_path / "snap").exists()
+    err = capsys.readouterr().err
+    assert f"HTTP {status}" in err and KEY not in err
+
+
+def test_no_credential_exits_5(tmp_path, edge, monkeypatch, capsys):
+    _no_cred(monkeypatch)
+    assert _live(tmp_path, edge) == 5 and not _Edge.seen
+    assert "FG_EVAL_API_KEY" in capsys.readouterr().err

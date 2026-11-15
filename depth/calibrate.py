@@ -110,6 +110,18 @@ def _utc() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")  # spreadsheet formula triggers (CSV injection)
+
+
+def _csv_cell(v: Any) -> Any:
+    """'' for None; strings that a spreadsheet would evaluate get a leading quote. Numbers are untouched."""
+    if v is None:
+        return ""
+    if isinstance(v, str) and v.startswith(CSV_FORMULA_PREFIXES):
+        return "'" + v
+    return v
+
+
 def append_row(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     new = not path.exists() or path.stat().st_size == 0
@@ -117,7 +129,7 @@ def append_row(path: Path, row: dict[str, Any]) -> None:
         w = csv.DictWriter(fh, fieldnames=CSV_FIELDS, extrasaction="ignore")
         if new:
             w.writeheader()
-        w.writerow({k: ("" if row.get(k) is None else row.get(k)) for k in CSV_FIELDS})
+        w.writerow({k: _csv_cell(row.get(k)) for k in CSV_FIELDS})
 
 
 def result_row(
@@ -192,6 +204,7 @@ class Job:
     deadline_ms: float
     dispatched_ms: float | None = None
     done: bool = False
+    in_flight: bool = False  # an upload holding the nonce is being measured (claimed under the lock)
 
 
 class CalibrationServer:
@@ -299,20 +312,30 @@ class CalibrationServer:
             blobs = [parts[f"depth_{i}"][1] for i in range(3) if f"depth_{i}" in parts]
             phase = str(meta.get("phase", "")).upper()
             key = (str(meta.get("attempt_id")), phase)
-            with self.cond:
+            with self.cond:  # check + claim atomically: one upload per nonce is ever measured
                 job = self.jobs.get(key)
-            if job is None:
-                return 404, _err("ATTEMPT_NOT_FOUND", "unknown attempt_id/phase")
-            if job.done:
-                return 409, _err("ATTEMPT_CLOSED", "frames already received for this attempt/phase")
-            if not hmac.compare_digest(str(meta.get("depth_nonce") or "").encode(), job.nonce.encode()):
-                return 403, _err("FORBIDDEN", "depth_nonce missing or mismatched")
-            neutral = self.passive.get(job.attempt_id) if phase == "CHALLENGE" else None
-            res = process_upload(meta_text, blobs, self.cfg, neutral=neutral)
+                if job is None:
+                    return 404, _err("ATTEMPT_NOT_FOUND", "unknown attempt_id/phase")
+                if job.done or job.in_flight:
+                    return 409, _err("ATTEMPT_CLOSED", "frames already received for this attempt/phase")
+                if not hmac.compare_digest(str(meta.get("depth_nonce") or "").encode(), job.nonce.encode()):
+                    return 403, _err("FORBIDDEN", "depth_nonce missing or mismatched")
+                job.in_flight = True
+                neutral = self.passive.get(job.attempt_id) if phase == "CHALLENGE" else None
         except DepthProtocolError as exc:
             return 422, _err("VALIDATION_ERROR", str(exc))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             return 422, _err("VALIDATION_ERROR", f"bad meta: {exc}")
+        try:
+            res = process_upload(meta_text, blobs, self.cfg, neutral=neutral)
+        except DepthProtocolError as exc:
+            with self.cond:
+                job.in_flight = False  # malformed upload: the phone may retry with the same nonce
+            return 422, _err("VALIDATION_ERROR", str(exc))
+        except BaseException:
+            with self.cond:
+                job.in_flight = False
+            raise
         late = received > job.deadline_ms
         row = result_row(
             res,
@@ -409,7 +432,10 @@ def _make_handler(server: CalibrationServer) -> type[BaseHTTPRequestHandler]:
                 # same text as the edge (edge/app.py require_depth_device): DepthProbe's Find Mac and
                 # "Token missing / rejected" diagnosis key on it
                 return self._send(401, _err("UNAUTHORIZED", "depth device token required"))
-            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0  # malformed header -> 422 below (never an unhandled exception)
             if length <= 0 or length > MAX_BODY:
                 too_big = length > MAX_BODY  # API.md section 0: 413 = PAYLOAD_TOO_LARGE
                 return self._send(

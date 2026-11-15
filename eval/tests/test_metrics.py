@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import metrics as M
-from evallib import RESULTS_DIR, THRESHOLDS_PATH
+from evallib import EVAL_DIR, RESULTS_DIR, THRESHOLDS_PATH
 from evallib import io as eio
 from evallib import schema as S
 
@@ -260,3 +260,91 @@ def test_no_inputs_returns_3(tmp_path):
     assert M.main(["--attempts", str(tmp_path / "a.csv"), "--comparisons", str(tmp_path / "c.csv"),
                    "--scenarios", str(tmp_path / "s.csv"), "--out-dir", str(tmp_path / "o")]) == 3
     assert not (Path(tmp_path) / "o").exists()
+
+
+# ------------------------------------------------------------------ DE-07: FMR independence + source split
+
+def _cmp_rows(n_subj=10, n_probe=30, lfw_pairs=0, false_match_pairs=()):
+    """Live: every probe of every subject vs every other gallery subject; optional LFW-vs-LFW padding."""
+    rows = []
+    subs = [f"DUMMY_S{i:02d}" for i in range(n_subj)]
+    for split in ("dev", "test"):
+        for p in subs:
+            for j in range(n_probe):
+                pid = f"img_{split}_{p}_{j}"
+                for g in subs:
+                    fm = (p, g) in false_match_pairs and j == 0
+                    rows.append({"probe_attempt_id": pid, "probe_subject": p, "gallery_subject": g,
+                                 "matcher": "arcface", "score": 0.9 if (g == p or fm) else 0.1,
+                                 "genuine": "1" if g == p else "0", "split": split, "source": "live",
+                                 "run_id": "DUMMY-C", "model": "dummy"})
+        for k in range(lfw_pairs):
+            rows.append({"probe_attempt_id": f"lfw_{split}_{k}", "probe_subject": f"LFW_{k}",
+                         "gallery_subject": f"LFW_{k + 1}", "matcher": "arcface", "score": 0.05, "genuine": "0",
+                         "split": split, "source": "lfw", "run_id": "DUMMY-C", "model": "dummy"})
+    return rows
+
+
+def _th():
+    return eio.load_yaml(THRESHOLDS_PATH)
+
+
+def test_fmr_claim_needs_independent_subject_pairs_not_raw_comparisons(tmp_path):
+    rows = _cmp_rows()  # 10 x 30 x 9 = 2700 impostor comparisons > 1497, but only 90 subject pairs
+    blk = M.match_block(rows, _th(), "dev", "test", tmp_path, make_plots=False)["arcface"]
+    t = blk["test"]
+    assert blk["counts"]["test"]["impostor"] == 2700
+    # T-02: (A,B) and (B,A) are one identity pair: 10 subjects -> 45 unordered pairs, not 90
+    assert t["impostor_units_live"] == {"comparisons": 2700, "probe_images": 300, "subject_pairs": 45}
+    assert t["fmr_claim_supportable"] is False
+    assert "distinct unordered live impostor subject pairs" in t["fmr_claim_basis"]
+
+
+def test_headline_fmr_is_live_only_and_lfw_reported_separately(tmp_path):
+    rows = _cmp_rows(lfw_pairs=5000, false_match_pairs={("DUMMY_S01", "DUMMY_S02")})
+    blk = M.match_block(rows, _th(), "dev", "test", tmp_path, make_plots=False)["arcface"]
+    live = blk["test"]["at_configured_online_live"]["fmr"]
+    assert (live["k"], live["n"]) == (1, 2700)  # LFW padding never dilutes the headline FMR
+    pooled = blk["test"]["at_configured_online"]["fmr"]
+    assert pooled["n"] == 7700
+    assert blk["test"]["fmr_subject_pair_level_live"]["k"] == 1
+    assert blk["test"]["fmr_subject_pair_level_live"]["n"] == 45
+    targets = eio.load_yaml(EVAL_DIR / "targets.yaml")
+    far = next(r for r in M.target_rows(None, {"arcface": blk}, None, targets)
+               if r["target"].startswith("False acceptance"))
+    assert far["measured"]["comparison_level"]["rate"] == live["rate"]  # shown for information only
+
+
+def _row(blk, prefix):
+    targets = eio.load_yaml(EVAL_DIR / "targets.yaml")
+    return next(r for r in M.target_rows(None, {"arcface": blk}, None, targets) if r["target"].startswith(prefix))
+
+
+def test_far_row_never_supported_from_dependent_comparisons(tmp_path):
+    """T-01: 2700 error-free comparisons from 10 identities (45 pairs) must not read as FAR <= 0.2 % SUPPORTED."""
+    blk = M.match_block(_cmp_rows(), _th(), "dev", "test", tmp_path, make_plots=False)["arcface"]
+    assert blk["test"]["at_configured_online_live"]["fmr"]["ub95"] <= 0.002  # comparison-level CP would claim it
+    far = _row(blk, "False acceptance")
+    assert not far["status"].startswith("SUPPORTED")
+    assert far["measured"]["n"] == 45 and far["measured"]["unit"] == "unordered live impostor subject pairs"
+    assert far["measured"]["ub95"] == blk["test"]["fmr_subject_pair_level_live"]["ub95"]
+
+
+def test_far_row_without_pair_level_record_is_not_confirmed(tmp_path):
+    blk = M.match_block(_cmp_rows(), _th(), "dev", "test", tmp_path, make_plots=False)["arcface"]
+    blk = {**blk, "test": {k: v for k, v in blk["test"].items() if k != "fmr_subject_pair_level_live"}}
+    far = _row(blk, "False acceptance")
+    assert far["status"].startswith("NOT CONFIRMED") and "fmr_claim_basis" in far["status"]
+
+
+def test_fnmr_row_is_live_only_lfw_genuine_padding_ignored(tmp_path):
+    """T-03: LFW genuine pairs (matched within LFW) must not inflate the face-auth accuracy row."""
+    base = _cmp_rows()
+    lfw_gen = [{"probe_attempt_id": f"lfwg_{k}", "probe_subject": f"LFW_{k}", "gallery_subject": f"LFW_{k}",
+                "matcher": "arcface", "score": 0.95, "genuine": "1", "split": "test", "source": "lfw",
+                "run_id": "DUMMY-C", "model": "dummy"} for k in range(3000)]
+    a = _row(M.match_block(base, _th(), "dev", "test", tmp_path, make_plots=False)["arcface"], "Face auth")
+    b = _row(M.match_block(base + lfw_gen, _th(), "dev", "test", tmp_path, make_plots=False)["arcface"],
+             "Face auth")
+    assert a["measured"]["n"] == b["measured"]["n"] == 300
+    assert a["status"] == b["status"] and "not independent" in b["measured"]["what"]
