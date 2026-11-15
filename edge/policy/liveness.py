@@ -119,6 +119,11 @@ def _three_zone(value: Any, fail_below: float, pass_above: float, *, pass_inclus
     return UNSURE
 
 
+def _capped(status: str, value: Any, ceiling: float) -> str:
+    """Plausibility ceiling (tighten-only): a PASS above `ceiling` is downgraded to UNSURE."""
+    return UNSURE if status == PASS and finite(value) and value > float(ceiling) else status
+
+
 def liveness_fusion(frames: Sequence[FrameSignals], att: AttemptSignals, inj_status: str, T: Any,
                     mode: str) -> LivenessResult:
     L = T.liveness
@@ -187,11 +192,13 @@ def liveness_fusion(frames: Sequence[FrameSignals], att: AttemptSignals, inj_sta
         D, dp = L.depth, att.depth
         d0 = dp.d0_valid_ratio
         depth_statuses.append(UNSURE if not finite(d0) or d0 < D.d0_valid_pass_min else PASS)
-        flat = [
-            _three_zone(dp.d1_plane_rms_mm, D.d1_plane_rms_fail_mm, D.d1_plane_rms_pass_mm, pass_inclusive=False),
-            _three_zone(dp.d2_quad_rms_mm, D.d2_quad_rms_fail_mm, D.d2_quad_rms_pass_mm, pass_inclusive=False),
-            _three_zone(dp.d3_nose_relief_mm, D.d3_nose_relief_fail_mm, D.d3_nose_relief_pass_mm,
-                        pass_inclusive=True),
+        flat = [  # DE-05: a value above the physical ceiling is non-physical geometry -> UNSURE, never PASS
+            _capped(_three_zone(dp.d1_plane_rms_mm, D.d1_plane_rms_fail_mm, D.d1_plane_rms_pass_mm,
+                                pass_inclusive=False), dp.d1_plane_rms_mm, D.d1_plane_rms_max_mm),
+            _capped(_three_zone(dp.d2_quad_rms_mm, D.d2_quad_rms_fail_mm, D.d2_quad_rms_pass_mm,
+                                pass_inclusive=False), dp.d2_quad_rms_mm, D.d2_quad_rms_max_mm),
+            _capped(_three_zone(dp.d3_nose_relief_mm, D.d3_nose_relief_fail_mm, D.d3_nose_relief_pass_mm,
+                                pass_inclusive=True), dp.d3_nose_relief_mm, D.d3_nose_relief_max_mm),
         ]
         depth_statuses += flat
         if FAIL in flat:

@@ -44,11 +44,15 @@ def local_summary(frames: Sequence[FrameSignals], cache_age_h: float | None, T: 
     cand = matched[0].match_top1_user
     same = [f for f in matched if f.match_top1_user == cand]
     top2s = [f.match_top2 for f in same if finite(f.match_top2)]
+    # verify M01: ANY embedded frame whose top-1 is a different enrolled user at or above the deny bar breaks
+    # identity consistency (a victim photo + attacker live face burst), not only a mismatch on the last frame
+    deny = float(T.match.local.deny_below_cosine)
+    other = any(f.match_top1_user != cand and f.match_top1 >= deny for f in matched)
     return LocalSummary(
         user=str(cand),
         top1=fmean(f.match_top1 for f in same),
         top2=fmean(top2s) if top2s else None,
-        consistent=matched[-1].match_top1_user == cand,
+        consistent=matched[-1].match_top1_user == cand and not other,
     )
 
 

@@ -1,7 +1,8 @@
 """Thresholds loader (config/thresholds.yaml).
 
 Base values = ONLINE. OFFLINE = deep_merge(base, offline.overrides). Offline overrides may only
-tighten pass bars (P6) -- a loosening override is a ConfigError, not a silent fail-open.
+tighten pass bars (P6) and may only touch OFFLINE_OVERRIDABLE leaves -- a loosening or unlisted override is a
+ConfigError, not a silent fail-open (audit F08).
 Missing keys raise ConfigError so a bad config surfaces as SYSTEM_ERROR (P1), never as a default.
 """
 
@@ -39,6 +40,19 @@ _TIGHTEN_ONLY = (
 # Optional enforce switches (a missing key = enforce; edge/policy/liveness.py `enforced`). Must be booleans;
 # offline may never switch one off while it is on online (P6: offline only tightens).
 ENFORCE_SWITCHES = ("liveness.flash.enforce", "liveness.moire.enforce", "liveness.mask.m2_rgb_enforce")
+# F08: the ONLY leaves offline.overrides may set. Everything else (deny bars of device / moire / depth / mask,
+# step-up method sets, attempt counts, rate limit, fallback limits, safety booleans) is identical in both modes:
+# an unlisted override is a ConfigError, so offline can never loosen a bar the list above does not cover.
+OFFLINE_OVERRIDABLE = frozenset({d for d, _ in _TIGHTEN_ONLY} | set(ENFORCE_SWITCHES) | {
+    "liveness.flash.ambient_exception_enabled",           # must end up false offline (checked below)
+})  # challenge action pools are NOT overridable: a narrower offline pool would weaken the randomness
+# Positive integer counters of the second-factor failure limits (edge/policy/lockouts.py).
+POSITIVE_COUNTS = ("fallback.staff_override.max_failures", "fallback.staff_override.device_max_failures",
+                   "fallback.totp.max_failures", "fallback.card.max_failures", "fallback.staff_override.code_length")
+POSITIVE_SECONDS = ("fallback.staff_override.lockout_s", "fallback.staff_override.device_lockout_s",
+                    "fallback.staff_override.device_window_s", "fallback.totp.lockout_s", "fallback.card.lockout_s")
+MIN_OVERRIDE_CODE_LENGTH = 8  # shortest one-time staff code ever accepted (legacy); new codes are longer (EO-11)
+FORCED_OFFLINE_MAX_MIN = 240  # V2 D: POST /v1/admin/mode max_minutes 1..240
 # Cloud match budgets (ms) read by edge/attempts.py + edge/cloud_client.py: a missing / non-numeric / non-positive
 # value would silently mean "no deadline" or "always time out", so it is a ConfigError at load (P1).
 POSITIVE_BUDGETS = ("latency_budget_ms.rekognition_timeout", "latency_budget_ms.rekognition_probe_deadline")
@@ -193,6 +207,52 @@ def _check_challenge_actions(cfg: Mapping[str, Any]) -> None:
                           f" when challenge.steps >= 2), got {second!r}")
 
 
+def _leaves(d: Mapping[str, Any], prefix: str = "") -> list[str]:
+    out: list[str] = []
+    for k, v in d.items():
+        path = f"{prefix}{k}"
+        out += _leaves(v, f"{path}.") if isinstance(v, Mapping) else [path]
+    return out
+
+
+def _check_offline_scope(overrides: Mapping[str, Any]) -> None:
+    for path in _leaves(overrides):
+        if path not in OFFLINE_OVERRIDABLE:
+            raise ConfigError(f"offline override of {path} is not allowed (P6: offline only tightens; deny bars,"
+                              f" method sets and limits are the same in both modes)")
+
+
+def _number(cfg: Mapping[str, Any], dotted: str) -> float:
+    try:
+        v = _get(cfg, dotted)
+    except (KeyError, TypeError) as exc:
+        raise ConfigError(f"missing config key: {dotted}") from exc
+    if isinstance(v, bool) or not isinstance(v, int | float) or not math.isfinite(v):
+        raise ConfigError(f"{dotted} must be a finite number, got {v!r}")
+    return float(v)
+
+
+def _check_fallback_limits(raw: Mapping[str, Any]) -> None:
+    for dotted in POSITIVE_COUNTS:
+        v = _number(raw, dotted)
+        if v < 1 or v != int(v):
+            raise ConfigError(f"{dotted} must be a positive integer, got {v!r}")
+    for dotted in POSITIVE_SECONDS:
+        if _number(raw, dotted) <= 0:
+            raise ConfigError(f"{dotted} must be > 0 s")
+    if _number(raw, "fallback.staff_override.code_length") < MIN_OVERRIDE_CODE_LENGTH:
+        raise ConfigError(f"fallback.staff_override.code_length must be >= {MIN_OVERRIDE_CODE_LENGTH} digits")
+    legacy = _get(raw, "fallback.staff_override").get("legacy_code_lengths", [])
+    if not (isinstance(legacy, list) and all(isinstance(n, int) and not isinstance(n, bool)
+                                             and n >= MIN_OVERRIDE_CODE_LENGTH for n in legacy)):
+        raise ConfigError(f"fallback.staff_override.legacy_code_lengths must be a list of ints >="
+                          f" {MIN_OVERRIDE_CODE_LENGTH}, got {legacy!r}")
+    lo, hi = _number(raw, "connectivity.forced_offline_default_min"), _number(raw, "connectivity.forced_offline_max_min")
+    if not (1 <= lo <= hi <= FORCED_OFFLINE_MAX_MIN):
+        raise ConfigError(f"connectivity.forced_offline_default_min/max_min must satisfy 1 <= default <= max <="
+                          f" {FORCED_OFFLINE_MAX_MIN}, got {lo!r}/{hi!r}")
+
+
 def _validate(raw: Mapping[str, Any]) -> None:
     missing = [s for s in REQUIRED_SECTIONS if s not in raw]
     if missing:
@@ -203,6 +263,8 @@ def _validate(raw: Mapping[str, Any]) -> None:
     if off.get("auto_allow_max_risk") not in RISK_LEVELS:
         raise ConfigError(f"offline.auto_allow_max_risk must be one of {list(RISK_LEVELS)}")
     overrides = off.get("overrides") or {}
+    if not isinstance(overrides, Mapping):
+        raise ConfigError("offline.overrides must be a mapping")
     merged = deep_merge(raw, overrides)
     for dotted, direction in _TIGHTEN_ONLY:
         try:
@@ -232,3 +294,5 @@ def _validate(raw: Mapping[str, Any]) -> None:
             raise ConfigError("ambient flash exception must be disabled offline (P6)")
     except KeyError as exc:
         raise ConfigError("missing liveness.flash.ambient_exception_enabled") from exc
+    _check_offline_scope(overrides)
+    _check_fallback_limits(raw)

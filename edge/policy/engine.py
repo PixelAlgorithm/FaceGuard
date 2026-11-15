@@ -27,7 +27,7 @@ from edge.policy.codes import (
 )
 from edge.policy.injection import injection_check
 from edge.policy.quality import quality_gate
-from edge.policy.schedule import cache_state, evaluate_schedule, kiosk_zone, zone_risk
+from edge.policy.schedule import cache_state, evaluate_schedule, kiosk_zone, revoked_any, zone_risk
 from edge.policy.signals import AttemptSignals
 from edge.policy.thresholds import MODES, RISK_LEVELS
 
@@ -76,6 +76,7 @@ class ScheduleCtx:
     zone: str | None = None  # override; default = bundle.kiosks[kiosk_id].zone
     confirmed_at: datetime | None = None
     refresh_age_s: float | None = None
+    revocations_incomplete: bool = False  # EO-08: the feed overlay was lost (quarantined) -> no auto-ALLOW
 
     @property
     def lvb(self) -> Mapping[str, Any] | None:
@@ -261,6 +262,9 @@ def combine(bio: str, bio_codes: Sequence[str], causes: set[str], sched: str | N
     om = ["OFFLINE_MODE"] if off else []
     if not lvb:  # never use data from an unverified bundle; unknown zone = high risk
         return Combined(DENY, dedupe(list(bio_codes) + ["SCHEDULE_BUNDLE_INVALID"] + om), [], None)
+    if off and cache == "INVALID" and sched == "REVOKED":  # F04: deny-only revocation check survives a rollback
+        return Combined(DENY, dedupe(list(bio_codes) + ["SCHEDULE_REVOKED", "SCHEDULE_BUNDLE_INVALID"] + om), [],
+                        None)
     if off and cache == "INVALID":  # verified bundle but clock rolled back: no schedule, staff override only
         steps = (["CHALLENGE"] if "LIVENESS" in causes else []) + ["SECOND_FACTOR"]
         return Combined(STEP_UP, dedupe(list(bio_codes) + ["SCHEDULE_BUNDLE_INVALID"] + om +
@@ -298,6 +302,19 @@ def combine(bio: str, bio_codes: Sequence[str], causes: set[str], sched: str | N
     if not steps:
         raise ValueError("STEP_UP without steps")
     return Combined(STEP_UP, dedupe(codes), steps, methods)
+
+
+def _require_second_factor(comb: Combined, mode: str, T: Any) -> Combined:
+    """EO-08 / P4: an ALLOW, or a STEP_UP without SECOND_FACTOR (e.g. CHALLENGE only), also requires a second
+    factor. DENY and step-ups that already need one are unchanged (tighten-only)."""
+    if comb.decision == DENY or "SECOND_FACTOR" in comb.steps:
+        return comb
+    off = mode == "OFFLINE"
+    extra = (["OFFLINE_MODE"] if off else []) + ["OFFLINE_FALLBACK_REQUIRED"]
+    methods = _methods(T, "offline_default" if off else "online_default")
+    if comb.decision == ALLOW:
+        return Combined(STEP_UP, extra, ["SECOND_FACTOR"], methods)
+    return Combined(STEP_UP, dedupe(list(comb.codes) + extra), list(comb.steps) + ["SECOND_FACTOR"], methods)
 
 
 def contact_desk(codes: Sequence[str], bio: str | None) -> bool:
@@ -516,12 +533,20 @@ def _evaluate(signals: AttemptSignals, ctx: ScheduleCtx, mode: str, now: datetim
         raise ValueError("no candidate identity for a non-failing biometric result")
     # 6. schedule (SC1): same function, newest verified bundle, both modes; t0 in Asia/Kolkata
     sched: str | None = None
+    merged = _bundle_for_eval(ctx)
     if lvb and cache != "INVALID":
         if not zone:
             raise ValueError(f"kiosk {ctx.kiosk_id} has no zone in the bundle")
-        sched = evaluate_schedule(user, zone, signals.t0, _bundle_for_eval(ctx), T.schedule)
+        sched = evaluate_schedule(user, zone, signals.t0, merged, T.schedule,
+                                  revocation_slack_s=float(T.cache.clock_rollback_tolerance_s))  # F03
+    elif lvb:  # F04: clock untrusted -> no schedule, but ANY held revocation (any timestamp) still denies
+        u = (merged.get("users") or {}).get(user)
+        if revoked_any(merged, user, u if isinstance(u, Mapping) else None):
+            sched = "REVOKED"
     # 7 + 8. mode restrictions + final decision
     comb = combine(bio, bio_codes, causes, sched, cache, risk, mode, T, lvb=bool(lvb))
+    if ctx.revocations_incomplete:  # EO-08: unknown feed revocations -> never resolve without a second factor
+        comb = _require_second_factor(comb, mode, T)
     # 8b. random deformation challenge: only a would-be ALLOW, exactly one draw (P12). A forced draw (runtime
     # FORCE / FORCE_NEXT demo control) bypasses the configured rate, including 0.0.
     if comb.decision == ALLOW and rng.rng is not None and (rng.random() < float(T.challenge.random_rate)

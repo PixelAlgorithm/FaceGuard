@@ -69,15 +69,21 @@ class AnchoredClock:
     def __init__(self, start: datetime) -> None:
         self._start = start.astimezone(UTC)
         self._mono0 = time.monotonic()
+        self._jump = timedelta(0)
 
     def __call__(self) -> datetime:
-        return self._start + timedelta(seconds=time.monotonic() - self._mono0)
+        return self._start + self._jump + timedelta(seconds=time.monotonic() - self._mono0)
+
+    def advance(self, delta: timedelta) -> None:
+        """Jump the injected real clock forward (expiry tests); undone by reset()."""
+        self._jump += delta
 
     def reset(self) -> None:
         """Re-anchor: `now` is `start` again. The shared RT_CLOCK is reset before every test (autouse fixture in
         the edge/policy + edge/offline conftests), so no test sees the real time the suite has already spent
         (a bundle signed at `now - 5 min` then has whole-minute stamps, whatever ran before)."""
         self._mono0 = time.monotonic()
+        self._jump = timedelta(0)
 
 
 RT_CLOCK = AnchoredClock(B_T0)  # Sat 10:05 IST: inside every baseline window (shared by make_rt and attempt())
