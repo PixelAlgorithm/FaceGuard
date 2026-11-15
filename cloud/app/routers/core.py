@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 import time
 from datetime import UTC, datetime
 
@@ -16,6 +18,7 @@ from ..clock import iso_z, parse_ts
 from ..config import APP_VERSION
 from ..errors import ApiError
 from ..schemas import (
+    REQUEST_ID,
     EnrollJson,
     EnrollMeta,
     EnrollResponse,
@@ -26,6 +29,7 @@ from ..schemas import (
     LivenessSessionResponse,
     MatchRequest,
     MatchResponse,
+    OfflineEnrolRecord,
     OtpSendRequest,
     OtpSendResponse,
     OtpVerifyRequest,
@@ -37,10 +41,12 @@ from ..schemas import (
 from ..services.match_service import decode_image
 from ..services.schedule_service import UnknownKiosk
 from ..services.sync_service import ItemRejected
-from .deps import KioskDep, SvcDep
+from .deps import KioskDep, SvcDep, audit_meta, device_actor_for
 
 router = APIRouter()
 STARTED = time.time()
+_STAMP = os.environ.get("HID_DEPLOY_STAMP", "")
+DEPLOY_STAMP = _STAMP if re.fullmatch(r"\d{8}T\d{6}Z", _STAMP) else None  # non-secret build identifier
 
 
 def _validation(exc: ValidationError) -> ApiError:
@@ -68,6 +74,7 @@ async def health(svc: SvcDep) -> HealthResponse:
         uptime_s=int(time.time() - STARTED),
         server_time=iso_z(datetime.now(UTC)),
         checked_at=iso_z(datetime.fromtimestamp(svc.health.checked_at, UTC)) if svc.health.checked_at else None,
+        deploy_stamp=DEPLOY_STAMP,
     )
 
 
@@ -81,11 +88,9 @@ async def match(req: MatchRequest, svc: SvcDep, kiosk_id: KioskDep) -> MatchResp
     out = await svc.match.match(attempt_id=req.attempt_id, image=image, mode=req.mode,
                                 claimed_user_id=req.claimed_user_id, max_users=req.max_users)
     status = None
-    if out.user_id:
-        rec = await asyncio.to_thread(svc.schedule.current)
-        u = (rec["doc"].get("users") or {}).get(out.user_id) or {}
-        row = await asyncio.to_thread(svc.kv.get, "users", out.user_id) or {}
-        status = "REVOKED" if u.get("revoked") else (row.get("status") or ("ACTIVE" if u else None))
+    if out.user_id:  # one rule for the whole cloud: ScheduleService.user_state (F18)
+        row = await asyncio.to_thread(svc.kv.get, "users", out.user_id)
+        status = await asyncio.to_thread(svc.schedule.match_status, out.user_id, row)
     return MatchResponse(attempt_id=req.attempt_id, matched=out.matched, user_id=out.user_id,
                          similarity=out.similarity, runner_up_user_id=out.runner_up_user_id,
                          runner_up_similarity=out.runner_up_similarity, face_detected=out.face_detected,
@@ -122,16 +127,42 @@ async def _enroll_inputs(request: Request) -> tuple[EnrollMeta, list[bytes]]:
 
 @router.post("/v1/enroll", response_model=EnrollResponse, status_code=201)
 async def enroll(request: Request, svc: SvcDep, kiosk_id: KioskDep) -> EnrollResponse:
+    """Device-scoped (kiosk HMAC); the edge-asserted actor is validated and recorded in the ENROL audit entry."""
     meta, frames = await _enroll_inputs(request)
+    ref = device_actor_for(meta.actor, kiosk_id)
     if meta.liveness_session_id:
         await svc.liveness.verify_for_enrolment(meta.liveness_session_id, kiosk_id, meta.user_id, frames, svc.blobs)
-    out = await asyncio.to_thread(svc.enroll.enroll, meta.model_dump(), frames, kiosk_id=kiosk_id)
+    body = {**meta.model_dump(exclude={"actor", "request_id"}), "actor": ref.actor}
+    out = await asyncio.to_thread(svc.enroll.enroll, body, frames, kiosk_id=kiosk_id,
+                                  audit_meta=audit_meta(ref, meta.request_id))
     return EnrollResponse(**out)
 
 
+@router.post("/v1/enroll/offline-record")
+async def offline_record(req: OfflineEnrolRecord, svc: SvcDep, kiosk_id: KioskDep) -> JSONResponse:
+    """An edge enrolled a face while the cloud was unreachable (SC2-D4). 201 recorded, 200 duplicate. The user's
+    offline ALLOWs are flagged OFFLINE_TEMPLATE_UNCONFIRMED by /v1/sync until a cloud enrolment indexes a face."""
+    if req.kiosk_id != kiosk_id:
+        raise ApiError("FORBIDDEN", "kiosk_id must match X-Kiosk-Id")
+    try:
+        at = iso_z(parse_ts(req.at))
+    except ValueError as exc:
+        raise ApiError("VALIDATION_ERROR", "at must be ISO-8601 with timezone") from exc
+    ref = device_actor_for(req.actor, kiosk_id)
+    created, body = await asyncio.to_thread(svc.enroll.record_offline, {**req.model_dump(), "at": at},
+                                            kiosk_id=kiosk_id, actor=ref.actor,
+                                            audit_meta=audit_meta(ref, req.request_id))
+    return JSONResponse(body, status_code=201 if created else 200)
+
+
 @router.delete("/v1/enroll/{user_id}", response_model=EraseResponse)
-async def erase(user_id: str, svc: SvcDep, kiosk_id: KioskDep) -> EraseResponse:
-    out = await asyncio.to_thread(svc.enroll.erase, user_id, kiosk_id=kiosk_id)
+async def erase(user_id: str, svc: SvcDep, kiosk_id: KioskDep,
+                actor: str | None = Query(None, max_length=64),
+                request_id: str | None = Query(None, pattern=REQUEST_ID)) -> EraseResponse:
+    """Device-scoped DPDP erasure; `?actor=` (signed with the path) is recorded in the ERASE audit entry."""
+    ref = device_actor_for(actor, kiosk_id)
+    out = await asyncio.to_thread(svc.enroll.erase, user_id, kiosk_id=kiosk_id, actor=ref.actor,
+                                  audit_meta=audit_meta(ref, request_id))
     return EraseResponse(**out)
 
 
@@ -147,7 +178,7 @@ async def schedule_bundle(kiosk_id: str, request: Request, svc: SvcDep, auth_kio
     inm = request.headers.get("if-none-match", "")
     tags = {t.strip().removeprefix("W/").strip() for t in inm.split(",") if t.strip()}
     version = str(bundle["bundle_version"])
-    if etag in tags or version in tags or f'"{version}"' in tags:
+    if etag in tags:  # only the full ETag (version AND issue): a bare '"<version>"' gets the fresh issue (EO-01)
         return Response(status_code=304, headers={"ETag": etag, "X-Bundle-Version": version})
     return JSONResponse(bundle, headers={"ETag": etag, "X-Bundle-Version": version, "Cache-Control": "no-store"})
 
@@ -187,8 +218,8 @@ async def sync(request: Request, svc: SvcDep, kiosk_id: KioskDep,
                verbose: bool = Query(False, description="add alerts/acks/conflicts (dashboard/debug)")) -> JSONResponse:
     try:
         body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise ApiError("VALIDATION_ERROR", "body must be JSON") from exc
+    except (ValueError, RecursionError) as exc:  # JSONDecodeError / UnicodeDecodeError are ValueErrors
+        raise ApiError("VALIDATION_ERROR", "body must be (reasonably nested) JSON", status=400) from exc
     if not isinstance(body, dict):
         raise ApiError("VALIDATION_ERROR", "body must be a JSON object")
     try:

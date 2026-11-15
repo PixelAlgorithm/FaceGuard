@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import time
 
 import pytest
@@ -34,8 +35,11 @@ def test_signed_request_accepted(signed):
     assert r.status_code == 200 and "x-latency-ms" in r.headers
 
 
-def test_signature_over_bare_path_is_accepted_for_compat(client):
+def test_signature_over_bare_path_is_refused_unless_transition_switch(client, services):
+    """F5: a signature over the bare path leaves the query unauthenticated (?since=, ?actor=)."""
     h = signed_headers(kiosk_id="KIOSK_LIB_01", key=KIOSK_KEY, api_key=API_KEY, method="GET", path="/v1/revocations")
+    assert client.get("/v1/revocations?since=0", headers=h).status_code == 401
+    services.settings = dataclasses.replace(services.settings, accept_bare_path_sig=True)
     assert client.get("/v1/revocations?since=0", headers=h).status_code == 200
 
 

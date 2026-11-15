@@ -9,9 +9,9 @@ import secrets
 from dataclasses import dataclass, field
 from typing import Any
 
-from .auth import ReplayCache
+from .auth import KvReplayGuard
 from .clock import Clock
-from .config import Settings
+from .config import ConfigError, Settings
 from .metrics import Metrics
 from .policy_bridge import PolicyBridge
 from .services.adapters import (
@@ -59,7 +59,7 @@ class Services:
     otp: OtpService
     liveness: LivenessService
     health: HealthMonitor
-    replay: ReplayCache
+    replay: KvReplayGuard
     extras: dict = field(default_factory=dict)
 
 
@@ -139,7 +139,9 @@ def build_services(settings: Settings, *, clock: Clock | None = None, kv=None, f
                            search_bucket=TokenBucket(settings.rekognition_search_tps),  # IndexFaces: own quota
                            match_threshold=t.user_match_threshold,  # AssociateFaces: appended face must match user
                            max_faces=settings.enroll_max_faces_per_user, pinned_faces=settings.enroll_pinned_faces)
-    otp_pepper = settings.otp_pepper or secrets.token_hex(32)  # per-process if unset: OTPs die on restart
+    if not settings.otp_pepper and settings.store_backend != "memory":  # settings_from_env refuses this too
+        raise ConfigError("OTP_PEPPER is required unless STORE_BACKEND=memory")
+    otp_pepper = settings.otp_pepper or secrets.token_hex(32)  # memory store only: dies with the process anyway
     otp = OtpService(kv, mailer, t, clock, metrics, pepper=otp_pepper, resend_after_s=settings.otp_resend_after_s)
     liveness = LivenessService(faces, kv, match, t, clock, tps=settings.liveness_tps,
                                max_concurrent=settings.liveness_max_concurrent, region=settings.region,
@@ -150,4 +152,4 @@ def build_services(settings: Settings, *, clock: Clock | None = None, kv=None, f
     return Services(settings=settings, thresholds=t, clock=clock, kv=kv, faces=faces, mailer=mailer, blobs=blobs,
                     box=box, metrics=metrics, policy=policy, schedule=schedule, sync=sync, match=match,
                     enroll=enroll, otp=otp, liveness=liveness, health=health,
-                    replay=ReplayCache(ttl_s=2 * settings.auth_skew_s + 5))
+                    replay=KvReplayGuard(kv, ttl_s=2 * settings.auth_skew_s + 5))

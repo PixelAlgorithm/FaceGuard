@@ -67,7 +67,7 @@ class LivenessService:
         return {"session_id": sid, "region": self.region, "expires_at": iso_z(expires)}
 
     async def result(self, session_id: str, kiosk_id: str, blobs) -> dict:
-        sess = self.kv.get(NS_LIVE, session_id)
+        sess = await asyncio.to_thread(self.kv.get, NS_LIVE, session_id)  # blocking store call: off the event loop
         if sess is None or sess.get("kiosk_id") != kiosk_id:
             raise ApiError("NOT_FOUND", "unknown liveness session")
         self._check()
@@ -97,7 +97,7 @@ class LivenessService:
         AND this user_id, is single-use (consumed by a CAS before evaluation, pass or fail), must be live, and
         its reference image must match the first enrolment frame (CompareFaces >= allow_min_similarity). A 1:1
         search against the user's gallery cannot work here: a first-time user has no faces yet."""
-        sess = self.kv.get(NS_LIVE, session_id)
+        sess = await asyncio.to_thread(self.kv.get, NS_LIVE, session_id)
         if sess is None or sess.get("kiosk_id") != kiosk_id:
             raise ApiError("NOT_FOUND", "unknown liveness session")
         if sess.get("user_id") != user_id:
@@ -106,8 +106,8 @@ class LivenessService:
             raise ApiError("FORBIDDEN", "liveness session already used")
         now = self.clock.now()
         rev = sess.pop("_rev", None)
-        if not self.kv.cas(NS_LIVE, session_id, {**sess, "consumed_at": iso_z(now)}, rev,
-                           ttl=epoch_s(now) + 600):
+        if not await asyncio.to_thread(self.kv.cas, NS_LIVE, session_id, {**sess, "consumed_at": iso_z(now)}, rev,
+                                       epoch_s(now) + 600):
             raise ApiError("FORBIDDEN", "liveness session already used")
         self._check()
         try:

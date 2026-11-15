@@ -201,9 +201,23 @@ def test_plan_eviction_same_rule_as_edge_templates():
 
 
 def test_config_validates_enrolment_caps():
-    env = {"KIOSK_HMAC_KEY": "k", "SCHEDULE_BUNDLE_HMAC_KEY": "b", "CLOUD_API_KEY": "a", "ADMIN_TOKEN": "t"}
+    env = {"KIOSK_HMAC_KEY": "k", "SCHEDULE_BUNDLE_HMAC_KEY": "b", "CLOUD_API_KEY": "a", "ADMIN_TOKEN": "t",
+           "ALLOW_SHARED_KIOSK_KEY": "1"}
     s = settings_from_env(env, load_env_file=False)
     assert (s.enroll_min_faces, s.enroll_max_faces_per_user, s.enroll_pinned_faces) == (1, 24, 5)
     for bad in ({"ENROLL_PINNED_FACES": "24"}, {"ENROLL_MAX_FACES_PER_USER": "101"}, {"ENROLL_MIN_FACES": "0"}):
         with pytest.raises(ConfigError):
             settings_from_env({**env, **bad}, load_env_file=False)
+
+
+def test_only_the_original_enrolment_is_pinned(signed, services):
+    """EM-06: a 3-face first enrolment pins 3 faces, not the first 5 positions (appended looks stay evictable)."""
+    services.enroll.bucket = None
+    first = enroll(signed, frames(USER, 3, "a")).json()["face_ids"]
+    assert services.kv.get("users", USER)["pinned_n"] == 3
+    second = [f for f in enroll(signed, frames(USER, 10, "b")).json()["face_ids"] if f not in first]
+    r = enroll(signed, frames(USER, 10, "c")).json()["face_ids"]
+    third = [f for f in enroll(signed, frames(USER, 3, "d")).json()["face_ids"] if f not in r]
+    ids = services.kv.get("users", USER)["face_ids"]
+    assert len(ids) == 24 and ids[:3] == first and set(third) <= set(ids)
+    assert second[0] not in ids and second[1] not in ids  # appended looks were evicted although they came early

@@ -22,6 +22,9 @@ _SPEC: dict[str, tuple[tuple[str, ...], Any]] = {
     "otp_digits": (("fallback", "email_otp", "digits"), 6),
     "otp_ttl_s": (("fallback", "email_otp", "ttl_s"), 300),
     "otp_max_attempts": (("fallback", "email_otp", "max_attempts"), 3),  # API.md §4.6: 3 attempts
+    # per-user cap on OTP e-mails (any attempt) in a rolling window: no mail bombing / brute force across attempts
+    "otp_max_sends_per_user": (("fallback", "email_otp", "max_sends_per_user"), 5),
+    "otp_send_window_s": (("fallback", "email_otp", "send_window_s"), 3600),
     "clock_skew_alert_s": (("sync", "clock_skew_alert_s"), 120),
     "spoof_burst_count": (("sync", "spoof_burst_count"), 3),
     "spoof_burst_window_min": (("sync", "spoof_burst_window_min"), 10),
@@ -29,7 +32,7 @@ _SPEC: dict[str, tuple[tuple[str, ...], Any]] = {
     # one source of truth with scripts/sign_bundle.py: per-code valid_until = bundle expires_at + N h (R7)
     "override_valid_after_expiry_h": (("fallback", "staff_override", "valid_after_expiry_h"), 24),
     # POST /v1/admin/codes/rotate mints codes the edge accepts (edge/policy/fallback.py _match_override)
-    "override_code_length": (("fallback", "staff_override", "code_length"), 8),
+    "override_code_length": (("fallback", "staff_override", "code_length"), 10),
     "override_pbkdf2_iterations": (("fallback", "staff_override", "pbkdf2_iterations"), 100000),
 }
 
@@ -59,8 +62,10 @@ class CloudThresholds:
     spoof_burst_window_min: int
     bundle_max_staleness_hours: int
     override_valid_after_expiry_h: float = 24.0
-    override_code_length: int = 8
+    override_code_length: int = 10
     override_pbkdf2_iterations: int = 100000
+    otp_max_sends_per_user: int = 5
+    otp_send_window_s: int = 3600
     missing: list[str] = field(default_factory=list)
 
 
@@ -91,5 +96,7 @@ def load_thresholds(path: str | Path) -> CloudThresholds:
         override_valid_after_expiry_h=float(values["override_valid_after_expiry_h"]),
         override_code_length=int(values["override_code_length"]),
         override_pbkdf2_iterations=int(values["override_pbkdf2_iterations"]),
+        otp_max_sends_per_user=int(values["otp_max_sends_per_user"]),
+        otp_send_window_s=int(values["otp_send_window_s"]),
         missing=missing,
     )

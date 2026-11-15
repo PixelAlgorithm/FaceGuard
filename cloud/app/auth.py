@@ -3,11 +3,13 @@
 Headers: X-Kiosk-Id, X-Timestamp (epoch seconds), X-Signature, X-Api-Key.
 X-Signature = hex(HMAC-SHA256(key, "METHOD\\nPATH\\nX-Timestamp\\nhex(sha256(body))"))
 - key  = the kiosk key string encoded as UTF-8 (the 64-char value in .env is used as-is, not hex-decoded)
-- PATH = URL path plus "?query" when a query string is present (e.g. "/v1/revocations?since=7");
-         the server also accepts a signature over the bare path for compatibility.
+- PATH = URL path plus "?query" when a query string is present (e.g. "/v1/revocations?since=7"). A signature
+         over the bare path is refused for a request with a query (the query would be unauthenticated), unless
+         the transition switch CLOUD_ACCEPT_BARE_PATH_SIG=1 is set.
 - body = raw request bytes (b"" for GET), so multipart bodies are covered too.
 Window: |server_now - X-Timestamp| <= 60 s. Non-GET requests (except the idempotent /v1/sync) are
-additionally single-use within the window (replay cache keyed by signature) — re-sign when retrying.
+additionally single-use within the window (replay guard keyed by kiosk + signature, kept in the shared KV store
+with a TTL so every worker / instance sees it) — re-sign when retrying.
 Clock skew: every response carries X-Server-Time (epoch s); a kiosk whose clock drifts should sign with
 local_time + (server_time - local_time) learned from /v1/health.
 """
@@ -55,7 +57,7 @@ def constant_time_eq(a: str, b: str) -> bool:
 
 
 class ReplayCache:
-    """Remembers signatures of non-GET requests for 2x the skew window (per process)."""
+    """Per-process replay memory (unit tests / tools only; the app uses KvReplayGuard)."""
 
     def __init__(self, ttl_s: float) -> None:
         self._ttl = ttl_s
@@ -72,6 +74,22 @@ class ReplayCache:
                 return False
             self._seen[sig] = t + self._ttl
             return True
+
+
+class KvReplayGuard:
+    """Replay guard shared by every worker: put_if_absent(ns "replay", kiosk:sig) with an absolute TTL of
+    2x the skew window. A store failure propagates (the caller answers 503, never accepts unchecked)."""
+
+    NS = "replay"
+
+    def __init__(self, kv, ttl_s: float, now_fn=time.time) -> None:
+        self._kv = kv
+        self._ttl = ttl_s
+        self._now = now_fn
+
+    def check_and_add(self, sig: str, now: float | None = None) -> bool:
+        t = self._now() if now is None else now
+        return bool(self._kv.put_if_absent(self.NS, sig, {"seen_at": int(t)}, ttl=int(t + self._ttl) + 1))
 
 
 class AuthFailure(Exception):
@@ -91,8 +109,9 @@ def verify_request(
     api_key: str,
     key_lookup,
     skew_s: int,
-    replay: ReplayCache | None,
+    replay: ReplayCache | KvReplayGuard | None,
     now: float | None = None,
+    accept_bare_path: bool = False,
 ) -> str:
     """Returns the authenticated kiosk_id or raises AuthFailure. `headers` keys must be lower-case."""
     kiosk_id = headers.get(HEADER_KIOSK, "")
@@ -113,7 +132,9 @@ def verify_request(
     key = key_lookup(kiosk_id)
     if not key:
         raise AuthFailure("UNAUTHORIZED", "unknown kiosk")
-    candidates = [path + "?" + query_string, path] if query_string else [path]
+    candidates = [path + "?" + query_string] if query_string else [path]
+    if query_string and accept_bare_path:
+        candidates.append(path)
     if not any(constant_time_eq(sign_request(key, method, p, ts, body), sig) for p in candidates):
         raise AuthFailure("UNAUTHORIZED", "bad signature")
     if replay is not None and method.upper() != "GET" and not replay.check_and_add(f"{kiosk_id}:{sig}"):

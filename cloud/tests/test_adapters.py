@@ -240,8 +240,12 @@ def test_put_metric_data_batches_values_for_percentiles():
 def test_config_requires_secrets_and_defaults_to_us_east_1():
     with pytest.raises(ConfigError) as ei:
         settings_from_env({}, load_env_file=False)
-    assert "KIOSK_HMAC_KEY" in str(ei.value) and "CLOUD_API_KEY" in str(ei.value)
-    env = {"KIOSK_HMAC_KEY": "SECRET-K-123", "SCHEDULE_BUNDLE_HMAC_KEY": "SECRET-B-456",
+    assert "SCHEDULE_BUNDLE_HMAC_KEY" in str(ei.value) and "CLOUD_API_KEY" in str(ei.value)
+    with pytest.raises(ConfigError) as ei:  # the shared kiosk key is opt-in and then required
+        settings_from_env({"ALLOW_SHARED_KIOSK_KEY": "1", "SCHEDULE_BUNDLE_HMAC_KEY": "b", "CLOUD_API_KEY": "a"},
+                          load_env_file=False)
+    assert "KIOSK_HMAC_KEY" in str(ei.value)
+    env = {"KIOSK_HMAC_KEY": "SECRET-K-123", "SCHEDULE_BUNDLE_HMAC_KEY": "SECRET-B-456", "ALLOW_SHARED_KIOSK_KEY": "1",
            "CLOUD_API_KEY": "SECRET-A-789", "ADMIN_TOKEN": "SECRET-T-000", "AWS_REGION": "ap-south-1"}
     s = settings_from_env(env, load_env_file=False)
     assert s.region == "us-east-1"  # AWS_REGION deliberately ignored (sandbox = us-east-1)

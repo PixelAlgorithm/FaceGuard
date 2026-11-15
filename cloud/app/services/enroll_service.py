@@ -16,8 +16,14 @@ lifecycle <= 7 days, for 1:1 CompareFaces). The user row keeps e-mail (for SES O
 Role: the request's role is echoed (requested_role) but never applied; the signed schedule decides
 (PUT /v1/admin/users/{user_id}/access). A successful enrolment updates the schedule user's fallback flags and
 lifts an ERASED suspension (consent re-recorded), publishing only when something changes.
-Erase: row face ids + ListFaces(user) -> DeleteUser + DeleteFaces + row + reference image; the schedule entry
-stays, suspended by an ERASED revocation until the user enrols again (ScheduleService.erase_user).
+Erase: row face ids + ListFaces(user) -> DeleteUser + DeleteFaces (every face must be gone, else 503 and nothing
+else changes) + reference image -> publish the ERASED suspension -> delete the row LAST, so a failure at any step
+leaves a row and the retry finishes the job (the schedule entry stays, suspended by an ERASED revocation until the
+user enrols again, ScheduleService.erase_user).
+Offline enrolment record (POST /v1/enroll/offline-record): an edge that enrolled a face while the cloud was
+unreachable reports it (no images); /v1/sync then flags that user's offline ALLOWs until a cloud enrolment exists.
+Pinning: the first enrolment's own face count (<= ENROLL_PINNED_FACES) is stored as pinned_n and only those faces are
+protected from eviction (pinning by position also pinned appended looks when the first enrolment had < 5 faces).
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ from typing import Any
 
 from ..clock import Clock, iso_z
 from ..errors import ApiError
-from .faces import Association, FaceError
+from .faces import FACE_GONE, Association, FaceError
 from .kv import KV
 from .schedule_service import ScheduleService
 
@@ -40,6 +46,10 @@ log = logging.getLogger("hid.cloud.enroll")
 USER_ID_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
 EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,253}\.[A-Za-z]{2,}$")
 PURPOSE = "campus access control at HID kiosk (hackathon demo)"
+NS_OFFLINE_ENROL = "offline_enrol"  # key = user_id: the latest offline enrolment the cloud never indexed
+NS_OFFLINE_ENROL_EVENTS = "offline_enrol_events"  # key = kiosk|user|at: idempotency of offline-record
+OFFLINE_RECORD_TTL_S = 30 * 86400
+CONTACT_CAS_RETRIES = 5
 
 
 def card_hash(pepper: str, card_id: str) -> str:
@@ -198,13 +208,16 @@ class EnrollService:
             "totp_enrolled": totp if totp is not None else bool(old.get("totp_enrolled")) if old else False,
             "totp_seed_enc": seed_enc,
             "reference_key": ref_key,
+            # faces of the ORIGINAL enrolment that are never evicted (EM-06); legacy rows: position-based default
+            "pinned_n": int(old.get("pinned_n", self.pinned_faces)) if old else min(len(face_ids), self.pinned_faces),
             "template_version": int(old.get("template_version", 0)) + 1 if old else 1,
             "created_at": old.get("created_at", now) if old else now,
             "updated_at": now,
         }
         return row, chash
 
-    def enroll(self, meta: dict[str, Any], frames: list[bytes], *, kiosk_id: str | None = None) -> dict:
+    def enroll(self, meta: dict[str, Any], frames: list[bytes], *, kiosk_id: str | None = None,
+               audit_meta: dict | None = None) -> dict:
         if getattr(self.faces, "name", "") == "disabled":
             raise ApiError("CLOUD_UNAVAILABLE", "enrolment needs Rekognition (FACE_BACKEND=disabled)")
         uid = meta["user_id"]
@@ -248,7 +261,7 @@ class EnrollService:
             log.info("enroll %s: %d new face(s) not associated: %s", uid, len(refused),
                      sorted({r for f in refused for r in assoc.unsuccessful.get(f, [])}))
             self._delete_quiet(uid, refused)
-        _, evict = plan_eviction(row["face_ids"], self.max_faces, self.pinned_faces)
+        _, evict = plan_eviction(row["face_ids"], self.max_faces, int(row.get("pinned_n", self.pinned_faces)))
         gone = set(self._evict(uid, evict, token)) if evict else set()
         if gone:
             row["face_ids"] = [f for f in row["face_ids"] if f not in gone]
@@ -256,8 +269,15 @@ class EnrollService:
                 self.kv.put("users", uid, row)
             except Exception:
                 log.warning("enroll %s: face list not updated after eviction (reconciled at the next enrolment)", uid)
+        try:  # the cloud now holds an indexed template: offline-enrolment flags for this user stop
+            self.kv.delete(NS_OFFLINE_ENROL, uid)
+        except Exception:  # noqa: BLE001 - housekeeping
+            log.warning("enroll %s: offline-enrolment mark not cleared", uid)
         sched = self.schedule.record_enrolment(uid, totp_enrolled=self.totp_flag(meta), card_id_hash=chash,
                                                kiosk_id=kiosk_id)
+        if meta.get("actor") is not None or audit_meta:
+            self.schedule.audit("ENROL", kiosk_id=kiosk_id, actor=meta.get("actor"), user_id=uid,
+                                faces_indexed=len(added), **(audit_meta or {}))
         requested = meta.get("role")
         out = {
             "user_id": uid,
@@ -278,37 +298,90 @@ class EnrollService:
         }
         return out
 
-    def erase(self, user_id: str, *, kiosk_id: str | None = None) -> dict:
-        """DPDP erasure of an ENROLLED user: Rekognition user + faces, user row and reference image; the schedule
-        entry stays, suspended by an ERASED revocation (feed: non-deny ERASE item). A user without an enrolment
-        row (e.g. a schedule-only demo user) -> 404 and nothing changes (no schedule edit, no revocation)."""
+    def erase(self, user_id: str, *, kiosk_id: str | None = None, actor: str | None = None,
+              audit_meta: dict | None = None) -> dict:
+        """DPDP erasure of an ENROLLED user: Rekognition user + faces, reference image, then the ERASED suspension
+        (feed: non-deny ERASE item), then the user row. A user without an enrolment row -> 404 NOT_ENROLLED and
+        nothing changes. Any face Rekognition refused to delete -> 503, row kept (retry finishes the erasure)."""
         row = self.kv.get("users", user_id)
         if row is None:
-            raise ApiError("NOT_FOUND", "user not enrolled (no enrolment record); nothing erased")
-        face_ids = list(row.get("face_ids") or [])
-        rek_deleted = False
-        deleted_faces: list[str] = []
-        if getattr(self.faces, "name", "") != "disabled":
-            # Rekognition is authoritative: faces the row does not list (e.g. concurrent appends) go too. Listed
-            # BEFORE DeleteUser, which only disassociates them.
-            try:
-                face_ids = list(dict.fromkeys(face_ids + self._current_faces(user_id, row)))
-            except FaceError as e:
-                if e.kind != "INVALID_PARAMETER":
-                    raise _face_error(e) from e
-            try:
-                rek_deleted = self.faces.delete_user(user_id, uuid.uuid4().hex[:32])
-                deleted_faces = self.faces.delete_faces(face_ids)
-            except FaceError as e:
-                if e.kind not in {"NOT_FOUND", "INVALID_PARAMETER"}:
-                    raise _face_error(e) from e
+            raise ApiError("NOT_FOUND", "user not enrolled (no enrolment record); nothing erased",
+                           reason="NOT_ENROLLED")
+        rek_deleted, deleted_faces = self._erase_faces(user_id, row)
         if row.get("reference_key"):
             try:
                 self.blobs.delete(row["reference_key"])
             except Exception:
                 log.warning("reference image delete failed for %s", user_id)
-        self.kv.delete("users", user_id)
-        event = self.schedule.erase_user(user_id, kiosk_id=kiosk_id)
+        event = self.schedule.erase_user(user_id, kiosk_id=kiosk_id, actor=actor, audit_meta=audit_meta)
+        self.kv.delete("users", user_id)  # last: until here a failure leaves the row for the retry
+        try:
+            self.kv.delete(NS_OFFLINE_ENROL, user_id)
+        except Exception:  # noqa: BLE001 - housekeeping
+            log.warning("erase %s: offline-enrolment mark not cleared", user_id)
         return {"user_id": user_id, "erased": True, "rekognition_user_deleted": rek_deleted,
                 "faces_deleted": len(deleted_faces), "revocation_seq": event["seq"],
                 "bundle_version": event["bundle_version"]}
+
+    def _erase_faces(self, user_id: str, row: dict) -> tuple[bool, list[str]]:
+        if getattr(self.faces, "name", "") == "disabled":
+            return False, []
+        face_ids = list(row.get("face_ids") or [])
+        # Rekognition is authoritative: faces the row does not list (e.g. concurrent appends) go too. Listed BEFORE
+        # DeleteUser, which only disassociates them.
+        try:
+            face_ids = list(dict.fromkeys(face_ids + self._current_faces(user_id, row)))
+        except FaceError as e:
+            if e.kind != "INVALID_PARAMETER":
+                raise _face_error(e) from e
+        try:
+            rek_deleted = self.faces.delete_user(user_id, uuid.uuid4().hex[:32])
+            deleted, refused = self.faces.delete_faces_detailed(face_ids)
+        except FaceError as e:
+            if e.kind not in {"NOT_FOUND", "INVALID_PARAMETER"}:
+                raise _face_error(e) from e
+            return False, []
+        left = sorted(f for f, reasons in refused.items() if any(r != FACE_GONE for r in reasons))
+        if left:
+            log.warning("erase %s: %d face(s) not deleted (%s); erasure not completed", user_id, len(left),
+                        sorted({r for f in left for r in refused[f]}))
+            raise ApiError("CLOUD_UNAVAILABLE", f"{len(left)} face(s) could not be deleted; nothing else changed, "
+                                                "retry the erasure", reason="ERASE_INCOMPLETE")
+        return rek_deleted, deleted
+
+    # ------------------------------------------------------------------ offline enrolment record (SC2-D4)
+    def record_offline(self, rec: dict[str, Any], *, kiosk_id: str, actor: str | None,
+                       audit_meta: dict[str, Any]) -> tuple[bool, dict]:
+        """(created, body). Idempotent on (kiosk_id, user_id, at)."""
+        uid, at = rec["user_id"], rec["at"]
+        now = self.clock.now()
+        ttl = int(now.timestamp()) + OFFLINE_RECORD_TTL_S
+        created = self.kv.put_if_absent(NS_OFFLINE_ENROL_EVENTS, f"{kiosk_id}|{uid}|{at}",
+                                        {"user_id": uid, "kiosk_id": kiosk_id, "at": at}, ttl=ttl)
+        if created:
+            self.kv.put(NS_OFFLINE_ENROL, uid, {"user_id": uid, "kiosk_id": kiosk_id, "at": at,
+                                                "template_count": rec["template_count"], "model": rec["model"],
+                                                "recorded_at": iso_z(now)}, ttl=ttl)
+            self.schedule.audit("OFFLINE_ENROLMENT", kiosk_id=kiosk_id, actor=actor, user_id=uid, at=at,
+                                template_count=rec["template_count"], model=rec["model"], **audit_meta)
+        return created, {"recorded": True, "duplicate": not created}
+
+    # ------------------------------------------------------------------ contact-only record
+    def upsert_contact(self, user_id: str, *, display_name: str, email: str, consent_version: str,
+                       kiosk_id: str, actor: str | None, audit_meta: dict[str, Any]) -> dict:
+        """PUT /v1/admin/users/{user_id}/contact: e-mail + consent without biometric data. CAS on the row so a
+        concurrent enrolment (faces) is never overwritten; audited without the e-mail (no PII in the ledger)."""
+        now = iso_z(self.clock.now())
+        for _ in range(CONTACT_CAS_RETRIES):
+            cur = self.kv.get("users", user_id)
+            base = cur or {"user_id": user_id, "groups": [], "status": "ACTIVE", "face_ids": [],
+                           "rekognition_user_id": None, "template_version": 0, "created_at": now}
+            row = {**{k: v for k, v in base.items() if k != "_rev"}, "display_name": display_name, "email": email,
+                   "updated_at": now,
+                   "consent": {"given": True, "version": consent_version, "given_at": now, "purpose": PURPOSE}}
+            if self.kv.cas("users", user_id, row, cur["_rev"] if cur else None):
+                self.schedule.audit("CONTACT_UPDATE", kiosk_id=kiosk_id, actor=actor, user_id=user_id,
+                                    created=cur is None, consent_version=consent_version,
+                                    destination_masked=mask_email(email), **audit_meta)
+                return row
+        raise ApiError("INVALID_STATE", "user record changed concurrently; retry", reason="CONTACT_CONFLICT")

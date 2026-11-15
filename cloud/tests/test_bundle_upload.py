@@ -18,7 +18,7 @@ from cloud.app.services import code_hygiene
 from cloud.app.services.schedule_service import verify_bundle
 from cloud.tools.fakeimg import make_fake_jpeg
 
-from .conftest import ADMIN, BUNDLE_KEY, T0, Signed
+from .conftest import ADMIN, BUNDLE_KEY, T0, Signed, etag
 
 ADMIN_H = {"X-Admin-Token": ADMIN}
 EXAMPLE = PROJECT_ROOT / "config" / "schedule.example.json"
@@ -65,12 +65,14 @@ def test_upload_is_served_verbatim_with_version_etag_and_edge_accepts_it(main, s
     r = put(main, "KIOSK_MAIN_01", b)
     assert r.status_code == 200, r.text
     out = r.json()
-    assert out["bundle_version"] == 46 and out["etag"] == '"46"' and out["served"] == "verbatim"
+    assert out["bundle_version"] == 46 and out["etag"] == etag(46) and out["served"] == "verbatim"
     assert out["master"] == "replaced" and out["override_codes"] == 2 and out["unchanged"] is False
 
     g = main.get("/v1/schedule/KIOSK_MAIN_01")
-    assert g.status_code == 200 and g.headers["etag"] == '"46"' and g.json() == b  # byte-for-byte content
-    assert main.get("/v1/schedule/KIOSK_MAIN_01", headers={"If-None-Match": '"46"'}).status_code == 304
+    assert g.status_code == 200 and g.headers["etag"] == etag(46) and g.json() == b  # byte-for-byte content
+    assert main.get("/v1/schedule/KIOSK_MAIN_01", headers={"If-None-Match": etag(46)}).status_code == 304
+    # a bare version tag is not the representation the kiosk holds: 200 (EO-01)
+    assert main.get("/v1/schedule/KIOSK_MAIN_01", headers={"If-None-Match": '"46"'}).status_code == 200
 
     # the edge's own BundleStore installs it (signature + kiosk scope + version rules of edge/offline/bundle.py)
     from edge.offline.bundle import BundleStore
@@ -94,13 +96,13 @@ def test_identical_reupload_is_idempotent(main):
     assert put(main, "KIOSK_MAIN_01", b, now=ts).status_code == 401
     again = put(main, "KIOSK_MAIN_01", b, now=ts + 2)  # operator retry re-signs -> idempotent no-op
     assert again.status_code == 200 and again.json()["unchanged"] is True
-    assert main.get("/v1/schedule/KIOSK_MAIN_01").headers["etag"] == '"46"'
+    assert main.get("/v1/schedule/KIOSK_MAIN_01").headers["etag"] == etag(46)
 
 
 # ------------------------------------------------------------------ refusals (nothing changes)
 def _unchanged(main, services, version: int = 42) -> None:
     assert services.schedule.current()["version"] == version
-    assert main.get("/v1/schedule/KIOSK_MAIN_01").headers["etag"] == f'"{version}"'
+    assert main.get("/v1/schedule/KIOSK_MAIN_01").headers["etag"] == etag(version)
 
 
 def test_bad_signature_rejected_403(main, services):
@@ -170,8 +172,8 @@ def test_revocation_after_upload_publishes_higher_version_with_uploaded_codes(ma
     rv = main.request("POST", "/v1/admin/revocations", json_body={"type": "USER", "target_id": "u_prj1"},
                       headers=ADMIN_H)
     assert rv.status_code == 201 and rv.json()["bundle_version"] == 47
-    g = main.get("/v1/schedule/KIOSK_MAIN_01", headers={"If-None-Match": '"46"'})
-    assert g.status_code == 200 and g.headers["etag"] == '"47"'
+    g = main.get("/v1/schedule/KIOSK_MAIN_01", headers={"If-None-Match": etag(46)})
+    assert g.status_code == 200 and g.headers["etag"] == etag(47)
     b = g.json()
     assert verify_bundle(b, BUNDLE_KEY) and b["users"]["u_prj1"]["revoked"] is True
     assert [c["code_id"] for c in b["override_codes"]["codes"]] == ["OVR-DTEST-01", "OVR-DTEST-02"]

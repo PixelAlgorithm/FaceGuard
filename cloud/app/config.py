@@ -17,7 +17,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 APP_VERSION = "0.1.0"
 
-_REQUIRED_SECRETS = ("KIOSK_HMAC_KEY", "SCHEDULE_BUNDLE_HMAC_KEY", "CLOUD_API_KEY", "ADMIN_TOKEN")
+_REQUIRED_SECRETS = ("SCHEDULE_BUNDLE_HMAC_KEY", "CLOUD_API_KEY")
 
 
 class ConfigError(RuntimeError):
@@ -77,6 +77,11 @@ class Settings:
     card_id_pepper: str = field(default="", repr=False)
     otp_pepper: str = field(default="", repr=False)
     cloud_data_key: str = field(default="", repr=False)
+    cloud_api_keys: tuple = field(default=(), repr=False)  # rbac.ApiKeyEntry entries (CLOUD_API_KEYS_JSON)
+    # --- auth switches (design v2 §E; both default OFF in production) ---
+    auth_legacy_admin_token: bool = False  # AUTH_LEGACY_ADMIN_TOKEN=1: accept X-Admin-Token (role admin)
+    allow_shared_kiosk_key: bool = False  # ALLOW_SHARED_KIOSK_KEY=1: KIOSK_HMAC_KEY for kiosks not in KIOSK_KEYS_JSON
+    accept_bare_path_sig: bool = False  # CLOUD_ACCEPT_BARE_PATH_SIG=1: transition only (signature without ?query)
     # --- environment ---
     region: str = "us-east-1"
     face_backend: str = "fake"  # rekognition | fake | disabled
@@ -123,10 +128,11 @@ class Settings:
     synthetic_kiosks: tuple[str, ...] = ()
 
     def key_for_kiosk(self, kiosk_id: str, known_kiosks: set[str]) -> str | None:
-        """Per-kiosk HMAC key: explicit KIOSK_KEYS_JSON entry, else the shared demo key for known kiosks."""
+        """Per-kiosk HMAC key: explicit KIOSK_KEYS_JSON entry; the shared KIOSK_HMAC_KEY only for known kiosks and
+        only with ALLOW_SHARED_KIOSK_KEY=1 (one leaked kiosk key would otherwise impersonate every kiosk)."""
         if kiosk_id in self.kiosk_keys:
             return self.kiosk_keys[kiosk_id]
-        if kiosk_id in known_kiosks:
+        if self.allow_shared_kiosk_key and self.kiosk_hmac_key and kiosk_id in known_kiosks:
             return self.kiosk_hmac_key
         return None
 
@@ -157,9 +163,17 @@ def settings_from_env(environ: dict[str, str] | None = None, *, load_env_file: b
     if load_env_file and _bool(env.get("CLOUD_LOAD_DOTENV"), True):
         load_dotenv(PROJECT_ROOT / ".env", env)
 
+    legacy = _bool(env.get("AUTH_LEGACY_ADMIN_TOKEN"), False)
+    shared = _bool(env.get("ALLOW_SHARED_KIOSK_KEY"), False)
+    store_backend = _choice("STORE_BACKEND", env.get("STORE_BACKEND"), "memory", {"dynamodb", "sqlite", "memory"})
     missing = [k for k in _REQUIRED_SECRETS if not env.get(k)]
-    if env.get("CLOUD_ADMIN_TOKEN") and "ADMIN_TOKEN" in missing:
-        missing.remove("ADMIN_TOKEN")
+    if legacy and not (env.get("CLOUD_ADMIN_TOKEN") or env.get("ADMIN_TOKEN")):
+        missing.append("ADMIN_TOKEN (required with AUTH_LEGACY_ADMIN_TOKEN=1)")
+    if shared and not env.get("KIOSK_HMAC_KEY"):
+        missing.append("KIOSK_HMAC_KEY (required with ALLOW_SHARED_KIOSK_KEY=1)")
+    if store_backend != "memory" and not env.get("OTP_PEPPER"):
+        # a per-process pepper on a persistent store: every OTP dies on restart / differs between workers
+        missing.append("OTP_PEPPER (required unless STORE_BACKEND=memory)")
     if missing:
         raise ConfigError(f"missing required secrets (set in env or .env): {', '.join(missing)}")
 
@@ -172,13 +186,23 @@ def settings_from_env(environ: dict[str, str] | None = None, *, load_env_file: b
         if not isinstance(parsed, dict) or not all(isinstance(v, str) and v for v in parsed.values()):
             raise ConfigError("KIOSK_KEYS_JSON must map kiosk_id -> non-empty key string")
         kiosk_keys = parsed
+    if not kiosk_keys and not shared:
+        raise ConfigError("no kiosk keys: set KIOSK_KEYS_JSON ({kiosk_id: key}) or ALLOW_SHARED_KIOSK_KEY=1 with "
+                          "KIOSK_HMAC_KEY")
+    from .rbac import parse_api_keys  # rbac imports this module
+
+    api_keys = parse_api_keys(env.get("CLOUD_API_KEYS_JSON"))
 
     s = Settings(
-        kiosk_hmac_key=env["KIOSK_HMAC_KEY"],
+        kiosk_hmac_key=env.get("KIOSK_HMAC_KEY", ""),
         schedule_bundle_hmac_key=env["SCHEDULE_BUNDLE_HMAC_KEY"],
         cloud_api_key=env["CLOUD_API_KEY"],
-        admin_token=env.get("CLOUD_ADMIN_TOKEN") or env["ADMIN_TOKEN"],
+        admin_token=(env.get("CLOUD_ADMIN_TOKEN") or env.get("ADMIN_TOKEN") or "") if legacy else "",
         kiosk_keys=kiosk_keys,
+        cloud_api_keys=api_keys,
+        auth_legacy_admin_token=legacy,
+        allow_shared_kiosk_key=shared,
+        accept_bare_path_sig=_bool(env.get("CLOUD_ACCEPT_BARE_PATH_SIG"), False),
         card_id_pepper=env.get("CARD_ID_PEPPER", ""),
         otp_pepper=env.get("OTP_PEPPER", ""),
         cloud_data_key=env.get("CLOUD_DATA_KEY", ""),
@@ -187,7 +211,7 @@ def settings_from_env(environ: dict[str, str] | None = None, *, load_env_file: b
         liveness_backend=_choice(
             "LIVENESS_BACKEND", env.get("LIVENESS_BACKEND"), "fake", {"rekognition", "fake", "disabled"}
         ),
-        store_backend=_choice("STORE_BACKEND", env.get("STORE_BACKEND"), "memory", {"dynamodb", "sqlite", "memory"}),
+        store_backend=store_backend,
         email_backend=_choice("EMAIL_BACKEND", env.get("EMAIL_BACKEND"), "fake", {"ses", "fake", "disabled"}),
         blob_backend=_choice("BLOB_BACKEND", env.get("BLOB_BACKEND"), "memory", {"s3", "memory", "disabled"}),
         metrics_sink=_choice(
