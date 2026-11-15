@@ -6,8 +6,10 @@
   3. POST /v1/sync accepts a 2-item batch; the SAME batch replayed -> duplicates (idempotent)
   4. (only with --otp-email, after the SES identity is Verified) PUT contact for --otp-user + POST /v1/otp/send
 
-    cloud/.venv/bin/python -m cloud.tools.smoke_noface --base https://<api>.execute-api.us-east-1.amazonaws.com
-    ... --otp-user u_prj1 --otp-email studies.prajwalm@gmail.com     # step 4, after the verification click
+    cloud/.venv/bin/python -m cloud.tools.smoke_noface --live --base https://<api-id>.execute-api.us-east-1.amazonaws.com
+    ... --otp-user u_prj1 --otp-email <verified-address>     # step 4, after the verification click
+
+A non-local --base needs --live. Step 4 (PUT contact) is an admin route: FG_CLOUD_ADMIN_KEY (Bearer).
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import uuid
 from datetime import UTC, datetime
 
 from cloud.app.config import PROJECT_ROOT, load_dotenv
+from cloud.tools import redact, targets
 from cloud.tools.cloudclient import CloudClient, load_keys, sign_items
 
 
@@ -35,7 +38,7 @@ def show(title: str, resp, curl: str | None = None, body: dict | None = None) ->
             data = {"raw": resp.text[:300]}
     print(f"HTTP {resp.status_code}  X-Latency-Ms: {resp.headers.get('x-latency-ms')}  "
           f"ETag: {resp.headers.get('etag')}")
-    print(json.dumps(data, indent=2)[:2500])
+    print(json.dumps(redact.redact_json(data), indent=2)[:2500])
     return data
 
 
@@ -48,8 +51,10 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--otp-email")
     ap.add_argument("--otp-only", action="store_true",
                     help="only the OTP step (writes no sync records to the live ledger)")
+    targets.add_live_flag(ap)
     a = ap.parse_args(argv)
-    keys = load_keys()
+    targets.require_target(a.base, live=a.live)
+    keys = load_keys(a.kiosk)
     env = dict(os.environ)
     load_dotenv(PROJECT_ROOT / ".env", env)
     bundle_key = env["SCHEDULE_BUNDLE_HMAC_KEY"].encode("utf-8")
@@ -78,8 +83,9 @@ def main(argv: list[str]) -> int:
     show(f"2a. GET /v1/schedule/{a.kiosk} (signed bundle, summary)", r, curl, body=summary)
     ok &= r.status_code == 200 and summary["edge_verify_bundle"] and summary["demo_user_entitled"]
     ok &= not summary["placeholder_card_hashes"]
-    r, curl = c.request("GET", f"/v1/schedule/{a.kiosk}", headers={"If-None-Match": f'"{b.get("bundle_version")}"'})
-    print(f"\n### 2b. If-None-Match \"{b.get('bundle_version')}\" -> HTTP {r.status_code} (expect 304)")
+    etag = r.headers.get("etag") or f'"{b.get("bundle_version")}"'
+    r, curl = c.request("GET", f"/v1/schedule/{a.kiosk}", headers={"If-None-Match": etag})
+    print(f"\n### 2b. If-None-Match {etag} (the ETag just received) -> HTTP {r.status_code} (expect 304)")
     ok &= r.status_code == 304
 
     att = f"att_smoke_{uuid.uuid4().hex[:10]}"

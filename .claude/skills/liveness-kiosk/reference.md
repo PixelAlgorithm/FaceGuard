@@ -644,6 +644,8 @@ def bundle_sig(bundle: dict, key: bytes) -> str:       # HMAC-SHA256 over the bu
     return hmac.new(key, canon({k: v for k, v in bundle.items() if k != "signature"}), hashlib.sha256).hexdigest()
 
 def verify_bundle(bundle: dict, key: bytes) -> bool:   # key = SCHEDULE_BUNDLE_HMAC_KEY
+    # as built: edge/offline/bundle.py verify_bundle(bundle, key, key_id) also pins signature.key_id
+    # (SCHEDULE_BUNDLE_KEY_ID, default "demo-k1"); a rotated-out key id is refused
     sig = bundle.get("signature") or {}
     return sig.get("alg") == "HMAC-SHA256" and isinstance(sig.get("value"), str) \
         and hmac.compare_digest(sig["value"], bundle_sig(bundle, key))      # constant-time compare

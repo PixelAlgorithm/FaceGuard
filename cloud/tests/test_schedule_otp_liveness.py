@@ -13,7 +13,7 @@ from cloud.app.clock import parse_ts
 from cloud.app.services.schedule_service import verify_bundle
 from cloud.tools.fakeimg import make_fake_jpeg
 
-from .conftest import ADMIN, BUNDLE_KEY, T0
+from .conftest import ADMIN, BUNDLE_KEY, T0, etag
 
 
 def _fresh_code(code: str = "60417223", code_id: str = "OVR-T0001") -> dict:
@@ -28,7 +28,7 @@ def test_bundle_is_schedule_example_format_filtered_and_signed(signed, services)
     # the seed's publicly documented OVR-001..003 are stripped; a fresh (non-documented) code is published
     services.schedule.publish(lambda d: d["override_codes"]["codes"].append(_fresh_code()), "test:code")
     r = signed.get("/v1/schedule/KIOSK_LIB_01")
-    assert r.status_code == 200 and r.headers["etag"] == '"43"'
+    assert r.status_code == 200 and r.headers["etag"] == etag(43)
     b = r.json()
     from cloud.app.config import PROJECT_ROOT
 
@@ -81,10 +81,12 @@ def test_bundle_filtering_is_safe_for_every_kiosk_user_and_half_hour(signed, ser
 
 
 def test_bundle_etag_304_and_version_bump(signed, services):
-    assert signed.get("/v1/schedule/KIOSK_LIB_01", headers={"If-None-Match": '"42"'}).status_code == 304
+    first = signed.get("/v1/schedule/KIOSK_LIB_01")
+    assert first.headers["etag"] == etag(42)
+    assert signed.get("/v1/schedule/KIOSK_LIB_01", headers={"If-None-Match": etag(42)}).status_code == 304
     services.schedule.revoke(rtype="USER", target_id="u_1a2b", reason="ADMIN")
-    r = signed.get("/v1/schedule/KIOSK_LIB_01", headers={"If-None-Match": '"42"'})
-    assert r.status_code == 200 and r.json()["bundle_version"] == 43 and r.headers["etag"] == '"43"'
+    r = signed.get("/v1/schedule/KIOSK_LIB_01", headers={"If-None-Match": etag(42)})
+    assert r.status_code == 200 and r.json()["bundle_version"] == 43 and r.headers["etag"] == etag(43)
     assert r.json()["revocations_version"] == 8
 
 

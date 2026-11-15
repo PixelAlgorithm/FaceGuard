@@ -105,12 +105,17 @@ def test_staff_override_requires_the_staff_id(missing):
     assert res.ok is True and res.fallback["staff_id"] == "s_guard02"
 
 
-def test_missing_staff_id_counts_towards_the_override_lockout():
+def test_missing_staff_id_counts_only_towards_the_device_backstop():
+    """F05: anonymous submissions cannot lock a named guard with max_failures guesses; only the device backstop
+    (device_max_failures in device_window_s) locks every override."""
     st = InMemoryFallbackState()
     v = verifier(state=st)
     for _ in range(int(T.fallback.staff_override.max_failures)):
         assert v.verify(staff("48213907", staff_id=None), None, "OFFLINE", NOW).ok is False
-    res = v.verify(staff("48213907"), None, "OFFLINE", NOW + timedelta(seconds=1))
+    assert v.verify(staff("75530182"), None, "OFFLINE", NOW + timedelta(seconds=1)).ok is True
+    for _ in range(int(T.fallback.staff_override.device_max_failures)):
+        v.verify(staff("48213907", staff_id=None), None, "OFFLINE", NOW + timedelta(seconds=2))
+    res = v.verify(staff("48213907"), None, "OFFLINE", NOW + timedelta(seconds=3))
     assert res.ok is False and res.reason == "staff override locked"
 
 

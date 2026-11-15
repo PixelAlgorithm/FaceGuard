@@ -98,7 +98,7 @@ def test_erased_revocation_removes_totp_and_runs_erase_hooks_once(make_rt, cloud
 # ---------------------------------------------------------------- 4. P7 visibility in GET /v1/mode
 def test_cloud_match_misses_are_visible_while_the_kiosk_stays_online(make_rt, cloud):
     rt = make_rt(cloud)
-    cloud.bundle = rt.bundles.lvb
+    cloud.bundle = rt.bundles.lvb  # the verbatim signed LVB
     bring_online(rt)
     rt.sync_now()
     rt.decide(attempt("att_cm_miss", cloud={"ok": False, "top1_user": None}))
@@ -153,7 +153,7 @@ def test_totp_replay_table_is_purged_outside_the_window_only(tmp_path):
 # ---------------------------------------------------------------- 11. 304 bundle branch
 def test_bundle_304_confirms_the_installed_bundle(make_rt, cloud):
     rt = make_rt(cloud)
-    cloud.bundle = rt.bundles.lvb
+    cloud.bundle = rt.bundles.lvb  # the verbatim signed LVB
     cloud.etag_304 = True
     rep = rt.sync.run_once()
     assert rep["bundle"] == "not_modified" and rt.bundles.refresh_age_s() is not None
@@ -191,9 +191,9 @@ def test_revocation_overlay_file_is_owner_only_and_atomic(tmp_path):
     try:
         path = tmp_path / "data" / "revocations.enc"
         ov = RevocationOverlay(path, TEST_DATA_KEY)
-        ov.apply({"revocation_seq": 3, "items": [{"type": "USER", "target_id": "u_x", "reason": "LOST"}]})
+        ov.apply({"revocation_seq": 3, "items": [{"seq": 3, "type": "USER", "target_id": "u_x", "reason": "LOST"}]})
         assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
-        ov.apply({"revocation_seq": 4, "items": [{"type": "CARD", "target_id": "c_hash"}]})
+        ov.apply({"revocation_seq": 4, "items": [{"seq": 4, "type": "CARD", "target_id": "c_hash"}]})
         assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
         assert sorted(p.name for p in path.parent.iterdir()) == ["revocations.enc"]
         again = RevocationOverlay(path, TEST_DATA_KEY)

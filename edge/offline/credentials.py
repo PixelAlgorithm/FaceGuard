@@ -1,17 +1,21 @@
-"""Encrypted credential cache (per-user TOTP secrets). Never logged; AES-GCM with EDGE_DATA_KEY."""
+"""Encrypted credential cache (per-user TOTP secrets). Never logged; AES-GCM with EDGE_DATA_KEY.
+
+Writes are owner-only, fsync'd and atomic. A 0-byte / truncated / foreign-key file (power loss, wrong key) is
+quarantined as *.corrupt-<ts> and the cache starts empty with `corrupt` set (EO-08): TOTP is then simply not
+offered (fail-secure), the edge still starts, syncs and purges."""
 
 from __future__ import annotations
 
 import base64
 import json
-import os
 import secrets
-import tempfile
 import threading
 from pathlib import Path
 from urllib.parse import quote
 
-from edge.offline.crypto import DataCipher
+from edge.offline.crypto import DataCipher, read_encrypted, write_private_atomic
+
+_AAD = b"credentials"
 
 
 class CredentialStore:
@@ -21,6 +25,7 @@ class CredentialStore:
         self._lock = threading.Lock()
         self._totp: dict[str, str] = {}
         self._sig: tuple[int, int] | None = None
+        self.corrupt: Path | None = None
         self._reload()
 
     def _reload(self) -> None:
@@ -30,9 +35,16 @@ class CredentialStore:
         except OSError:
             return
         sig = (st.st_mtime_ns, st.st_size)
-        if sig != self._sig:
-            self._totp = json.loads(self._c.decrypt(self.path.read_bytes(), b"credentials")).get("totp", {})
-            self._sig = sig
+        if sig == self._sig:
+            return
+        plain, moved = read_encrypted(self.path, self._c, _AAD)
+        if moved is not None:  # quarantined: no TOTP until re-provisioned (never a crash)
+            self._totp, self._sig, self.corrupt = {}, None, moved
+            return
+        data = json.loads(plain) if plain else {}
+        totp = data.get("totp") if isinstance(data, dict) else None
+        self._totp = {str(k): str(v) for k, v in totp.items()} if isinstance(totp, dict) else {}
+        self._sig = sig
 
     def totp_secret(self, user_id: str) -> str | None:
         with self._lock:
@@ -64,15 +76,7 @@ class CredentialStore:
             return len(self._totp)
 
     def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        blob = self._c.encrypt(json.dumps({"totp": self._totp}).encode(), b"credentials")
-        fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".cred-")
-        try:
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(blob)
-            os.replace(tmp, self.path)
-            st = self.path.stat()
-            self._sig = (st.st_mtime_ns, st.st_size)
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
+        blob = self._c.encrypt(json.dumps({"totp": self._totp}).encode(), _AAD)
+        write_private_atomic(self.path, blob, prefix=".cred-")
+        st = self.path.stat()
+        self._sig = (st.st_mtime_ns, st.st_size)

@@ -8,6 +8,8 @@ downscaled image, so box precision is comparable.
 
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,6 +23,13 @@ from edge.ml.onnx import make_session
 DETECT_MAX_SIDE = 320  # model hyper-parameter (speed), not a decision threshold
 DET_CONFIDENCE = 0.5  # uniface default face-confidence cut-off for candidate boxes
 NMS_IOU = 0.4  # uniface default
+# Smallest RetinaFace anchor (min_sizes[0][0]). A detector input whose shorter side is below it cannot
+# hold a detectable face, so such degenerate frames (e.g. 4 x 4096) return no face without running the
+# model (a zero-sized resize used to raise cv2.error -> HTTP 500). Model geometry, not a threshold.
+DETECT_MIN_SIDE = 16
+# Priors depend only on the detector input size. Kiosk traffic uses a handful of sizes; the bound stops
+# a client cycling frame sizes from growing the cache without limit (up to 102,400 keys / ~1.8 GB).
+ANCHOR_CACHE_MAX = 8
 _MEAN_BGR = np.array([104.0, 117.0, 123.0], dtype=np.float32)
 
 
@@ -59,25 +68,59 @@ class FaceBox:
         return x1, y1, x2, y2
 
 
+class PriorCache:
+    """Thread-safe LRU of RetinaFace priors keyed by detector input (height, width), at most
+    ANCHOR_CACHE_MAX. detect() runs on several pool threads at once; priors are built outside the
+    lock (pure, read-only result) and inserted under it."""
+
+    def __init__(self, maxsize: int = ANCHOR_CACHE_MAX) -> None:
+        self._maxsize = max(1, maxsize)
+        self._items: OrderedDict[tuple[int, int], np.ndarray] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+    def get(self, h: int, w: int) -> np.ndarray:
+        key = (h, w)
+        with self._lock:
+            hit = self._items.get(key)
+            if hit is not None:
+                self._items.move_to_end(key)
+                return hit
+        priors = generate_anchors(image_size=(h, w))  # uniface 4.3.0: (height, width), see tests
+        priors.setflags(write=False)
+        with self._lock:
+            self._items[key] = priors
+            self._items.move_to_end(key)
+            while len(self._items) > self._maxsize:
+                self._items.popitem(last=False)
+        return priors
+
+
 class FaceDetector:
     def __init__(self, model_path: Path, *, threads: int = 2) -> None:
         self.session = make_session(model_path, threads=threads)
         self.input_name = self.session.get_inputs()[0].name
-        self._anchors: dict[tuple[int, int], np.ndarray] = {}
+        self._anchors = PriorCache()
 
     def _priors(self, h: int, w: int) -> np.ndarray:
-        key = (h, w)
-        if key not in self._anchors:
-            self._anchors[key] = generate_anchors(image_size=(h, w))  # uniface: (height, width)
-        return self._anchors[key]
+        return self._anchors.get(h, w)
 
     def detect(self, bgr: np.ndarray) -> list[FaceBox]:
-        """Return faces sorted by box area (largest = main face first)."""
+        """Return faces sorted by box area (largest = main face first). Degenerate frames (detector
+        input shorter side < DETECT_MIN_SIDE) return [] (no face), never an exception."""
         h0, w0 = bgr.shape[:2]
+        if min(h0, w0) < 1:
+            return []
         scale = min(1.0, DETECT_MAX_SIDE / float(max(h0, w0)))
+        target = (max(1, round(w0 * scale)), max(1, round(h0 * scale)))
+        if min(target) < DETECT_MIN_SIDE:
+            return []
         img = bgr
         if scale < 1.0:
-            img = cv2.resize(bgr, (round(w0 * scale), round(h0 * scale)), interpolation=cv2.INTER_AREA)
+            img = cv2.resize(bgr, target, interpolation=cv2.INTER_AREA)
         h, w = img.shape[:2]
         x = (img.astype(np.float32) - _MEAN_BGR).transpose(2, 0, 1)[None]
         loc, conf, lms = self.session.run(None, {self.input_name: x})

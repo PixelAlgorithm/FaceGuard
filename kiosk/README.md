@@ -14,15 +14,48 @@ npm run dev            # http://localhost:5173  (predev copies the offline Media
 | URL | What |
 |---|---|
 | `http://localhost:5173/?mock=0` | Kiosk against the real edge (`VITE_EDGE_URL`, default `http://127.0.0.1:8000`) |
-| `http://localhost:5173/admin` | **Control panel** (tabs: Users & access · Live system · Staff codes · Eval; `#users`, `#system`, `#codes`, `#eval`). Open it in a **separate window**: a hidden kiosk tab stops processing camera frames. From the kiosk: press `A` or the "control panel" link |
+| `http://localhost:5173/admin` | **Control panel** behind staff sign-in (tabs: Users & access · Live system · Staff codes · Eval · Staff & roles · Audit log; `#users`, `#system`, `#codes`, `#eval`, `#staff`, `#audit`; a tab shows only when your roles grant one of its permissions). Open it in a **separate window**: a hidden kiosk tab stops processing camera frames |
 | `http://localhost:5173/register` | Guided enrolment (consent → details → 5 frames → result). `/enroll.html` redirects here |
-| `…/?mock=1`, `…/admin?mock=1` | In-browser mock edge (demo safety net). **Per tab only** (sessionStorage) with a "SIMULATED EDGE" banner and an Exit link; other tabs stay on the real edge |
-| `…/?kiosk=KIOSK_SRV_01` | Kiosk id for this page load only. The edge serves only its own `kiosk_id` (`GET /v1/mode`); any other id is refused (409), and the kiosk then drops the override and shows an operator error |
+| `…/?mock=1`, `…/admin?mock=1` | In-browser mock edge (demo safety net, **dev server / `VITE_ALLOW_MOCK=1` builds only**). **Per tab only** (sessionStorage) with a "SIMULATED EDGE" banner and an Exit link; other tabs stay on the real edge |
+| `…/?kiosk=KIOSK_SRV_01` | Kiosk id for this page load only (dev builds). The edge serves only its own `kiosk_id` (`GET /v1/mode`); any other id is refused (409), and the kiosk then drops the override and shows an operator error |
 
-`npm run dev:mock` starts with the mock as the default. Admin token = `ADMIN_TOKEN` from the repo `.env`
-(the mock accepts any non-empty token). Grant camera permission when Chrome asks.
+Routing is by **path** only (`/`, `/admin`, `/operator`, `/register`); `#/admin`-style hash routes were removed.
+`npm run dev:mock` starts with the mock as the default. Grant camera permission when Chrome asks.
 
-Operator keys on the kiosk: `Esc` reset, `F` fullscreen, `A` control panel (new tab), `T` take the capture lock
+## Staff sign-in and roles (RBAC, design v2 §F)
+
+`/admin`, `/operator` and `/register` require a staff account (`src/shared/auth/`: `AuthProvider`, `useAuth()`,
+`<LoginGate requires title>`, `<RequirePermission>`, `<SignedInBadge>`). Create the first admin on the edge machine,
+as the edge OS user: `edge/.venv/bin/python -m edge.auth create-user --username ops_admin --display-name "Ops Admin" --role admin --mfa` (`--mfa` enrols the TOTP right away; admin requires MFA)
+(the login screen shows this when `GET /v1/auth/status` reports `EMPTY`; `admin` itself is a reserved username).
+
+- Login: username + password (`POST /v1/auth/login`); MFA accounts get a second step with the opaque `mfa_ticket`;
+  roles in `AUTH_MFA_REQUIRED_ROLES` (admin, security_officer) enrol TOTP at first sign-in (secret + `otpauth://` URI
+  shown as text); a temporary password must be changed first; `429 RATE_LIMITED` shows the wait.
+- The UI never derives permissions from role names: it uses `principal.permissions` from `GET /v1/auth/me`. Every
+  poll / subscription is enabled by `token && can(perm)`; buttons without the permission say `Needs <permission>`.
+  The edge enforces every route regardless (`docs/contracts/admin_access.examples.json` lists each route's `permission`).
+- Credentials (`src/api/credentials.ts`): `fgs_…` session tokens and `fgk_…` API keys go in `Authorization: Bearer`;
+  anything else is the deprecated shared token in `X-Admin-Token` (accepted only when the edge runs with
+  `AUTH_LEGACY_ADMIN_TOKEN=1`; the login screen then offers it). User-initiated requests carry `X-FG-Activity: 1`;
+  pointer / keyboard input posts `POST /v1/auth/activity` at most once a minute. Polls and SSE never extend a session.
+- Session token: module memory, persisted to sessionStorage `hid.session` only on `/admin`, `/operator`, `/register`.
+  The public kiosk route (`/`) wipes `hid.session` and the legacy `hid.adminToken` and logs that session out.
+  10 minutes without input signs the console out (the edge's own idle limit is 30 min, absolute 12 h). Any 401 on a
+  session request shows "Session expired, sign in again"; the SSE feed stops on 401/403 and on `event: auth`.
+- Staff & roles tab (`staff:manage`): create accounts (random temporary password shown once), edit roles,
+  disable / enable, reset password, unlock, API keys (1–3 roles, never admin, 1–90 days, key shown once, revoke). Every
+  mutation asks for your own password (`confirm_password`). Audit log tab (`audit:read`): `GET /v1/admin/auth/audit`.
+- Mock (`?mock=1`, dev only): demo staff `ada` (admin, MFA code 123456), `olivia` (security_officer, MFA enrolment),
+  `emma` (enroller), `audra` (auditor), `evan` (evaluator), `nina` (must change password). Any password except `wrong`.
+
+Production build: `?mock`, `?debug`, `?camflip`, `?delegate` and `?kiosk` are ignored (set `VITE_CAMERA_FLIPPED=1` /
+`VITE_DELEGATE=cpu|gpu` at build time instead; `VITE_ALLOW_MOCK=1` re-enables the developer tools in a build).
+The build carries a Content-Security-Policy `<meta>` (vite.config.ts `hid-csp`): `connect-src 'self'` + the
+`VITE_EDGE_URL` origin (+ `VITE_CSP_CONNECT_SRC`, comma-separated), `script-src 'self' 'wasm-unsafe-eval'` (MediaPipe
+WebAssembly), `img-src 'self' data: blob:`; the dev server additionally allows inline scripts (React refresh) and `ws:`.
+
+Operator keys on the kiosk: `Esc` reset, `F` fullscreen, `T` take the capture lock
 back from /operator, `1`–`9`/`0` mock scenario (mock only).
 
 ## Roles and access (signed schedule = single source of truth, API.md v1.4 §3.18)
@@ -39,7 +72,7 @@ card, shared flow `src/shared/registerFlow.ts`):
    warning, `skipped_offline` = offline note) and `warnings[]`; the TOTP QR only when `totp_active`.
 
 Offline, new people cannot be registered; people already in the installed bundle can enrol (local template).
-Kiosk calls (edge proxies, `X-Admin-Token`; all parsed strictly by `src/api/access.ts`):
+Kiosk calls (edge proxies, signed-in staff credential; all parsed strictly by `src/api/access.ts`):
 
 | Route | Use |
 |---|---|
@@ -71,7 +104,7 @@ become STEP_UP `SCHEDULE_BUNDLE_INVALID` (staff override), never DENY.
 ```bash
 npm run lint           # oxlint
 npx tsc --noEmit       # app type-check (npm run typecheck also checks vite.config.ts + scripts/contract-test.ts)
-npm test               # contract test: parsers + validators vs docs/contracts/admin_access.examples.json (plain node)
+npm test               # contract test (parsers, validators, RBAC route permissions vs docs/contracts/admin_access.examples.json) + unit tests (node --test src/**/*.test.ts)
 npm run build          # type-check + contract test + production build -> dist/ (fully offline: wasm + model in dist/)
 ```
 

@@ -18,6 +18,8 @@ interface Inner<T> {
   for: string
 }
 
+const defaultErrorText = (e: unknown): string => (e instanceof Error ? e.message : String(e))
+
 const EMPTY = { data: null, error: null, loadedAt: null, loading: false }
 
 /**
@@ -25,15 +27,24 @@ const EMPTY = { data: null, error: null, loadedAt: null, loading: false }
  * key, so a slow edge never gets overlapping requests. refresh() while a request is in flight does not
  * start a second chain; it re-runs once right after the current request. Restarts (and drops the previous
  * data, e.g. another admin token's user list) when `key` or `enabled` changes; stops on unmount.
+ * `formatError` turns a failure into the shown text (default: the Error message), e.g. authErrorText.
  */
-export function usePoll<T>(fetcher: () => Promise<T>, intervalMs: number, enabled: boolean, key: string): PollState<T> {
+export function usePoll<T>(
+  fetcher: () => Promise<T>,
+  intervalMs: number,
+  enabled: boolean,
+  key: string,
+  formatError: (e: unknown) => string = defaultErrorText,
+): PollState<T> {
   const stateKey = `${enabled ? 1 : 0}|${key}`
   const [state, setState] = useState<Inner<T>>({ ...EMPTY, for: stateKey })
   const fetcherRef = useRef(fetcher)
+  const formatRef = useRef(formatError)
   const kick = useRef<() => void>(() => undefined)
 
   useEffect(() => {
     fetcherRef.current = fetcher
+    formatRef.current = formatError
   })
 
   useEffect(() => {
@@ -56,7 +67,7 @@ export function usePoll<T>(fetcher: () => Promise<T>, intervalMs: number, enable
         if (!cancelled) setState({ data, error: null, loadedAt: Date.now(), loading: false, for: stateKey })
       } catch (e) {
         if (!cancelled) {
-          const error = e instanceof Error ? e.message : String(e)
+          const error = formatRef.current(e)
           setState((s) => ({ ...(s.for === stateKey ? s : { ...EMPTY, for: stateKey }), error, loadedAt: Date.now(), loading: false }))
         }
       } finally {

@@ -55,6 +55,7 @@ CODE_ORDER: tuple[str, ...] = (
     "CHALLENGE_FAILED",
     "FALLBACK_OK",
     "FALLBACK_FAILED",
+    "FALLBACK_LOCKED",  # KF-03: the submitted method is locked (failure limit); retry_after_s says how long
     # final
     "ACCESS_OK",
 )

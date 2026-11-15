@@ -13,7 +13,15 @@
       "headers": [
         "X-Admin-Token"
       ],
-      "missing_or_wrong": "401 UNAUTHORIZED"
+      "missing_or_wrong": "401 UNAUTHORIZED",
+      "accepted": [
+        "edge_session",
+        "edge_api_key",
+        "edge_legacy_admin"
+      ],
+      "permission_field": "route.permission (any of route.permission_any_of when present)",
+      "lacking_permission": "403 FORBIDDEN reason MISSING_PERMISSION, error.required = [permission]",
+      "note": "The examples keep X-Admin-Token (legacy, AUTH_LEGACY_ADMIN_TOKEN=1 in the test suites); production clients send Authorization: Bearer (edge_session / edge_api_key)."
     },
     "none": {
       "headers": []
@@ -33,9 +41,45 @@
         "X-Timestamp",
         "X-Signature",
         "X-Api-Key",
+        "Authorization"
+      ],
+      "missing_or_wrong": "401 UNAUTHORIZED (HMAC) / 403 FORBIDDEN reason ADMIN_KEY_INVALID | ADMIN_KEY_EXPIRED | MISSING_PERMISSION (+required) | KIOSK_NOT_BOUND | LEGACY_DISABLED (never 401)",
+      "format": "Authorization: Bearer fgk_<key_id>.<secret> (cloud API key; edge_proxy keys are bound to exactly one kiosk_id = the HMAC kiosk)",
+      "legacy": "X-Admin-Token only with cloud AUTH_LEGACY_ADMIN_TOKEN=1 (legacy principal = admin role)",
+      "actor": "^(staff:s_[0-9a-z_]{2,32}|key:[a-z0-9]{8}|legacy:admin_token)$ from edge_proxy keys (else 422 VALIDATION_ERROR reason ACTOR_INVALID)"
+    },
+    "edge_session": {
+      "headers": [
+        "Authorization"
+      ],
+      "format": "Bearer fgs_<43 url-safe chars>",
+      "obtained_from": "POST /v1/auth/login",
+      "missing_or_wrong": "401 UNAUTHORIZED (reason SESSION_EXPIRED | CREDENTIAL_INVALID)",
+      "idle": "AUTH_SESSION_IDLE_MIN (30); only non-GET requests, X-FG-Activity: 1 and POST /v1/auth/activity refresh it",
+      "absolute": "AUTH_SESSION_MAX_HOURS (12)"
+    },
+    "edge_api_key": {
+      "headers": [
+        "Authorization"
+      ],
+      "format": "Bearer fgk_<key_id [a-z0-9]{8}>.<secret>",
+      "missing_or_wrong": "401 UNAUTHORIZED (reason CREDENTIAL_INVALID)",
+      "never_allowed": "/v1/auth/password, /v1/auth/mfa/*, /v1/admin/staff*, /v1/admin/api-keys* (403)"
+    },
+    "edge_legacy_admin": {
+      "headers": [
         "X-Admin-Token"
       ],
-      "missing_or_wrong": "401 UNAUTHORIZED (HMAC) / 403 FORBIDDEN (admin token)"
+      "enabled_by": "AUTH_LEGACY_ADMIN_TOKEN=1 (default 0)",
+      "principal": "admin minus {staff:manage, codes:rotate_any}; actor legacy:admin_token; every use audited",
+      "missing_or_wrong": "401 UNAUTHORIZED"
+    },
+    "edge_activity": {
+      "headers": [
+        "X-FG-Activity"
+      ],
+      "value": "1",
+      "meaning": "the request was caused by user input; the only way a GET extends the session idle timer"
     }
   },
   "field_limits": {
@@ -278,6 +322,174 @@
       "status": 503,
       "code": "CLOUD_UNAVAILABLE",
       "where": "cloud codes/rotate (the edge reports it as CLOUD_ERROR)"
+    },
+    "CREDENTIAL_INVALID": {
+      "status": 401,
+      "code": "UNAUTHORIZED",
+      "where": "edge",
+      "meaning": "no credential, or an unknown / malformed session token, API key or legacy token"
+    },
+    "SESSION_EXPIRED": {
+      "status": 401,
+      "code": "UNAUTHORIZED",
+      "where": "edge",
+      "meaning": "the staff session passed its idle (30 min) or absolute (12 h) limit, or was revoked (epoch bump)"
+    },
+    "INVALID_CREDENTIALS": {
+      "status": 401,
+      "code": "UNAUTHORIZED",
+      "where": "edge POST /v1/auth/login",
+      "meaning": "wrong username or password (unknown users are indistinguishable)"
+    },
+    "MFA_REQUIRED": {
+      "status": 401,
+      "code": "UNAUTHORIZED",
+      "where": "edge POST /v1/auth/login",
+      "meaning": "password correct, TOTP missing: error.mfa_ticket (2 min, single use) for the second leg"
+    },
+    "MFA_INVALID": {
+      "status": 401,
+      "code": "UNAUTHORIZED",
+      "where": "edge POST /v1/auth/login",
+      "meaning": "TOTP code wrong or replayed (the mfa_ticket is consumed)"
+    },
+    "ACCOUNT_DISABLED": {
+      "status": 401,
+      "code": "UNAUTHORIZED",
+      "where": "edge POST /v1/auth/login",
+      "meaning": "correct password, account disabled"
+    },
+    "MISSING_PERMISSION": {
+      "status": 403,
+      "code": "FORBIDDEN",
+      "where": "edge + cloud",
+      "meaning": "the principal lacks the route permission; error.required lists it"
+    },
+    "PASSWORD_CHANGE_REQUIRED": {
+      "status": 403,
+      "code": "FORBIDDEN",
+      "where": "edge",
+      "meaning": "the session is confined to /v1/auth/me|logout|activity|password|mfa/* until the password is changed"
+    },
+    "MFA_ENROLMENT_REQUIRED": {
+      "status": 403,
+      "code": "FORBIDDEN",
+      "where": "edge",
+      "meaning": "the role requires MFA (AUTH_MFA_REQUIRED_ROLES) and it is not enrolled yet"
+    },
+    "REAUTH_REQUIRED": {
+      "status": 403,
+      "code": "FORBIDDEN",
+      "where": "edge staff:manage mutations, API key creation, mfa/enroll",
+      "meaning": "confirm_password / current_password missing or wrong (never a sign-out)"
+    },
+    "STAFF_ID_NOT_OWN": {
+      "status": 403,
+      "code": "FORBIDDEN",
+      "where": "edge POST /v1/admin/access/codes/rotate",
+      "meaning": "codes:rotate only for the caller's own staff_id"
+    },
+    "NO_STAFF_IDENTITY": {
+      "status": 403,
+      "code": "FORBIDDEN",
+      "where": "edge POST /v1/admin/access/codes/rotate",
+      "meaning": "API keys and the legacy token cannot mint staff codes"
+    },
+    "SELF_MODIFICATION": {
+      "status": 403,
+      "code": "FORBIDDEN",
+      "where": "edge PATCH /v1/admin/staff/{id}",
+      "meaning": "nobody changes their own roles or status"
+    },
+    "LAST_ADMIN": {
+      "status": 403,
+      "code": "FORBIDDEN",
+      "where": "edge staff admin",
+      "meaning": "the change would leave no active admin"
+    },
+    "ROLE_CEILING": {
+      "status": 403,
+      "code": "FORBIDDEN",
+      "where": "edge staff admin",
+      "meaning": "an actor may only grant roles whose permissions are a subset of its own"
+    },
+    "AUTH_UNAVAILABLE": {
+      "status": 503,
+      "code": "AUTH_UNAVAILABLE",
+      "where": "edge",
+      "meaning": "staff store MISSING / unreadable / rolled back: authenticated routes fail closed"
+    },
+    "AUTH_BUSY": {
+      "status": 503,
+      "code": "AUTH_BUSY",
+      "where": "edge",
+      "meaning": "staff store lock not acquired within 5 s"
+    },
+    "PASSWORD_POLICY": {
+      "status": 422,
+      "code": "VALIDATION_ERROR",
+      "where": "edge",
+      "meaning": "the new / temporary password fails the policy; error.problems lists why"
+    },
+    "RESERVED_USERNAME": {
+      "status": 422,
+      "code": "VALIDATION_ERROR",
+      "where": "edge POST /v1/admin/staff",
+      "meaning": "admin, root, administrator, sa, test, demo, system, kiosk"
+    },
+    "INVALID_ROLES": {
+      "status": 422,
+      "code": "VALIDATION_ERROR",
+      "where": "edge staff / API key admin",
+      "meaning": "unknown roles, more than 3, or admin for an API key"
+    },
+    "MFA_ALREADY_ENABLED": {
+      "status": 409,
+      "code": "INVALID_STATE",
+      "where": "edge POST /v1/auth/mfa/enroll",
+      "meaning": "MFA is already enabled for this account"
+    },
+    "ADMIN_KEY_INVALID": {
+      "status": 403,
+      "code": "FORBIDDEN",
+      "where": "cloud admin routes",
+      "meaning": "Authorization Bearer key missing, unknown or wrong (cloud admin failures are never 401)"
+    },
+    "ADMIN_KEY_EXPIRED": {
+      "status": 403,
+      "code": "FORBIDDEN",
+      "where": "cloud admin routes",
+      "meaning": "the cloud API key passed expires_at"
+    },
+    "KIOSK_NOT_BOUND": {
+      "status": 403,
+      "code": "FORBIDDEN",
+      "where": "cloud admin routes",
+      "meaning": "edge_proxy key used with an HMAC kiosk other than its bound kiosk_id"
+    },
+    "LEGACY_DISABLED": {
+      "status": 403,
+      "code": "FORBIDDEN",
+      "where": "cloud admin routes",
+      "meaning": "X-Admin-Token sent while cloud AUTH_LEGACY_ADMIN_TOKEN=0"
+    },
+    "ACTOR_INVALID": {
+      "status": 422,
+      "code": "VALIDATION_ERROR",
+      "where": "cloud (edge_proxy keys)",
+      "meaning": "body actor is not ^(staff:s_[0-9a-z_]{2,32}|key:[a-z0-9]{8}|legacy:admin_token)$"
+    },
+    "STAFF_ID_TAKEN": {
+      "status": 409,
+      "code": "INVALID_STATE",
+      "where": "cloud POST /v1/admin/codes/rotate",
+      "meaning": "the staff_id is bound to the kiosk that first rotated it"
+    },
+    "TOO_MANY_ACTIVE_CODES": {
+      "status": 422,
+      "code": "VALIDATION_ERROR",
+      "where": "cloud POST /v1/admin/codes/rotate",
+      "meaning": "at most 10 active codes per staff_id"
     }
   },
   "routes": [
@@ -1448,7 +1660,7 @@
       "errors": [
         {
           "name": "no_admin_token",
-          "state": "X-Admin-Token missing",
+          "state": "no credential (or an invalid one)",
           "request_invalid": false,
           "request": {
             "headers": {},
@@ -1462,13 +1674,15 @@
             "body": {
               "error": {
                 "code": "UNAUTHORIZED",
-                "message": "admin token required",
+                "message": "authentication required",
+                "reason": "CREDENTIAL_INVALID",
                 "attempt_id": null
               }
             }
           }
         }
-      ]
+      ],
+      "permission": "access:read"
     },
     {
       "id": "edge.access.users.put",
@@ -2283,7 +2497,7 @@
       "errors": [
         {
           "name": "no_admin_token",
-          "state": "X-Admin-Token missing",
+          "state": "no credential (or an invalid one)",
           "request_invalid": false,
           "request": {
             "headers": {},
@@ -2301,7 +2515,8 @@
             "body": {
               "error": {
                 "code": "UNAUTHORIZED",
-                "message": "admin token required",
+                "message": "authentication required",
+                "reason": "CREDENTIAL_INVALID",
                 "attempt_id": null
               }
             }
@@ -3050,7 +3265,8 @@
             }
           }
         }
-      ]
+      ],
+      "permission": "access:edit"
     },
     {
       "id": "edge.access.users.revoke",
@@ -3515,7 +3731,8 @@
             }
           }
         }
-      ]
+      ],
+      "permission": "access:revoke"
     },
     {
       "id": "edge.access.codes.rotate",
@@ -3970,7 +4187,13 @@
             }
           }
         }
-      ]
+      ],
+      "permission": "codes:rotate",
+      "permission_any_of": [
+        "codes:rotate",
+        "codes:rotate_any"
+      ],
+      "permission_note": "codes:rotate: body.staff_id must equal the caller's staff_id (else 403 STAFF_ID_NOT_OWN); codes:rotate_any: any staff_id. API keys: 403 MISSING_PERMISSION (keys never hold codes:rotate); legacy token: 403 NO_STAFF_IDENTITY."
     },
     {
       "id": "edge.bundle.refresh",
@@ -4132,7 +4355,8 @@
             }
           }
         }
-      ]
+      ],
+      "permission": "bundle:refresh"
     },
     {
       "id": "edge.enroll.post",
@@ -4411,6 +4635,59 @@
               "reinstated_after_erasure": false,
               "warnings": [
                 "requested role 'student' was NOT applied: the campus schedule says 'faculty' (the signed schedule is the source of truth; change it in Users & Access)"
+              ]
+            }
+          }
+        },
+        {
+          "name": "cloud_transport_failed",
+          "state": "ONLINE; the cloud enrol call timed out after the edge stored the template (local enrolment committed)",
+          "request": {
+            "headers": {
+              "X-Admin-Token": "<ADMIN_TOKEN>"
+            },
+            "path_params": {},
+            "query": {},
+            "body": null,
+            "content_type": "multipart/form-data",
+            "meta": {
+              "user_id": "u_kv02",
+              "display_name": "Prof. Arjun T.",
+              "email": null,
+              "consent": true,
+              "consent_version": "2026-11-14.v1",
+              "card_id": null,
+              "provision_totp": true
+            },
+            "frames": 5
+          },
+          "response": {
+            "status": 201,
+            "headers": {},
+            "body": {
+              "user_id": "u_kv02",
+              "template_version": 1,
+              "local_cache_updated": true,
+              "cloud_indexed": false,
+              "cloud_state": "failed",
+              "totp_provisioning_uri": "otpauth://totp/HID-Kiosk:u_kv02?secret=JBSWY3DPEHPK3PXP&issuer=HID-Kiosk&digits=6&period=30",
+              "totp_active": false,
+              "frames_used": 5,
+              "frames_rejected": [],
+              "min_pairwise_cosine": 0.7132,
+              "cloud": {
+                "status": null,
+                "error": "cloud enrol timed out"
+              },
+              "schedule_role": "faculty",
+              "schedule_display": "Prof. Arjun T.",
+              "role_requested": null,
+              "role_applied": false,
+              "bundle_version": 50,
+              "reinstated_after_erasure": false,
+              "warnings": [
+                "NOT indexed in the cloud (cloud enrol HTTP 503): while ONLINE, Rekognition is authoritative, so this user is NOT_ENROLLED online until re-enrolled with the cloud reachable",
+                "TOTP is not active yet: the campus schedule does not mark this user TOTP-enrolled (re-enrol while ONLINE)"
               ]
             }
           }
@@ -4793,7 +5070,8 @@
             }
           }
         }
-      ]
+      ],
+      "permission": "enrol:write"
     },
     {
       "id": "edge.enroll.delete",
@@ -4977,7 +5255,8 @@
             }
           }
         }
-      ]
+      ],
+      "permission": "enrol:erase"
     },
     {
       "id": "edge.admin.users.list",
@@ -5046,7 +5325,7 @@
       "errors": [
         {
           "name": "no_admin_token",
-          "state": "X-Admin-Token missing",
+          "state": "no credential (or an invalid one)",
           "request_invalid": false,
           "request": {
             "headers": {},
@@ -5060,7 +5339,8 @@
             "body": {
               "error": {
                 "code": "UNAUTHORIZED",
-                "message": "admin token required",
+                "message": "authentication required",
+                "reason": "CREDENTIAL_INVALID",
                 "attempt_id": null
               }
             }
@@ -5090,7 +5370,8 @@
             }
           }
         }
-      ]
+      ],
+      "permission": "enrol:read"
     },
     {
       "id": "edge.mode.get",
@@ -5209,7 +5490,8 @@
           }
         }
       ],
-      "errors": []
+      "errors": [],
+      "permission": null
     },
     {
       "id": "edge.admin.clock.post",
@@ -5376,7 +5658,9 @@
             }
           }
         }
-      ]
+      ],
+      "permission": "demo:clock",
+      "permission_note": "DEMO_MODE=1 only; omitted from /v1/auth/me permissions when DEMO_MODE=0"
     },
     {
       "id": "cloud.admin.users.list",
@@ -5395,7 +5679,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {},
             "query": {},
@@ -5891,8 +6175,8 @@
       ],
       "errors": [
         {
-          "name": "admin_token_wrong",
-          "state": "X-Admin-Token missing or wrong",
+          "name": "admin_key_wrong",
+          "state": "Authorization Bearer key missing, unknown or wrong",
           "request_invalid": false,
           "request": {
             "headers": {
@@ -5900,7 +6184,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {},
             "query": {},
@@ -5912,7 +6196,8 @@
             "body": {
               "error": {
                 "code": "FORBIDDEN",
-                "message": "admin token required"
+                "message": "admin API key invalid",
+                "reason": "ADMIN_KEY_INVALID"
               }
             }
           }
@@ -5927,7 +6212,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {},
             "query": {},
@@ -5944,7 +6229,8 @@
             }
           }
         }
-      ]
+      ],
+      "permission": "access:read"
     },
     {
       "id": "cloud.admin.access.put",
@@ -5963,7 +6249,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {
               "user_id": "u_kv02"
@@ -5973,7 +6259,7 @@
               "display": "Prof. Arjun T.",
               "role": "faculty",
               "consent": true,
-              "actor": "register"
+              "actor": "staff:s_enroller01"
             }
           },
           "response": {
@@ -6018,7 +6304,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {
               "user_id": "u_prj1"
@@ -6028,7 +6314,7 @@
               "display": "Prajwal M.",
               "role": "student",
               "consent": true,
-              "actor": "register"
+              "actor": "staff:s_enroller01"
             }
           },
           "response": {
@@ -6073,7 +6359,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {
               "user_id": "u_a3b4"
@@ -6083,7 +6369,7 @@
               "role": "student",
               "consent": true,
               "restore": true,
-              "actor": "control-panel"
+              "actor": "staff:s_admin01"
             }
           },
           "response": {
@@ -6128,7 +6414,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {
               "user_id": "u_3c4d"
@@ -6174,8 +6460,8 @@
       ],
       "errors": [
         {
-          "name": "admin_token_wrong",
-          "state": "X-Admin-Token missing or wrong",
+          "name": "admin_key_wrong",
+          "state": "Authorization Bearer key missing, unknown or wrong",
           "request_invalid": false,
           "request": {
             "headers": {
@@ -6183,7 +6469,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {
               "user_id": "u_3c4d"
@@ -6199,7 +6485,8 @@
             "body": {
               "error": {
                 "code": "FORBIDDEN",
-                "message": "admin token required"
+                "message": "admin API key invalid",
+                "reason": "ADMIN_KEY_INVALID"
               }
             }
           }
@@ -6214,7 +6501,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {
               "user_id": "u-3c4d"
@@ -6245,7 +6532,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {
               "user_id": "u_c5d6"
@@ -6287,7 +6574,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {
               "user_id": "u_kv02"
@@ -6320,7 +6607,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {
               "user_id": "u_kv02"
@@ -6354,7 +6641,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {
               "user_id": "u_3c4d"
@@ -6389,7 +6676,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {
               "user_id": "u_kv02"
@@ -6422,7 +6709,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {
               "user_id": "u_kv02"
@@ -6455,7 +6742,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {
               "user_id": "u_prj1"
@@ -6487,7 +6774,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {
               "user_id": "u_a3b4"
@@ -6521,7 +6808,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {
               "user_id": "u_3c4d"
@@ -6553,7 +6840,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {
               "user_id": "u_a3b4"
@@ -6575,8 +6862,44 @@
               }
             }
           }
+        },
+        {
+          "name": "actor_invalid",
+          "state": "edge_proxy key; body actor is not a principal id",
+          "request_invalid": false,
+          "request": {
+            "headers": {
+              "X-Kiosk-Id": "KIOSK_MAIN_01",
+              "X-Timestamp": "<epoch_s>",
+              "X-Signature": "<hex HMAC-SHA256>",
+              "X-Api-Key": "<CLOUD_API_KEY>",
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
+            },
+            "path_params": {
+              "user_id": "u_kv02"
+            },
+            "query": {},
+            "body": {
+              "display": "Prof. Arjun T.",
+              "role": "faculty",
+              "consent": true,
+              "actor": "register"
+            }
+          },
+          "response": {
+            "status": 422,
+            "headers": {},
+            "body": {
+              "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "actor must be a principal id",
+                "reason": "ACTOR_INVALID"
+              }
+            }
+          }
         }
-      ]
+      ],
+      "permission": "access:edit"
     },
     {
       "id": "cloud.admin.revocations.post",
@@ -6595,7 +6918,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {},
             "query": {},
@@ -6603,7 +6926,7 @@
               "type": "USER",
               "target_id": "u_3c4d",
               "reason": "ADMIN",
-              "actor": "control-panel"
+              "actor": "staff:s_admin01"
             }
           },
           "response": {
@@ -6631,7 +6954,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {},
             "query": {},
@@ -6663,7 +6986,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {},
             "query": {},
@@ -6695,7 +7018,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {},
             "query": {},
@@ -6716,7 +7039,8 @@
             }
           }
         }
-      ]
+      ],
+      "permission": "revocations:write"
     },
     {
       "id": "cloud.admin.codes.rotate",
@@ -6735,7 +7059,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {},
             "query": {},
@@ -6743,7 +7067,7 @@
               "staff_id": "s_guard01",
               "count": 4,
               "replace_existing": true,
-              "actor": "control-panel"
+              "actor": "staff:s_admin01"
             }
           },
           "response": {
@@ -6758,26 +7082,26 @@
               "codes": [
                 {
                   "code_id": "OVR-R1114125000-01",
-                  "code": "40718325"
+                  "code": "4071832569"
                 },
                 {
                   "code_id": "OVR-R1114125000-02",
-                  "code": "93360142"
+                  "code": "9336014287"
                 },
                 {
                   "code_id": "OVR-R1114125000-03",
-                  "code": "15862094"
+                  "code": "1586209431"
                 },
                 {
                   "code_id": "OVR-R1114125000-04",
-                  "code": "77203519"
+                  "code": "7720351946"
                 }
               ],
               "dropped_code_ids": [
                 "OVR-R1114092210-01",
                 "OVR-R1114092210-02"
               ],
-              "code_length": 8,
+              "code_length": 10,
               "valid_until": "2026-11-16T00:40:00Z",
               "one_time": true,
               "warning": "Shown once: store these codes safely (each works once, for this staff_id only). The cloud keeps only PBKDF2 hashes; kiosks get them with the next bundle refresh."
@@ -6796,7 +7120,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {},
             "query": {},
@@ -6825,7 +7149,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
             },
             "path_params": {},
             "query": {},
@@ -6844,8 +7168,75 @@
               }
             }
           }
+        },
+        {
+          "name": "staff_id_taken",
+          "state": "the staff_id is bound to another kiosk (first rotation owns it)",
+          "request_invalid": false,
+          "request": {
+            "headers": {
+              "X-Kiosk-Id": "KIOSK_MAIN_01",
+              "X-Timestamp": "<epoch_s>",
+              "X-Signature": "<hex HMAC-SHA256>",
+              "X-Api-Key": "<CLOUD_API_KEY>",
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
+            },
+            "path_params": {},
+            "query": {},
+            "body": {
+              "staff_id": "s_guard01",
+              "count": 4,
+              "replace_existing": true,
+              "actor": "staff:s_admin01"
+            }
+          },
+          "response": {
+            "status": 409,
+            "headers": {},
+            "body": {
+              "error": {
+                "code": "INVALID_STATE",
+                "message": "illustrative",
+                "reason": "STAFF_ID_TAKEN"
+              }
+            }
+          }
+        },
+        {
+          "name": "too_many_active_codes",
+          "state": "s_guard01 already holds 10 active codes; count 4 without replace -> 14 > 10",
+          "request_invalid": false,
+          "request": {
+            "headers": {
+              "X-Kiosk-Id": "KIOSK_MAIN_01",
+              "X-Timestamp": "<epoch_s>",
+              "X-Signature": "<hex HMAC-SHA256>",
+              "X-Api-Key": "<CLOUD_API_KEY>",
+              "Authorization": "Bearer <CLOUD_EDGE_PROXY_KEY>"
+            },
+            "path_params": {},
+            "query": {},
+            "body": {
+              "staff_id": "s_guard01",
+              "count": 4,
+              "replace_existing": false,
+              "actor": "staff:s_admin01"
+            }
+          },
+          "response": {
+            "status": 422,
+            "headers": {},
+            "body": {
+              "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "illustrative",
+                "reason": "TOO_MANY_ACTIVE_CODES"
+              }
+            }
+          }
         }
-      ]
+      ],
+      "permission": "codes:rotate"
     },
     {
       "id": "cloud.revocations.feed",
@@ -6935,7 +7326,8 @@
             }
           }
         }
-      ]
+      ],
+      "permission": null
     },
     {
       "id": "cloud.admin.audit",
@@ -6954,7 +7346,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_AUDITOR_KEY>"
             },
             "path_params": {},
             "query": {
@@ -6973,7 +7365,7 @@
                   "ts_utc": "2026-11-14T12:48:02Z",
                   "action": "USER_CREATE",
                   "kiosk_id": "KIOSK_MAIN_01",
-                  "actor": "register",
+                  "actor": "staff:s_enroller01",
                   "user_id": "u_kv02",
                   "bundle_version": 50,
                   "changes": {
@@ -6985,13 +7377,15 @@
                       null,
                       "faculty"
                     ]
-                  }
+                  },
+                  "actor_assurance": "edge_asserted",
+                  "via": "key:edgeprx1"
                 },
                 {
                   "ts_utc": "2026-11-14T12:50:00Z",
                   "action": "CODES_ROTATE",
                   "kiosk_id": "KIOSK_MAIN_01",
-                  "actor": "control-panel",
+                  "actor": "staff:s_admin01",
                   "staff_id": "s_guard01",
                   "bundle_version": 51,
                   "minted_code_ids": [
@@ -7003,7 +7397,9 @@
                   "dropped_code_ids": [
                     "OVR-R1114092210-01",
                     "OVR-R1114092210-02"
-                  ]
+                  ],
+                  "actor_assurance": "edge_asserted",
+                  "via": "key:edgeprx1"
                 }
               ]
             }
@@ -7021,7 +7417,7 @@
               "X-Timestamp": "<epoch_s>",
               "X-Signature": "<hex HMAC-SHA256>",
               "X-Api-Key": "<CLOUD_API_KEY>",
-              "X-Admin-Token": "<CLOUD_ADMIN_TOKEN>"
+              "Authorization": "Bearer <CLOUD_AUDITOR_KEY>"
             },
             "path_params": {},
             "query": {
@@ -7040,7 +7436,1025 @@
             }
           }
         }
+      ],
+      "permission": "audit:read"
+    }
+  ],
+  "auth_routes": [
+    {
+      "id": "edge.auth.status",
+      "side": "edge",
+      "method": "GET",
+      "path": "/v1/auth/status",
+      "auth": "none",
+      "permission": null,
+      "examples": [
+        {
+          "name": "bootstrap_empty",
+          "request": {
+            "headers": {},
+            "body": null
+          },
+          "response": {
+            "status": 200,
+            "body": {
+              "store": "EMPTY",
+              "accounts_exist": false,
+              "legacy_token_enabled": false,
+              "mfa_required_roles": [
+                "admin",
+                "security_officer"
+              ]
+            }
+          }
+        },
+        {
+          "name": "ok",
+          "request": {
+            "headers": {},
+            "body": null
+          },
+          "response": {
+            "status": 200,
+            "body": {
+              "store": "OK",
+              "accounts_exist": true,
+              "legacy_token_enabled": false,
+              "mfa_required_roles": [
+                "admin",
+                "security_officer"
+              ]
+            }
+          }
+        }
+      ],
+      "errors": []
+    },
+    {
+      "id": "edge.auth.login",
+      "side": "edge",
+      "method": "POST",
+      "path": "/v1/auth/login",
+      "auth": "none",
+      "permission": null,
+      "response_headers": {
+        "Cache-Control": "no-store",
+        "Pragma": "no-cache"
+      },
+      "examples": [
+        {
+          "name": "password_and_totp",
+          "request": {
+            "headers": {},
+            "body": {
+              "username": "guard01",
+              "password": "<PASSWORD>",
+              "totp_code": "123456"
+            }
+          },
+          "response": {
+            "status": 200,
+            "body": {
+              "token": "fgs_<SESSION_TOKEN>",
+              "token_type": "Bearer",
+              "expires_at": "2026-11-15T21:00:00Z",
+              "idle_timeout_s": 1800,
+              "principal": {
+                "kind": "staff",
+                "id": "s_guard01",
+                "staff_id": "s_guard01",
+                "actor_id": "staff:s_guard01",
+                "username": "guard01",
+                "display_name": "Guard One",
+                "roles": [
+                  "security_officer"
+                ],
+                "permissions": [
+                  "access:read",
+                  "access:revoke",
+                  "attempt:signals",
+                  "audit:read",
+                  "bundle:refresh",
+                  "codes:rotate",
+                  "enrol:read",
+                  "events:read",
+                  "metrics:read",
+                  "mode:switch",
+                  "ratelimit:reset",
+                  "store:read",
+                  "sync:run"
+                ],
+                "must_change_password": false,
+                "mfa_enrolment_required": false,
+                "mfa_enabled": true
+              }
+            }
+          }
+        },
+        {
+          "name": "mfa_second_leg",
+          "request": {
+            "headers": {},
+            "body": {
+              "mfa_ticket": "<MFA_TICKET>",
+              "totp_code": "123456"
+            }
+          },
+          "response": {
+            "status": 200,
+            "body": {
+              "token": "fgs_<SESSION_TOKEN>",
+              "token_type": "Bearer",
+              "expires_at": "2026-11-15T21:00:00Z",
+              "idle_timeout_s": 1800,
+              "principal": {
+                "kind": "staff",
+                "id": "s_guard01",
+                "staff_id": "s_guard01",
+                "actor_id": "staff:s_guard01",
+                "username": "guard01",
+                "display_name": "Guard One",
+                "roles": [
+                  "security_officer"
+                ],
+                "permissions": [
+                  "access:read",
+                  "access:revoke",
+                  "attempt:signals",
+                  "audit:read",
+                  "bundle:refresh",
+                  "codes:rotate",
+                  "enrol:read",
+                  "events:read",
+                  "metrics:read",
+                  "mode:switch",
+                  "ratelimit:reset",
+                  "store:read",
+                  "sync:run"
+                ],
+                "must_change_password": false,
+                "mfa_enrolment_required": false,
+                "mfa_enabled": true
+              }
+            }
+          }
+        }
+      ],
+      "errors": [
+        {
+          "name": "mfa_required",
+          "request_invalid": false,
+          "request": {
+            "body": {
+              "username": "guard01",
+              "password": "<PASSWORD>"
+            }
+          },
+          "response": {
+            "status": 401,
+            "body": {
+              "error": {
+                "code": "UNAUTHORIZED",
+                "message": "illustrative",
+                "reason": "MFA_REQUIRED",
+                "mfa_ticket": "<MFA_TICKET>"
+              }
+            }
+          }
+        },
+        {
+          "name": "invalid_credentials",
+          "request_invalid": false,
+          "request": {
+            "body": {
+              "username": "guard01",
+              "password": "<WRONG>"
+            }
+          },
+          "response": {
+            "status": 401,
+            "body": {
+              "error": {
+                "code": "UNAUTHORIZED",
+                "message": "illustrative",
+                "reason": "INVALID_CREDENTIALS"
+              }
+            }
+          }
+        },
+        {
+          "name": "mfa_invalid",
+          "request_invalid": false,
+          "request": {
+            "body": {
+              "mfa_ticket": "<MFA_TICKET>",
+              "totp_code": "000000"
+            }
+          },
+          "response": {
+            "status": 401,
+            "body": {
+              "error": {
+                "code": "UNAUTHORIZED",
+                "message": "illustrative",
+                "reason": "MFA_INVALID"
+              }
+            }
+          }
+        },
+        {
+          "name": "account_disabled",
+          "request_invalid": false,
+          "request": {
+            "body": {
+              "username": "guard01",
+              "password": "<PASSWORD>"
+            }
+          },
+          "response": {
+            "status": 401,
+            "body": {
+              "error": {
+                "code": "UNAUTHORIZED",
+                "message": "illustrative",
+                "reason": "ACCOUNT_DISABLED"
+              }
+            }
+          }
+        },
+        {
+          "name": "rate_limited",
+          "request_invalid": false,
+          "request": {
+            "body": {
+              "username": "guard01",
+              "password": "<WRONG>"
+            }
+          },
+          "response": {
+            "status": 429,
+            "body": {
+              "error": {
+                "code": "RATE_LIMITED",
+                "message": "illustrative",
+                "retry_after_s": 8
+              }
+            }
+          }
+        },
+        {
+          "name": "store_unavailable",
+          "request_invalid": false,
+          "request": {
+            "body": {
+              "username": "guard01",
+              "password": "<PASSWORD>"
+            }
+          },
+          "response": {
+            "status": 503,
+            "body": {
+              "error": {
+                "code": "AUTH_UNAVAILABLE",
+                "message": "illustrative"
+              }
+            }
+          }
+        },
+        {
+          "name": "mfa_step_rate_limited",
+          "request_invalid": false,
+          "request": {
+            "body": {
+              "mfa_ticket": "<MFA_TICKET>",
+              "totp_code": "000000"
+            }
+          },
+          "response": {
+            "status": 429,
+            "body": {
+              "error": {
+                "code": "RATE_LIMITED",
+                "message": "illustrative",
+                "retry_after_s": 4
+              }
+            }
+          }
+        }
       ]
+    },
+    {
+      "id": "edge.auth.me",
+      "side": "edge",
+      "method": "GET",
+      "path": "/v1/auth/me",
+      "auth": "edge_session",
+      "permission": null,
+      "examples": [
+        {
+          "name": "session",
+          "request": {
+            "headers": {
+              "Authorization": "Bearer <SESSION_TOKEN>"
+            },
+            "body": null
+          },
+          "response": {
+            "status": 200,
+            "body": {
+              "principal": {
+                "kind": "staff",
+                "id": "s_guard01",
+                "staff_id": "s_guard01",
+                "actor_id": "staff:s_guard01",
+                "username": "guard01",
+                "display_name": "Guard One",
+                "roles": [
+                  "security_officer"
+                ],
+                "permissions": [
+                  "access:read",
+                  "access:revoke",
+                  "attempt:signals",
+                  "audit:read",
+                  "bundle:refresh",
+                  "codes:rotate",
+                  "enrol:read",
+                  "events:read",
+                  "metrics:read",
+                  "mode:switch",
+                  "ratelimit:reset",
+                  "store:read",
+                  "sync:run"
+                ],
+                "must_change_password": false,
+                "mfa_enrolment_required": false,
+                "mfa_enabled": true
+              },
+              "session": {
+                "session_id": "a1b2c3d4",
+                "expires_at": "2026-11-15T21:00:00Z",
+                "idle_timeout_s": 1800
+              }
+            }
+          }
+        }
+      ],
+      "errors": [
+        {
+          "name": "session_expired",
+          "request_invalid": false,
+          "request": {
+            "body": null
+          },
+          "response": {
+            "status": 401,
+            "body": {
+              "error": {
+                "code": "UNAUTHORIZED",
+                "message": "illustrative",
+                "reason": "SESSION_EXPIRED"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "edge.auth.mfa.enroll",
+      "side": "edge",
+      "method": "POST",
+      "path": "/v1/auth/mfa/enroll",
+      "auth": "edge_session",
+      "permission": null,
+      "response_headers": {
+        "Cache-Control": "no-store",
+        "Pragma": "no-cache"
+      },
+      "examples": [
+        {
+          "name": "started",
+          "request": {
+            "headers": {
+              "Authorization": "Bearer <SESSION_TOKEN>"
+            },
+            "body": {
+              "current_password": "<PASSWORD>"
+            }
+          },
+          "response": {
+            "status": 200,
+            "body": {
+              "secret": "JBSWY3DPEHPK3PXP",
+              "otpauth_uri": "otpauth://totp/FaceGuard:guard01?secret=JBSWY3DPEHPK3PXP&issuer=FaceGuard"
+            }
+          }
+        }
+      ],
+      "errors": [
+        {
+          "name": "missing_password",
+          "request_invalid": true,
+          "request": {
+            "body": {}
+          },
+          "response": {
+            "status": 422,
+            "body": {
+              "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "illustrative"
+              }
+            }
+          }
+        },
+        {
+          "name": "wrong_password",
+          "request_invalid": false,
+          "request": {
+            "body": {
+              "current_password": "<WRONG>"
+            }
+          },
+          "response": {
+            "status": 403,
+            "body": {
+              "error": {
+                "code": "FORBIDDEN",
+                "message": "illustrative",
+                "reason": "REAUTH_REQUIRED"
+              }
+            }
+          }
+        },
+        {
+          "name": "already_enabled",
+          "request_invalid": false,
+          "request": {
+            "body": {}
+          },
+          "response": {
+            "status": 409,
+            "body": {
+              "error": {
+                "code": "INVALID_STATE",
+                "message": "illustrative",
+                "reason": "MFA_ALREADY_ENABLED"
+              }
+            }
+          }
+        }
+      ],
+      "request_note": "current_password is REQUIRED (re-authentication, review F6)"
+    },
+    {
+      "id": "edge.auth.password",
+      "side": "edge",
+      "method": "POST",
+      "path": "/v1/auth/password",
+      "auth": "edge_session",
+      "permission": null,
+      "examples": [
+        {
+          "name": "changed",
+          "request": {
+            "headers": {
+              "Authorization": "Bearer <SESSION_TOKEN>"
+            },
+            "body": {
+              "current_password": "<PASSWORD>",
+              "new_password": "<NEW_PASSWORD>"
+            }
+          },
+          "response": {
+            "status": 204,
+            "body": null
+          }
+        }
+      ],
+      "errors": [
+        {
+          "name": "policy",
+          "request_invalid": false,
+          "request": {
+            "body": {
+              "current_password": "<PASSWORD>",
+              "new_password": "short"
+            }
+          },
+          "response": {
+            "status": 422,
+            "body": {
+              "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "illustrative",
+                "reason": "PASSWORD_POLICY",
+                "problems": [
+                  "at least 12 characters"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "edge.admin.staff.list",
+      "side": "edge",
+      "method": "GET",
+      "path": "/v1/admin/staff",
+      "auth": "edge_session",
+      "permission": "staff:manage",
+      "examples": [
+        {
+          "name": "list",
+          "request": {
+            "headers": {
+              "Authorization": "Bearer <SESSION_TOKEN>"
+            },
+            "body": null
+          },
+          "response": {
+            "status": 200,
+            "body": {
+              "items": [
+                {
+                  "staff_id": "s_enrol02",
+                  "username": "enrol02",
+                  "display_name": "Desk Two",
+                  "roles": [
+                    "enroller"
+                  ],
+                  "status": "active",
+                  "locked": false,
+                  "locked_until": null,
+                  "failed_logins": 0,
+                  "mfa_enabled": false,
+                  "must_change_password": true,
+                  "created_at": "2026-11-15T09:00:00Z",
+                  "updated_at": "2026-11-15T09:00:00Z",
+                  "password_changed_at": "2026-11-15T09:00:00Z",
+                  "last_login_at": null
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "errors": [
+        {
+          "name": "missing_permission",
+          "request_invalid": false,
+          "request": {
+            "body": null
+          },
+          "response": {
+            "status": 403,
+            "body": {
+              "error": {
+                "code": "FORBIDDEN",
+                "message": "illustrative",
+                "reason": "MISSING_PERMISSION",
+                "required": [
+                  "staff:manage"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "edge.admin.staff.create",
+      "side": "edge",
+      "method": "POST",
+      "path": "/v1/admin/staff",
+      "auth": "edge_session",
+      "permission": "staff:manage",
+      "examples": [
+        {
+          "name": "created",
+          "request": {
+            "headers": {
+              "Authorization": "Bearer <SESSION_TOKEN>"
+            },
+            "body": {
+              "username": "enrol02",
+              "display_name": "Desk Two",
+              "roles": [
+                "enroller"
+              ],
+              "temporary_password": "<TEMP_PASSWORD>",
+              "confirm_password": "<PASSWORD>"
+            }
+          },
+          "response": {
+            "status": 201,
+            "body": {
+              "item": {
+                "staff_id": "s_enrol02",
+                "username": "enrol02",
+                "display_name": "Desk Two",
+                "roles": [
+                  "enroller"
+                ],
+                "status": "active",
+                "locked": false,
+                "locked_until": null,
+                "failed_logins": 0,
+                "mfa_enabled": false,
+                "must_change_password": true,
+                "created_at": "2026-11-15T09:00:00Z",
+                "updated_at": "2026-11-15T09:00:00Z",
+                "password_changed_at": "2026-11-15T09:00:00Z",
+                "last_login_at": null
+              }
+            }
+          }
+        }
+      ],
+      "errors": [
+        {
+          "name": "reauth",
+          "request_invalid": false,
+          "request": {
+            "body": null
+          },
+          "response": {
+            "status": 403,
+            "body": {
+              "error": {
+                "code": "FORBIDDEN",
+                "message": "illustrative",
+                "reason": "REAUTH_REQUIRED"
+              }
+            }
+          }
+        },
+        {
+          "name": "role_ceiling",
+          "request_invalid": false,
+          "request": {
+            "body": null
+          },
+          "response": {
+            "status": 403,
+            "body": {
+              "error": {
+                "code": "FORBIDDEN",
+                "message": "illustrative",
+                "reason": "ROLE_CEILING"
+              }
+            }
+          }
+        },
+        {
+          "name": "reserved_username",
+          "request_invalid": false,
+          "request": {
+            "body": null
+          },
+          "response": {
+            "status": 422,
+            "body": {
+              "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "illustrative",
+                "reason": "RESERVED_USERNAME"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "edge.admin.staff.patch",
+      "side": "edge",
+      "method": "PATCH",
+      "path": "/v1/admin/staff/{staff_id}",
+      "auth": "edge_session",
+      "permission": "staff:manage",
+      "examples": [
+        {
+          "name": "disabled",
+          "request": {
+            "headers": {
+              "Authorization": "Bearer <SESSION_TOKEN>"
+            },
+            "body": {
+              "status": "disabled",
+              "confirm_password": "<PASSWORD>"
+            }
+          },
+          "response": {
+            "status": 200,
+            "body": {
+              "item": {
+                "staff_id": "s_enrol02",
+                "username": "enrol02",
+                "display_name": "Desk Two",
+                "roles": [
+                  "enroller"
+                ],
+                "status": "disabled",
+                "locked": false,
+                "locked_until": null,
+                "failed_logins": 0,
+                "mfa_enabled": false,
+                "must_change_password": true,
+                "created_at": "2026-11-15T09:00:00Z",
+                "updated_at": "2026-11-15T09:00:00Z",
+                "password_changed_at": "2026-11-15T09:00:00Z",
+                "last_login_at": null
+              }
+            }
+          }
+        }
+      ],
+      "errors": [
+        {
+          "name": "self_modification",
+          "request_invalid": false,
+          "request": {
+            "body": null
+          },
+          "response": {
+            "status": 403,
+            "body": {
+              "error": {
+                "code": "FORBIDDEN",
+                "message": "illustrative",
+                "reason": "SELF_MODIFICATION"
+              }
+            }
+          }
+        },
+        {
+          "name": "last_admin",
+          "request_invalid": false,
+          "request": {
+            "body": null
+          },
+          "response": {
+            "status": 403,
+            "body": {
+              "error": {
+                "code": "FORBIDDEN",
+                "message": "illustrative",
+                "reason": "LAST_ADMIN"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "edge.admin.api_keys.list",
+      "side": "edge",
+      "method": "GET",
+      "path": "/v1/admin/api-keys",
+      "auth": "edge_session",
+      "permission": "staff:manage",
+      "examples": [
+        {
+          "name": "list",
+          "request": {
+            "headers": {
+              "Authorization": "Bearer <SESSION_TOKEN>"
+            },
+            "body": null
+          },
+          "response": {
+            "status": 200,
+            "body": {
+              "items": [
+                {
+                  "key_id": "k7q2m9x1",
+                  "name": "eval capture",
+                  "roles": [
+                    "evaluator"
+                  ],
+                  "permissions": [
+                    "attempt:signals",
+                    "eval:admin",
+                    "events:read",
+                    "metrics:read",
+                    "mode:switch",
+                    "ratelimit:reset",
+                    "store:read"
+                  ],
+                  "status": "active",
+                  "created_at": "2026-11-15T09:05:00Z",
+                  "created_by": "staff:s_admin01",
+                  "expires_at": "2026-12-15T09:05:00Z",
+                  "last_used_at": null,
+                  "revoked_at": null
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "errors": []
+    },
+    {
+      "id": "edge.admin.api_keys.create",
+      "side": "edge",
+      "method": "POST",
+      "path": "/v1/admin/api-keys",
+      "auth": "edge_session",
+      "permission": "staff:manage",
+      "response_headers": {
+        "Cache-Control": "no-store",
+        "Pragma": "no-cache"
+      },
+      "examples": [
+        {
+          "name": "created",
+          "request": {
+            "headers": {
+              "Authorization": "Bearer <SESSION_TOKEN>"
+            },
+            "body": {
+              "name": "eval capture",
+              "roles": [
+                "evaluator"
+              ],
+              "expires_days": 30,
+              "confirm_password": "<PASSWORD>"
+            }
+          },
+          "response": {
+            "status": 201,
+            "body": {
+              "key": "fgk_k7q2m9x1.<SECRET>",
+              "item": {
+                "key_id": "k7q2m9x1",
+                "name": "eval capture",
+                "roles": [
+                  "evaluator"
+                ],
+                "permissions": [
+                  "attempt:signals",
+                  "eval:admin",
+                  "events:read",
+                  "metrics:read",
+                  "mode:switch",
+                  "ratelimit:reset",
+                  "store:read"
+                ],
+                "status": "active",
+                "created_at": "2026-11-15T09:05:00Z",
+                "created_by": "staff:s_admin01",
+                "expires_at": "2026-12-15T09:05:00Z",
+                "last_used_at": null,
+                "revoked_at": null
+              }
+            }
+          }
+        }
+      ],
+      "errors": [
+        {
+          "name": "admin_role_refused",
+          "request_invalid": false,
+          "request": {
+            "body": null
+          },
+          "response": {
+            "status": 422,
+            "body": {
+              "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "illustrative",
+                "reason": "INVALID_ROLES"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "edge.admin.roles",
+      "side": "edge",
+      "method": "GET",
+      "path": "/v1/admin/roles",
+      "auth": "edge_session",
+      "permission": null,
+      "examples": [
+        {
+          "name": "catalog",
+          "request": {
+            "headers": {
+              "Authorization": "Bearer <SESSION_TOKEN>"
+            },
+            "body": null
+          },
+          "response": {
+            "status": 200,
+            "body": {
+              "roles": [
+                {
+                  "name": "enroller",
+                  "description": "Registers (enrols) faces of people already in the signed schedule.",
+                  "permissions": [
+                    "access:read",
+                    "bundle:refresh",
+                    "enrol:erase",
+                    "enrol:read",
+                    "enrol:write"
+                  ],
+                  "key_allowed": true
+                }
+              ],
+              "permissions": [
+                "access:read",
+                "bundle:refresh",
+                "enrol:erase",
+                "enrol:read",
+                "enrol:write"
+              ],
+              "key_forbidden_permissions": [
+                "access:edit",
+                "access:revoke",
+                "codes:rotate",
+                "codes:rotate_any",
+                "demo:clock",
+                "enrol:erase",
+                "staff:manage"
+              ],
+              "max_roles_per_account": 3
+            }
+          }
+        }
+      ],
+      "errors": [],
+      "permission_note": "any authenticated principal (edge/auth/rbac.py ROUTE_PERMISSIONS); the kiosk only uses it inside Staff & roles"
+    },
+    {
+      "id": "edge.admin.auth.audit",
+      "side": "edge",
+      "method": "GET",
+      "path": "/v1/admin/auth/audit",
+      "auth": "edge_session",
+      "permission": "audit:read",
+      "examples": [
+        {
+          "name": "page",
+          "request": {
+            "headers": {
+              "Authorization": "Bearer <SESSION_TOKEN>"
+            },
+            "body": null
+          },
+          "response": {
+            "status": 200,
+            "body": {
+              "as_of": "2026-11-15T10:00:00Z",
+              "count": 2,
+              "items": [
+                {
+                  "seq": 42,
+                  "ts_utc": "2026-11-15T09:59:00Z",
+                  "actor": {
+                    "kind": "staff",
+                    "id": "s_admin01",
+                    "username": "admin01"
+                  },
+                  "action": "staff.create",
+                  "target": "s_enrol02",
+                  "outcome": "ok",
+                  "client_ip": "127.0.0.1",
+                  "detail": null,
+                  "count": null
+                },
+                {
+                  "seq": 41,
+                  "ts_utc": "2026-11-15T09:58:00Z",
+                  "actor": {
+                    "kind": "staff",
+                    "id": "s_enrol02",
+                    "username": "enrol02"
+                  },
+                  "action": "auth.denied",
+                  "target": "POST /v1/admin/access/users/{user_id}/revoke",
+                  "outcome": "denied",
+                  "client_ip": "127.0.0.1",
+                  "detail": {
+                    "reason": "MISSING_PERMISSION",
+                    "required": [
+                      "access:revoke"
+                    ]
+                  },
+                  "count": 3
+                }
+              ],
+              "next_before_seq": 41
+            }
+          }
+        }
+      ],
+      "errors": []
     }
   ]
 }

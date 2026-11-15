@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -28,16 +29,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import ValidationError
 from starlette.datastructures import UploadFile
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from edge import access
 from edge import attempts as svc
 from edge.attempts import EdgeContext
-from edge.cloud_client import CloudClient, CloudRejected, CloudUnavailable
+from edge.auth import rbac
+from edge.auth.config import legacy_token_enabled as auth_legacy_flag
+from edge.auth.deps import AuthDependencies, client_ip, route_template, secret_json
+from edge.auth.models import AuthError, Principal
+from edge.auth.routes import build_router as build_auth_router
+from edge.auth.service import AuthService, build_auth_service
+from edge.cloud_client import EMAIL_UNAVAILABLE, CloudClient, CloudRejected, CloudUnavailable
 from edge.config import EDGE_VERSION, Settings, Thresholds
 from edge.depth_bridge import DepthBridge
-from edge.enroll import enroll
+from edge.enroll import enroll, replay_offline_enrolments, replay_offline_enrolments_sync, user_lock
 from edge.errors import ApiError, install_error_handlers
 from edge.events import EventBus
+from edge.http_guards import BodyLimitMiddleware, OriginGuardMiddleware
 from edge.metrics import MetricsStore
 from edge.ml.templates import TemplateStore, TemplateStoreError
 from edge.perception import PerceptionEngine, decode_jpeg
@@ -78,7 +87,8 @@ def build_context(settings: Settings | None = None, engine: PerceptionEngine | N
     templates: TemplateStore | None = None
     model_id = engine.embedder.model_id if engine.embedder else "arcface_unavailable"
     try:
-        templates = TemplateStore(settings.data_dir / "templates.fernet", settings.edge_data_key, model_id)
+        templates = TemplateStore(settings.data_dir / "templates.fernet", settings.edge_data_key, model_id,
+                                  clock_rollback_tolerance_s=float(th.get("cache.clock_rollback_tolerance_s", 0.0)))
         templates.load()
     except TemplateStoreError as exc:
         log.error("template cache unavailable: %s", exc)
@@ -123,6 +133,7 @@ def create_lan_app(ctx: EdgeContext) -> FastAPI:
                   openapi_url=None)
     lan.state.ctx = ctx
     _add_latency_middleware(lan)
+    lan.add_middleware(BodyLimitMiddleware)
     install_error_handlers(lan)
     lan.include_router(depth_router)
     return lan
@@ -179,14 +190,65 @@ def tighten_data_dir(data_dir) -> list[str]:
     return fixed
 
 
-def create_app(context_factory=build_context) -> FastAPI:
+DEMO_MODE_WARNING = ("DEMO_MODE=1: demo clock, random-challenge control and /docs are enabled and /v1/health reports "
+                     "degraded 'demo_mode'. Never run a production kiosk with DEMO_MODE=1.")
+
+
+def register_offline_enrolment_replay(ctx: EdgeContext, loop: asyncio.AbstractEventLoop) -> str | None:
+    """SC2-D4 + probe offline-e2e F2: replay the queued offline-enrolment records BEFORE each sync's decision batch
+    (runtime.add_pre_sync_hook, synchronous on the sync thread), so the cloud can flag that user's offline ALLOWs.
+    Older runtimes: after each successful sync (add_sync_hook, scheduled on the event loop). Returns the hook used."""
+    pre = getattr(ctx.runtime, "add_pre_sync_hook", None)
+    if callable(pre):
+        pre(lambda: replay_offline_enrolments_sync(ctx))
+        return "pre_sync"
+    add = getattr(ctx.runtime, "add_sync_hook", None)
+    if not callable(add):
+        return None
+    busy: dict[str, Any] = {"future": None}
+
+    def hook() -> None:
+        fut = busy["future"]
+        if fut is not None and not fut.done():
+            return
+        busy["future"] = asyncio.run_coroutine_threadsafe(replay_offline_enrolments(ctx), loop)
+
+    add(hook)
+    return "post_sync"
+
+
+def _add_guards(app: FastAPI, settings: Settings) -> None:
+    """F3 / F5 / RBAC v2 D, outermost first: CORS (EA-4: also on the guards' 400 / 403 / 413, so the kiosk sees the
+    real error instead of an opaque network failure) -> Host allow-list (DNS rebinding) -> body caps before any
+    parsing -> foreign-Origin 403 on state-changing requests -> latency header. add_middleware wraps outside, so
+    the calls run innermost first."""
+    _add_latency_middleware(app)
+    app.add_middleware(OriginGuardMiddleware, allowed_origins=settings.cors_origins)
+    app.add_middleware(BodyLimitMiddleware)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(settings.allowed_hosts))
+    app.add_middleware(
+        CORSMiddleware, allow_origins=list(settings.cors_origins), allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=cors_allow_headers(), expose_headers=["X-Latency-Ms", "Retry-After"],
+    )
+
+
+def create_app(context_factory=build_context, settings: Settings | None = None) -> FastAPI:
+    base = settings or Settings.from_env()  # CORS / hosts / docs are fixed when the app object is built
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         ctx: EdgeContext = await asyncio.to_thread(context_factory)
         app.state.ctx = ctx
         tighten_data_dir(ctx.settings.data_dir)
+        if ctx.auth is None:
+            ctx.auth = await asyncio.to_thread(build_auth_service, ctx.settings.data_dir, auth_env(ctx.settings))
+        if ctx.settings.demo_mode:
+            log.warning(DEMO_MODE_WARNING)
         await ctx.cloud.start()
         svc.register_erase_hook(ctx)  # before start(): the first tick's ERASED revocations delete templates too
+        svc.register_reconcile_hook(ctx)
+        register_offline_enrolment_replay(ctx, asyncio.get_running_loop())
         svc._safe_call(ctx.runtime, "start")
         svc.report_template_cache(ctx)
         lan_task = start_lan_listener(ctx)
@@ -203,19 +265,42 @@ def create_app(context_factory=build_context) -> FastAPI:
                     await asyncio.wait_for(lan_task, timeout=3)
             svc._safe_call(ctx.runtime, "stop")
             await ctx.cloud.stop()
+            svc._safe_call(ctx.auth, "close")
             ctx.pool.shutdown(wait=False, cancel_futures=True)
 
-    app = FastAPI(title="HID kiosk edge", version=EDGE_VERSION, lifespan=lifespan)
-    app.add_middleware(
-        CORSMiddleware, allow_origins=list(Settings.from_env().cors_origins), allow_credentials=False,
-        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type", "X-Admin-Token"], expose_headers=["X-Latency-Ms"],
-    )
-    _add_latency_middleware(app)
+    docs = base.demo_mode  # F3: no /docs, /redoc, /openapi.json on a production kiosk
+    app = FastAPI(title="HID kiosk edge", version=EDGE_VERSION, lifespan=lifespan,
+                  docs_url="/docs" if docs else None, redoc_url="/redoc" if docs else None,
+                  openapi_url="/openapi.json" if docs else None)
+    _add_guards(app, base)
     install_error_handlers(app)
+    app.include_router(build_auth_router(get_auth))  # /v1/auth/*, /v1/admin/staff*, api-keys, auth audit
     app.include_router(router)
     app.include_router(depth_router)
     return app
+
+
+def legacy_token_enabled() -> bool:
+    """AUTH_LEGACY_ADMIN_TOKEN parsed exactly like edge/auth/config.py does (one parser): X-Admin-Token is a CORS
+    header only while the legacy principal can actually be used. An invalid value -> False here (the auth
+    service refuses to start on it anyway)."""
+    try:
+        return auth_legacy_flag(os.environ)
+    except ValueError:
+        return False
+
+
+def auth_env(settings: Settings) -> dict[str, str]:
+    """build_auth_service input: the process env (AUTH_*, STAFF_STORE_KEY) with the edge's own resolved secrets
+    and DEMO_MODE (settings win, so a scratch context's values are the ones in force)."""
+    return {**os.environ, "EDGE_DATA_KEY": settings.edge_data_key, "ADMIN_TOKEN": settings.admin_token,
+            "DEMO_MODE": "1" if settings.demo_mode else "0"}
+
+
+def cors_allow_headers() -> list[str]:
+    """RBAC v2 D: Authorization (Bearer sessions / API keys) + X-FG-Activity; X-Admin-Token only while the legacy
+    flag is on."""
+    return ["Content-Type", "Authorization", "X-FG-Activity", *(["X-Admin-Token"] if legacy_token_enabled() else [])]
 
 
 # ---------------------------------------------------------------------------------- dependencies
@@ -226,19 +311,86 @@ def get_ctx(request: Request) -> EdgeContext:
 Ctx = Annotated[EdgeContext, Depends(get_ctx)]
 
 
-def require_admin(ctx: Ctx, x_admin_token: Annotated[str | None, Header()] = None) -> None:
-    if not secret_equal(ctx.settings.admin_token, x_admin_token):  # non-ASCII header -> 401, not 500
-        raise ApiError("UNAUTHORIZED", "admin token required")
-
-
 def require_depth_device(ctx: Ctx, x_depth_token: Annotated[str | None, Header()] = None) -> None:
     if not secret_equal(ctx.settings.depth_device_token, x_depth_token):
         ctx.depth.note_rejected_token()  # /v1/health depth_probe -> "rejected_token" (never the token itself)
         raise ApiError("UNAUTHORIZED", "depth device token required")
 
 
-Admin = Annotated[None, Depends(require_admin)]
 DepthDevice = Annotated[None, Depends(require_depth_device)]
+
+
+def get_auth(request: Request) -> AuthService | None:
+    """AuthService of the running edge (None -> every authenticated route answers 503 AUTH_UNAVAILABLE)."""
+    ctx = getattr(request.app.state, "ctx", None)
+    return getattr(ctx, "auth", None)
+
+
+# RBAC v2 D: every privileged route's dependency comes from rbac.ROUTE_PERMISSIONS (one table, checked by
+# edge/tests/test_rbac_wiring.py against app.routes). Module-level aliases: `from __future__ import annotations`
+# makes FastAPI resolve them by name.
+deps = AuthDependencies(get_auth)
+
+
+def _route(method: str, path: str) -> Any:
+    return Annotated[Principal, Depends(deps.for_route(method, f"/v1{path}"))]
+
+
+def _demo_route(method: str, path: str) -> Any:
+    """DEMO_MODE=1 controls: 403 NOT_DEMO_MODE (contract) before the permission check, else the mapped permission
+    (demo:clock / challenge:control are removed from every principal when DEMO_MODE=0)."""
+    needed = rbac.ROUTE_PERMISSIONS[(method, f"/v1{path}")]
+
+    def dependency(request: Request) -> Principal:
+        principal = deps.resolve(request)
+        if not request.app.state.ctx.settings.demo_mode:
+            raise ApiError("FORBIDDEN", f"{path.rsplit('/', 1)[-1]} requires DEMO_MODE=1",
+                           extra={"reason": "NOT_DEMO_MODE"})
+        if not rbac.has_permissions(principal.permissions, needed):
+            deps.service(request).audit_denied(principal, path=route_template(request), required=list(needed),
+                                               reason="MISSING_PERMISSION", client_ip=client_ip(request))
+            raise AuthError("FORBIDDEN", "missing permission", reason="MISSING_PERMISSION",
+                            extra={"required": list(needed)})
+        return principal
+
+    return Annotated[Principal, Depends(dependency)]
+
+
+EventsRead = _route("GET", "/events")
+MetricsRead = _route("GET", "/metrics")
+ModeSwitch = _route("POST", "/admin/mode")
+ModeDetailRead = _route("GET", "/admin/mode/detail")
+StoreRead = _route("GET", "/admin/store")
+SyncRun = _route("POST", "/admin/sync")
+EvalSet = _route("POST", "/admin/eval/context")
+EvalClear = _route("DELETE", "/admin/eval/context")
+RateLimitReset = _route("POST", "/admin/rate-limit/reset")
+DemoClock = _demo_route("POST", "/admin/clock")
+ChallengeControl = _demo_route("POST", "/admin/random-challenge")
+AttemptSignals = _route("GET", "/admin/attempt/{attempt_id}/signals")
+EnrolRead = _route("GET", "/admin/users")
+AccessRead = _route("GET", "/admin/access/users")
+AccessEdit = _route("PUT", "/admin/access/users/{user_id}")
+AccessRevoke = _route("POST", "/admin/access/users/{user_id}/revoke")
+CodesRotate = _route("POST", "/admin/access/codes/rotate")
+BundleRefresh = _route("POST", "/admin/bundle/refresh")
+AlertsRead = _route("GET", "/admin/alerts")
+SyncDetailRead = _route("GET", "/admin/sync/last")
+EnrolWrite = _route("POST", "/enroll")
+EnrolErase = _route("DELETE", "/enroll/{user_id}")
+
+
+def actor_of(request: Request) -> str:
+    """RBAC v2 D: the audit actor is ALWAYS derived from the authenticated principal (staff:<id> | key:<id> |
+    legacy:admin_token); any client-supplied `actor` field is accepted but ignored. No principal on the request
+    (a route wired without its auth dependency) -> 401, never a guessed actor (fail closed)."""
+    principal = getattr(request.state, "principal", None)
+    actor = getattr(principal, "actor_id", None)
+    if not actor:
+        raise ApiError("UNAUTHORIZED", "authentication required", extra={"reason": "CREDENTIAL_INVALID"})
+    return str(actor)
+
+
 router = APIRouter(prefix="/v1")
 depth_router = APIRouter(prefix="/v1")
 
@@ -381,8 +533,8 @@ def _kiosk_refusal(ctx: EdgeContext, kiosk_id: str) -> ApiError:
 # ---------------------------------------------------------------------------------- system
 def health_problems(ctx: EdgeContext) -> list[str]:
     """Why /v1/health is `degraded` (empty = ok): fail-secure policy runtime (every attempt DENY
-    SYSTEM_ERROR), a required model missing, the MiniFASNet self-test failed (PAD disabled), or no
-    template cache."""
+    SYSTEM_ERROR), a required model missing, the MiniFASNet self-test failed (PAD disabled), no template
+    cache, DEMO_MODE=1, a group/world-readable .env, or an auth problem (RBAC v2 A)."""
     h = ctx.engine.health
     out = []
     if ctx.runtime_kind == "fail_secure":
@@ -393,7 +545,31 @@ def health_problems(ctx: EdgeContext) -> list[str]:
         out.append("pad_self_test_failed" if h.pad_self_test else "pad_self_test_not_run")
     if ctx.templates is None:
         out.append("template_cache_unavailable")
+    if ctx.settings.demo_mode:
+        out.append("demo_mode")  # F7: never silently on
+    if env_file_permissive(ctx.settings.project_root):
+        out.append("env_file_permissive")
+    out += auth_problems(ctx)
     return out
+
+
+def auth_problems(ctx: EdgeContext) -> list[str]:
+    """RBAC v2 A: legacy_admin_token | auth_unavailable | auth_bruteforce (no auth service -> auth_unavailable)."""
+    if ctx.auth is None:
+        return ["auth_unavailable"]
+    try:
+        return [str(r) for r in ctx.auth.degraded_reasons()]
+    except Exception:
+        log.exception("auth.degraded_reasons failed")
+        return ["auth_unavailable"]
+
+
+def env_file_permissive(project_root) -> bool:
+    """RBAC v2 A: the project .env holds every edge secret; group/other access (mode & 0o077) is degraded."""
+    try:
+        return bool((project_root / ".env").stat().st_mode & 0o077)
+    except OSError:
+        return False
 
 
 @router.get("/health")
@@ -452,8 +628,9 @@ def _demo_clock_view(dc: Any) -> dict[str, Any] | None:
     return out
 
 
-@router.get("/mode")
-async def mode(ctx: Ctx) -> dict[str, Any]:
+def mode_detail(ctx: EdgeContext) -> dict[str, Any]:
+    """The full runtime status (GET /v1/admin/mode/detail, store:read): bundle, rate limit, policy bars, last sync,
+    cloud match, random challenge, zone, demo clock (API 3.10 shape)."""
     status = dict(svc._safe_call(ctx.runtime, "mode_status") or {"mode": svc._safe_call(ctx.runtime, "mode")})
     dc = status.get("demo_clock")  # v1.4 (R-E): present whenever DEMO_MODE=1 (with `active`), else null
     status["demo_clock"] = _demo_clock_view(dc) if ctx.settings.demo_mode and isinstance(dc, dict) else None
@@ -465,14 +642,76 @@ async def mode(ctx: Ctx) -> dict[str, Any]:
     return status
 
 
+PUBLIC_MODE_KEYS = ("mode", "state", "reason", "forced", "forced_until", "kiosk_id", "sync_queue_depth")
+
+
+def public_mode(detail: dict[str, Any]) -> dict[str, Any]:
+    """offline-verification F6: the public kiosk badge subset of the mode status (polled every 2 s without a
+    credential). Nothing that identifies users, sync reports, thresholds or lockout state."""
+    out = {k: detail.get(k) for k in PUBLIC_MODE_KEYS}
+    out["demo_clock"] = detail.get("demo_clock")  # DemoClock contract shape (DEMO_MODE=1 only; times, no users)
+    tc = detail.get("template_cache")
+    out["template_cache"] = {"count": tc.get("count")} if isinstance(tc, dict) else None
+    bundle = detail.get("schedule_bundle")
+    out["cache_state"] = bundle.get("cache_state") if isinstance(bundle, dict) else None
+    cm = detail.get("cloud_match")  # badge "ONLINE, cloud slow: deciding locally" (P7); a boolean only
+    out["cloud_match"] = {"degraded": bool(cm.get("degraded"))} if isinstance(cm, dict) else None
+    return out
+
+
+@router.get("/mode")
+async def mode(ctx: Ctx) -> dict[str, Any]:
+    return public_mode(mode_detail(ctx))
+
+
+@router.get("/admin/mode/detail")
+async def admin_mode_detail(ctx: Ctx, _: ModeDetailRead) -> dict[str, Any]:
+    return mode_detail(ctx)
+
+
+ALERTS_MAX = 200
+
+
+@router.get("/admin/alerts")
+async def admin_alerts(ctx: Ctx, _: AlertsRead, limit: Annotated[int, Query(ge=1, le=ALERTS_MAX)] = 50) -> dict[str, Any]:
+    """Policy alerts and security events (runtime.recent_alerts, newest last)."""
+    fn = getattr(ctx.runtime, "recent_alerts", None)
+    items = await svc._run(ctx, lambda: fn(limit=limit)) if callable(fn) else []
+    return {"items": list(items or []), "count": len(items or [])}
+
+
+@router.get("/admin/sync/last")
+async def admin_sync_last(ctx: Ctx, _: SyncDetailRead) -> dict[str, Any]:
+    """Full last-sync report incl. server flags (runtime.sync_detail); the public mode carries counts only."""
+    fn = getattr(ctx.runtime, "sync_detail", None)
+    if callable(fn):
+        return dict(await svc._run(ctx, fn) or {})
+    ms = svc._safe_call(ctx.runtime, "mode_status") or {}
+    return {"last_sync": ms.get("last_sync"), "server_flags": ms.get("server_flags") or []}
+
+
+SSE_BUSY_RETRY_S = 30
+
+
 @router.get("/events")
-async def events(request: Request, ctx: Ctx) -> StreamingResponse:
-    return StreamingResponse(ctx.events.stream(request.is_disconnected), media_type="text/event-stream",
+async def events(request: Request, ctx: Ctx, principal: EventsRead) -> StreamingResponse:
+    if not ctx.events.has_capacity():  # F5: bounded number of live streams
+        raise ApiError("RATE_LIMITED", "too many live event streams", extra={"retry_after_s": SSE_BUSY_RETRY_S},
+                       headers={"Retry-After": str(SSE_BUSY_RETRY_S)})
+    auth = ctx.auth
+
+    def authorized() -> bool:  # re-checked before every event and at every heartbeat (never extends idle)
+        try:
+            return auth is not None and bool(auth.is_authorized(principal, "events:read"))
+        except Exception:  # noqa: BLE001 - cannot tell: close the stream (fail-secure)
+            return False
+
+    return StreamingResponse(ctx.events.stream(request.is_disconnected, authorized), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @router.get("/metrics")
-async def metrics(ctx: Ctx, since: str | None = None, label: str | None = None) -> dict[str, Any]:
+async def metrics(ctx: Ctx, _: MetricsRead, since: str | None = None, label: str | None = None) -> dict[str, Any]:
     since_dt = None
     if since:
         try:
@@ -482,10 +721,10 @@ async def metrics(ctx: Ctx, since: str | None = None, label: str | None = None) 
         if since_dt.tzinfo is None:
             since_dt = since_dt.replace(tzinfo=UTC)
     ms = svc._safe_call(ctx.runtime, "mode_status") or {}
-    last = ms.get("last_sync")  # PolicyRuntime: {"at": ..., "report": ...} (same value as GET /v1/mode)
+    last = ms.get("last_sync")  # PolicyRuntime: {"at": ..., "report": ...} (same value as /v1/admin/mode/detail)
     sync = {"queue_depth": ms.get("sync_queue_depth"),
             "last_sync_at": last.get("at") if isinstance(last, dict) else ms.get("last_sync_at")}
-    return ctx.metrics.summary(since_dt, label, sync)
+    return await asyncio.to_thread(ctx.metrics.summary, since_dt, label, sync)  # F6: never on the event loop
 
 
 # ---------------------------------------------------------------------------------- attempts
@@ -646,6 +885,8 @@ async def attempt_otp_send(attempt_id: str, ctx: Ctx) -> dict[str, Any]:
     try:
         return await ctx.cloud.otp_send(attempt_id, att.candidate_user_id)
     except CloudUnavailable as exc:
+        if exc.reason == EMAIL_UNAVAILABLE:  # mailer down, cloud healthy (offline-verification F7): R11, no miss
+            raise await _email_unavailable(ctx, att) from exc
         if exc.connectivity_miss:  # transport error / 5xx only: a 401 is a key problem, not an outage
             svc._safe_call(ctx.runtime, "record_cloud_result", False)
         raise ApiError("CLOUD_UNAVAILABLE", str(exc), attempt_id) from exc
@@ -653,25 +894,35 @@ async def attempt_otp_send(attempt_id: str, ctx: Ctx) -> dict[str, Any]:
         raise await _otp_send_rejected(ctx, att, exc) from exc
 
 
+async def _drop_email_otp(ctx: EdgeContext, att) -> list[str] | None:
+    """R11: re-issue the same STEP_UP without EMAIL_OTP (nothing counted). Returns the methods left."""
+    try:
+        resp = await svc.drop_method(ctx, att, "EMAIL_OTP")
+        svc.finish(ctx, att, dict(resp), kind="fallback")
+        return (resp.get("next_action") or {}).get("methods")
+    except ApiError:  # EMAIL_OTP was the only method left: the step stays open unchanged
+        return ((att.last_response or {}).get("next_action") or {}).get("methods")
+
+
+async def _email_unavailable(ctx: EdgeContext, att) -> ApiError:
+    methods = await _drop_email_otp(ctx, att)
+    return ApiError("CLOUD_UNAVAILABLE", "e-mail codes are unavailable right now: use TOTP, card or a staff code",
+                    att.attempt_id, extra={"reason": EMAIL_UNAVAILABLE, "methods": methods})
+
+
 async def _otp_send_rejected(ctx: EdgeContext, att, exc: CloudRejected) -> ApiError:
     """404 = no e-mail on file: drop EMAIL_OTP from this step (R11 path, nothing counted; the re-issued STEP_UP
     is GET /v1/attempt/{id} and `methods` below). 429 = resend throttle. Anything else = 422."""
     aid = att.attempt_id
     if exc.status == 404:
-        methods = None
-        try:
-            resp = await svc.drop_method(ctx, att, "EMAIL_OTP")
-            svc.finish(ctx, att, dict(resp), kind="fallback")
-            methods = (resp.get("next_action") or {}).get("methods")
-        except ApiError:  # EMAIL_OTP was the only method left: the step stays open unchanged
-            methods = ((att.last_response or {}).get("next_action") or {}).get("methods")
+        methods = await _drop_email_otp(ctx, att)
         return ApiError("NOT_FOUND", "no e-mail on file for this user: use TOTP, card or a staff code", aid,
                         extra={"reason": "NO_EMAIL_ON_FILE", "methods": methods})
     if exc.status == 429:
         retry = exc.retry_after_s
         return ApiError("RATE_LIMITED", "an e-mail code was sent recently; wait before asking again"
                         + (f" ({retry} s)" if retry is not None else ""), aid,
-                        extra={"retry_after_s": retry},
+                        extra={"retry_after_s": retry, **({"reason": exc.reason} if exc.reason else {})},
                         headers={"Retry-After": str(retry)} if retry is not None else None)
     return ApiError("VALIDATION_ERROR", f"cloud refused the e-mail code request: {exc.message}", aid,
                     extra={"cloud_status": exc.status, "cloud_code": exc.code})
@@ -692,21 +943,24 @@ async def attempt_get(attempt_id: str, ctx: Ctx) -> dict[str, Any]:
 
 # ---------------------------------------------------------------------------------- admin
 @router.post("/admin/mode")
-async def admin_mode(body: AdminModeRequest, ctx: Ctx, _: Admin) -> dict[str, Any]:
+async def admin_mode(body: AdminModeRequest, request: Request, ctx: Ctx, _: ModeSwitch) -> dict[str, Any]:
+    """{force, reason?, max_minutes? (1..240)}: a forced OFFLINE auto-reverts to AUTO at expiry (policy runtime)."""
     fn = getattr(ctx.runtime, "set_forced_mode", None)
     if not callable(fn):
         raise ApiError("INVALID_STATE", f"policy runtime ({ctx.runtime_kind}) cannot force a mode")
-    await _call_runtime(ctx, fn, body.force)
-    return await mode(ctx)
+    await _call_runtime(ctx, fn, body.force, reason=body.reason, max_minutes=body.max_minutes)
+    log.info("mode forced=%s reason=%s max_minutes=%s actor=%s", body.force, body.reason, body.max_minutes,
+             actor_of(request))
+    return mode_detail(ctx)
 
 
 @router.get("/admin/store")
-async def admin_store(ctx: Ctx, _: Admin) -> dict[str, Any]:
+async def admin_store(ctx: Ctx, _: StoreRead) -> dict[str, Any]:
     return await svc._run(ctx, lambda: svc._safe_call(ctx.runtime, "store_view") or {})
 
 
 @router.post("/admin/sync")
-async def admin_sync(ctx: Ctx, _: Admin) -> dict[str, Any]:
+async def admin_sync(ctx: Ctx, _: SyncRun) -> dict[str, Any]:
     fn = getattr(ctx.runtime, "sync_now", None)
     if not callable(fn) or not ctx.settings.cloud_enabled:
         raise ApiError("CLOUD_UNAVAILABLE", "cloud not configured / unreachable (offline)")
@@ -724,29 +978,27 @@ async def admin_sync(ctx: Ctx, _: Admin) -> dict[str, Any]:
 
 
 @router.post("/admin/eval/context")
-async def admin_eval_context_set(body: EvalContext, ctx: Ctx, _: Admin) -> dict[str, Any]:
+async def admin_eval_context_set(body: EvalContext, ctx: Ctx, _: EvalSet) -> dict[str, Any]:
     ctx.eval_context = body.model_dump()
     ctx.eval_context_since = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
     return {"active": True, "context": ctx.eval_context, "since": ctx.eval_context_since}
 
 
 @router.delete("/admin/eval/context", status_code=204)
-async def admin_eval_context_clear(ctx: Ctx, _: Admin) -> Response:
+async def admin_eval_context_clear(ctx: Ctx, _: EvalClear) -> Response:
     ctx.eval_context = None
     ctx.eval_context_since = None
     return Response(status_code=204)
 
 
 @router.post("/admin/rate-limit/reset", status_code=204)
-async def admin_rate_limit_reset(ctx: Ctx, _: Admin) -> Response:
+async def admin_rate_limit_reset(ctx: Ctx, _: RateLimitReset) -> Response:
     svc._safe_call(ctx.runtime, "reset_rate_limit")
     return Response(status_code=204)
 
 
 @router.post("/admin/clock")
-async def admin_clock(body: ClockRequest, ctx: Ctx, _: Admin) -> dict[str, Any]:
-    if not ctx.settings.demo_mode:
-        raise ApiError("FORBIDDEN", "demo clock requires DEMO_MODE=1", extra={"reason": "NOT_DEMO_MODE"})
+async def admin_clock(body: ClockRequest, ctx: Ctx, _: DemoClock) -> dict[str, Any]:
     if sum([body.set_local is not None, body.offset_s is not None, bool(body.reset)]) != 1:
         raise ApiError("VALIDATION_ERROR", "send exactly one of set_local | offset_s | reset")
     fn = getattr(ctx.runtime, "set_demo_clock", None)
@@ -757,10 +1009,9 @@ async def admin_clock(body: ClockRequest, ctx: Ctx, _: Admin) -> dict[str, Any]:
 
 
 @router.post("/admin/random-challenge")
-async def admin_random_challenge(body: RandomChallengeRequest, ctx: Ctx, _: Admin) -> dict[str, Any]:
-    """Demo control for the random liveness challenge (mask contingency). DEMO_MODE=1 only."""
-    if not ctx.settings.demo_mode:
-        raise ApiError("FORBIDDEN", "random-challenge control requires DEMO_MODE=1")
+async def admin_random_challenge(body: RandomChallengeRequest, ctx: Ctx, _: ChallengeControl) -> dict[str, Any]:
+    """Demo control for the random liveness challenge (mask contingency). DEMO_MODE=1 only (the ChallengeControl
+    dependency answers 403 NOT_DEMO_MODE before this runs)."""
     fn = getattr(ctx.runtime, "set_random_challenge", None)
     if not callable(fn):
         raise ApiError("INVALID_STATE", f"policy runtime ({ctx.runtime_kind}) has no random challenge")
@@ -769,13 +1020,13 @@ async def admin_random_challenge(body: RandomChallengeRequest, ctx: Ctx, _: Admi
 
 
 @router.get("/admin/attempt/{attempt_id}/signals")
-async def admin_attempt_signals(attempt_id: str, ctx: Ctx, _: Admin) -> dict[str, Any]:
+async def admin_attempt_signals(attempt_id: str, ctx: Ctx, _: AttemptSignals) -> dict[str, Any]:
     att = _attempt(ctx, attempt_id)
     return {"attempt_id": attempt_id, "eval": att.eval_tags, **(att.signals_debug or {})}
 
 
 @router.get("/admin/users")
-async def admin_users(ctx: Ctx, _: Admin) -> dict[str, Any]:
+async def admin_users(ctx: Ctx, _: EnrolRead) -> dict[str, Any]:
     """Locally enrolled users. `role` / `display_name` are the VERIFIED BUNDLE's (what every decision uses);
     the label stored with the template is `template_role` / `template_display_name`. `in_schedule` false =
     the user is not in the bundle (DENY NOT_ENROLLED / NO_ENTITLEMENT until added)."""
@@ -803,116 +1054,199 @@ UserIdPath = Annotated[str, Path(pattern=access.USER_ID)]
 
 
 @router.get("/admin/access/users")
-async def admin_access_users(ctx: Ctx, _: Admin) -> dict[str, Any]:
+async def admin_access_users(ctx: Ctx, _: AccessRead) -> dict[str, Any]:
     """API 3.18.1: cloud master (ONLINE) merged with the verified bundle + feed and the local enrolment.
     OFFLINE / cloud error -> bundle-only, read_only (read_only_code says why). Only 401 is an error."""
     return await access.list_view(ctx)
 
 
 @router.put("/admin/access/users/{user_id}")
-async def admin_access_put(user_id: UserIdPath, body: access.AccessUpdate, ctx: Ctx, _: Admin) -> dict[str, Any]:
+async def admin_access_put(user_id: UserIdPath, body: access.AccessUpdate, request: Request, ctx: Ctx,
+                           _: AccessEdit) -> dict[str, Any]:
     """API 3.18.2: create / update / re-admit (R-B) / restore (R-C) a schedule entry in the cloud master, then
     pull + install the re-signed bundle and the feed in the same call. Needs ONLINE (503 otherwise)."""
-    return await access.put_access(ctx, user_id, body)
+    return await access.put_access(ctx, user_id, body, actor_of(request))
 
 
 @router.post("/admin/access/users/{user_id}/revoke")
-async def admin_access_revoke(user_id: UserIdPath, ctx: Ctx, _: Admin,
+async def admin_access_revoke(user_id: UserIdPath, request: Request, ctx: Ctx, _: AccessRevoke,
                               body: access.RevokeRequest | None = None) -> dict[str, Any]:
     """API 3.18.3 (R-C): cloud USER revocation (SCHEDULE_REVOKED online and offline), then bundle + feed pull."""
-    return await access.revoke(ctx, user_id, body or access.RevokeRequest())
+    return await access.revoke(ctx, user_id, body or access.RevokeRequest(), actor_of(request))
 
 
 @router.post("/admin/access/codes/rotate")
-async def admin_codes_rotate(body: access.CodesRotateRequest, ctx: Ctx, _: Admin) -> Response:
+async def admin_codes_rotate(body: access.CodesRotateRequest, request: Request, ctx: Ctx,
+                             principal: CodesRotate) -> Response:
     """API 3.18.4 (R-D): fresh one-time staff override codes, returned FLAT and ONCE: never logged, never stored
-    on the edge, Cache-Control: no-store. Always 200 once the cloud minted them."""
-    payload = await access.rotate_codes(ctx, body)
-    return Response(json.dumps(payload), media_type="application/json",
-                    headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+    on the edge, Cache-Control: no-store. Always 200 once the cloud minted them. RBAC v2 D identity rules."""
+    check_codes_rotate(principal, body)
+    payload = await access.rotate_codes(ctx, body, actor_of(request))
+    return secret_json(payload)
+
+
+OWN_CODES_MAX = 4  # codes:rotate (own staff_id) may mint at most this many per call
+
+
+def check_codes_rotate(principal: Principal, body: access.CodesRotateRequest) -> None:
+    """Session principals only (an API key / the legacy token is no staff identity); codes:rotate = own staff_id
+    and count <= OWN_CODES_MAX; codes:rotate_any = any STAFF_ID (the model's own limits)."""
+    if principal.kind != "staff" or not principal.staff_id:
+        raise AuthError("FORBIDDEN", "staff override codes are minted for a signed-in staff member only",
+                        reason="NO_STAFF_IDENTITY")
+    if "codes:rotate_any" in principal.permissions:
+        return
+    if body.staff_id != principal.staff_id:
+        raise AuthError("FORBIDDEN", "you may rotate only your own staff override codes", reason="STAFF_ID_NOT_OWN")
+    if body.count > OWN_CODES_MAX:
+        raise ApiError("VALIDATION_ERROR", f"count must be <= {OWN_CODES_MAX} for your own codes")
 
 
 @router.post("/admin/bundle/refresh")
-async def admin_bundle_refresh(ctx: Ctx, _: Admin) -> dict[str, Any]:
+async def admin_bundle_refresh(ctx: Ctx, _: BundleRefresh) -> dict[str, Any]:
     """API 3.18.5: pull + verify + install the newest cloud bundle now (body {} or none)."""
     return await access.refresh_route(ctx)
 
 
 @router.post("/enroll", status_code=201, response_model=EnrollResponse)
-async def enroll_user(request: Request, ctx: Ctx, _: Admin) -> EnrollResponse:
+async def enroll_user(request: Request, response: Response, ctx: Ctx, _: EnrolWrite) -> EnrollResponse:
     form = await _form(request)
     meta: EnrollMeta = _meta(form, EnrollMeta)
     jpegs = await _files(form, "frame_", int(ctx.thresholds.get("quality.frames_per_attempt")), MAX_FRAME_BYTES)
     if not jpegs:
         raise ApiError("VALIDATION_ERROR", "no frame_* parts")
-    return await enroll(ctx, meta, jpegs)
+    out = await enroll(ctx, meta, jpegs, actor_of(request))
+    if out.totp_provisioning_uri:  # secret-bearing: never cached (RBAC v2 C secret_json rule)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+    return out
 
 
 ERASE_QUEUED_MSG = ("local data erased; the cloud erasure (Rekognition faces + cloud record) is queued and retried at "
                     "the next sync")
 
 
-async def _queue_cloud_erasure(ctx: EdgeContext, user_id: str) -> bool:
-    """R-J: persist the pending cloud erasure in edge/offline (PolicyRuntime.queue_cloud_erasure, replayed at
-    every sync until the cloud answers 200/204/404). False when the runtime cannot queue it."""
+TEMPLATES_UNAVAILABLE_MSG = ("the template cache is unavailable, so local face templates could not be checked; they "
+                             "are deleted when the cloud's ERASE event reaches this edge with the cache loaded")
+
+
+async def _queue_cloud_erasure(ctx: EdgeContext, user_id: str, actor: str) -> bool:
+    """R-J: persist the pending cloud erasure (with the actor, RBAC v2 D) in edge/offline
+    (PolicyRuntime.queue_cloud_erasure, replayed at every sync). False when the runtime cannot queue it."""
     fn = getattr(ctx.runtime, "queue_cloud_erasure", None) or getattr(ctx.runtime, "enqueue_cloud_erasure", None)
     if not callable(fn):
         return False
     try:
-        await svc._run(ctx, fn, user_id)
+        await svc._run(ctx, lambda: fn(user_id, actor=actor))
     except Exception as exc:  # noqa: BLE001 - reported honestly as not queued
         log.error("queueing the cloud erasure failed: %s", type(exc).__name__)
         return False
     return True
 
 
+CLOUD_NOT_ENROLLED = "NOT_ENROLLED"
+
+
+def cloud_erasure_done(res: dict[str, Any]) -> bool:
+    """EAE-12: 200/204, or a 404 that SAYS the cloud holds nothing (error.code NOT_FOUND + reason NOT_ENROLLED,
+    cloud-app's erase contract). Any other 404 (route not deployed, another reason) is a failure: queue + retry."""
+    status = res.get("status")
+    if status in (200, 204):
+        return True
+    err = (res.get("body") or {}).get("error") if isinstance(res.get("body"), dict) else None
+    return status == 404 and isinstance(err, dict) and err.get("code") == "NOT_FOUND" \
+        and err.get("reason") == CLOUD_NOT_ENROLLED
+
+
+async def _erase_local(ctx: EdgeContext, user_id: str) -> bool | None:
+    """Local template delete. None = the cache is unavailable (skipped, F11). A failed write raises 503 before
+    anything else changes (EM-02: memory and disk unchanged, the user is still enrolled)."""
+    if ctx.templates is None:
+        return None
+    try:
+        removed = await svc._run(ctx, ctx.templates.delete, user_id)
+    except TemplateStoreError as exc:
+        raise ApiError("MODELS_UNAVAILABLE", f"local erasure NOT applied (template store write failed: {exc}); "
+                                             "nothing was changed, retry", extra={"reason": "LOCAL_ERASE_FAILED"}) from exc
+    svc.report_template_cache(ctx)
+    return bool(removed)
+
+
+async def _erase_cloud_now(ctx: EdgeContext, user_id: str, actor: str, out: dict[str, Any]) -> str | None:
+    """Try the cloud erasure now (ONLINE only). Returns None when done (out updated), else the error text."""
+    forced = bool(getattr(getattr(ctx.runtime, "monitor", None), "forced", False))
+    if forced or access.edge_mode(ctx) != "ONLINE":
+        return "kiosk OFFLINE"
+    try:
+        res = await ctx.cloud.delete_user(user_id, actor=actor)
+    except CloudUnavailable as exc:
+        if exc.connectivity_miss:
+            svc._safe_call(ctx.runtime, "record_cloud_result", False)
+        return str(exc)
+    out["cloud_status"] = res.get("status")
+    if cloud_erasure_done(res):
+        out["cloud"] = "deleted"
+        body = res.get("body")
+        want = body.get("bundle_version") if isinstance(body, dict) else None
+        out["bundle"] = await access.refresh_bundle(ctx, want if isinstance(want, int) else None)
+        return None
+    if isinstance(res.get("status"), int) and res["status"] >= 500:
+        svc._safe_call(ctx.runtime, "record_cloud_result", False)
+    return f"cloud HTTP {res.get('status')}"
+
+
 @router.delete("/enroll/{user_id}")
-async def enroll_delete(user_id: UserIdPath, ctx: Ctx, _: Admin) -> dict[str, Any]:
+async def enroll_delete(user_id: UserIdPath, request: Request, ctx: Ctx, _: EnrolErase) -> dict[str, Any]:
     """API 3.15 DPDP erasure: local template + TOTP secret now; the cloud erasure now when ONLINE, else (or when
     the cloud call fails) queued in edge/offline and replayed at sync (R-J). `cloud` is one of deleted | queued |
     not_configured | failed (M1: the local erasure queue could not be written, e.g. disk error; the local
-    template IS erased and the operator must retry while ONLINE)."""
-    if ctx.templates is None:
-        raise ApiError("INVALID_STATE", "template cache unavailable")
-    removed = await svc._run(ctx, ctx.templates.delete, user_id)
-    svc.report_template_cache(ctx)
+    template IS erased and the operator must retry while ONLINE). An unavailable template cache no longer blocks
+    the TOTP and cloud erasure (F11): local_removed is false and `message` says why."""
+    actor = actor_of(request)
+    async with user_lock(ctx, user_id):  # EA-1: never interleaved with an enrolment of the same user
+        return await erase_user(ctx, user_id, actor)
+
+
+async def erase_user(ctx: EdgeContext, user_id: str, actor: str) -> dict[str, Any]:
+    """The erasure itself (caller holds user_lock): local templates, TOTP secret, the queued offline-enrolment
+    record (EA-2: never replayed after an erasure), then the cloud erasure now or queued."""
+    removed = await _erase_local(ctx, user_id)
     creds = getattr(ctx.runtime, "credentials", None)  # TOTP secret lives in the runtime's encrypted store
     if creds is not None and callable(getattr(creds, "remove", None)):
         await svc._run(ctx, creds.remove, user_id)
-    if not removed and not ctx.cloud.enabled:
+    await _clear_pending_enrolment(ctx, user_id)
+    if removed is False and not ctx.cloud.enabled:
         raise ApiError("NOT_FOUND", f"user {user_id} not enrolled on this edge", extra={"reason": "NOT_ENROLLED"})
+    note = TEMPLATES_UNAVAILABLE_MSG if removed is None else None
     out: dict[str, Any] = {"user_id": user_id, "local_removed": bool(removed), "cloud": "not_configured",
-                           "cloud_status": None, "message": None, "bundle": None}
-    if not ctx.cloud.enabled:
-        return out
-    forced = bool(getattr(getattr(ctx.runtime, "monitor", None), "forced", False))
-    error = "kiosk OFFLINE"
-    if not forced and access.edge_mode(ctx) == "ONLINE":
-        try:
-            res = await ctx.cloud.delete_user(user_id)
-            out["cloud_status"] = res.get("status")
-            if res.get("status") in (200, 204, 404):  # 404 = nothing left in the cloud (idempotent)
-                out["cloud"] = "deleted"
-                body = res.get("body")
-                want = body.get("bundle_version") if isinstance(body, dict) else None
-                refreshed = await access.refresh_bundle(ctx, want if isinstance(want, int) else None)
-                out["bundle"] = refreshed  # the erasure re-signs the bundle: install it now
-                return out
-            error = f"cloud HTTP {res.get('status')}"
-            if isinstance(res.get("status"), int) and res["status"] >= 500:
-                svc._safe_call(ctx.runtime, "record_cloud_result", False)
-        except CloudUnavailable as exc:
-            error = str(exc)
-            if exc.connectivity_miss:
-                svc._safe_call(ctx.runtime, "record_cloud_result", False)
-    if await _queue_cloud_erasure(ctx, user_id):
-        out["cloud"], out["message"] = "queued", ERASE_QUEUED_MSG
-    else:  # no persisted queue in this runtime: say so honestly (DPDP), never claim "queued"
-        out["cloud"] = "failed"
-        out["message"] = (f"local data erased, but the CLOUD erasure did not happen ({error}) and could not be "
-                          f"queued: retry DELETE /v1/enroll/{user_id} while the kiosk is ONLINE")
-    log.info("erasure user=%s local_removed=%s cloud=%s", user_id, removed, out["cloud"])
+                           "cloud_status": None, "message": note, "bundle": None}
+    if ctx.cloud.enabled:
+        error = await _erase_cloud_now(ctx, user_id, actor, out)
+        if error is not None:
+            await _settle_queued_erasure(ctx, user_id, actor, error, out)
+    if note and out["message"] != note:
+        out["message"] = f"{out['message']} ({note})" if out["message"] else note
+    log.info("erasure user=%s local_removed=%s cloud=%s actor=%s", user_id, removed, out["cloud"], actor)
     return out
+
+
+async def _clear_pending_enrolment(ctx: EdgeContext, user_id: str) -> None:
+    fn = getattr(ctx.runtime, "clear_pending_enrolment", None)
+    if not callable(fn):
+        return
+    try:
+        await svc._run(ctx, fn, user_id)
+    except Exception as exc:  # noqa: BLE001 - the erasure goes on; the record holds no biometric data
+        log.error("clearing the queued offline-enrolment record failed: %s", type(exc).__name__)
+
+
+async def _settle_queued_erasure(ctx: EdgeContext, user_id: str, actor: str, error: str, out: dict[str, Any]) -> None:
+    if await _queue_cloud_erasure(ctx, user_id, actor):
+        out["cloud"], out["message"] = "queued", ERASE_QUEUED_MSG
+        return
+    out["cloud"] = "failed"  # no persisted queue in this runtime: say so honestly (DPDP), never claim "queued"
+    out["message"] = (f"local data erased, but the CLOUD erasure did not happen ({error}) and could not be "
+                      f"queued: retry DELETE /v1/enroll/{user_id} while the kiosk is ONLINE")
 
 
 # ---------------------------------------------------------------------------------- depth (DepthProbe)
@@ -962,7 +1296,9 @@ async def depth_frames(request: Request, ctx: Ctx, _: DepthDevice) -> dict[str, 
     except DepthProtocolError as exc:
         raise ApiError("VALIDATION_ERROR", str(exc), meta.attempt_id) from exc
     ctx.depth.mark_arrived(meta.attempt_id, meta.phase)
-    return {"accepted": True, "attempt_id": meta.attempt_id, "phase": meta.phase, "checks": sig.model_dump()}
+    log.info("depth upload accepted attempt=%s phase=%s available=%s", meta.attempt_id, meta.phase, sig.available)
+    # DE-02: the measured checks stay server-side (no tuning oracle for whoever holds the depth token)
+    return {"accepted": True, "attempt_id": meta.attempt_id, "phase": meta.phase}
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")

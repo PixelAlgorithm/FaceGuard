@@ -11,15 +11,25 @@ is DENY + SYSTEM_ERROR. Raises AttemptClosedError (-> 409 ATTEMPT_CLOSED) for an
 reached ALLOW/DENY, AttemptNotFoundError (-> 404) for an unknown step-up attempt, CloudUnavailableError
 (-> 503) from sync_now() when the cloud cannot be reached.
 Clocks (§2): the wall clock (= demo clock with DEMO_MODE=1) drives t0, schedule, bundle freshness and
-record stamps; the real clock drives step-up / nonce TTLs, TOTP and the rate limiter (monotonic).
+record stamps; the real clock drives step-up / nonce TTLs, TOTP, second-factor lockouts, the forced-mode deadline
+and the rate limiter (monotonic).
+Hardening (policy-fixes): forced OFFLINE auto-reverts (set_forced_mode), the deny-only revocation feed is pulled
+even while forced, every background stage is isolated (F07), a user revoked while a step-up is open is denied
+(F11), an erasure is complete only when every hook succeeded (EO-05), alerts are listed by recent_alerts (F14),
+GET /v1/mode carries counts only (sync_detail() has the ids), a deleted fallback-state file is detected and
+re-seeded from the decision log (EO-12).
+Layout (behaviour-identical split, quality bar <= 800 lines): this module keeps construction, clocks, mode, the
+decision path and sync_now; PolicyRuntime mixes in runtime_clock (forced mode, random challenge, demo clock),
+runtime_erasure (local DPDP erasure, pending cloud erasures / enrolments, sync + reconcile hooks), runtime_views
+(GET /v1/mode, access / store views) and runtime_background (tick, heartbeat, loop thread). Shared names live in
+runtime_common; every public name (PolicyRuntime, the exceptions, read_env, copy_windows, IST, NEVER_STORED,
+MAX_DEMO_OFFSET_S, TICK_INTERVAL_S) stays importable from edge.policy.runtime.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 import os
-import re
 import secrets
 import threading
 import time
@@ -29,63 +39,54 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import httpx
 from pydantic import ValidationError
 
-from edge.offline.bundle import BundleStore
+from edge.config import cloud_tls_verify, validate_cloud_url
+from edge.offline.bundle import DEFAULT_KEY_ID, BundleStore
 from edge.offline.connectivity import OFFLINE, ONLINE, SYNCING, ConnectivityMonitor
 from edge.offline.credentials import CredentialStore
-from edge.offline.erasures import PendingErasures
-from edge.offline.migrate import migrate_legacy_log
+from edge.offline.erasures import PendingEnrolments, PendingErasures, valid_actor
+from edge.offline.migrate import migrate_legacy_log, purge_foreign_logs
 from edge.offline.signing import KioskAuth
-from edge.offline.store import RECORD_FIELDS, DecisionLog, SqliteFallbackState, minimal_record
+from edge.offline.store import DecisionLog, SqliteFallbackState, minimal_record, reseed_fallback_state
 from edge.offline.sync import RevocationOverlay, SyncAgent
+from edge.policy import runtime_ops as ops
 from edge.policy import schedule as sched_mod
 from edge.policy.challenge import new_challenge
+from edge.policy.codes import order_codes
 from edge.policy.engine import (
+    ALLOW,
     DENY,
+    GENERIC_DESK_MESSAGE,
     STEP_UP,
     Decision,
+    NextAction,
     evaluate,
     online_bundle_ok,
     system_error,
     user_meta,
 )
 from edge.policy.fallback import FallbackVerifier, InMemoryFallbackState
-from edge.policy.liveness import enforced
 from edge.policy.ratelimit import RateLimiter
+from edge.policy.runtime_background import TICK_INTERVAL_S, BackgroundMixin
+from edge.policy.runtime_clock import MAX_DEMO_OFFSET_S, ClockMixin
+from edge.policy.runtime_common import IST, AttemptClosedError, AttemptNotFoundError, CloudUnavailableError
+from edge.policy.runtime_common import iso as _iso
+from edge.policy.runtime_erasure import ErasureMixin
+from edge.policy.runtime_views import NEVER_STORED, ViewsMixin, copy_windows
 from edge.policy.signals import AttemptSignals, ChallengeEvidence, FallbackSubmission
-from edge.policy.stepup import OPEN, SessionClosed, StepUpSession, expire_if_due, open_session
+from edge.policy.stepup import OPEN, SessionClosed, StepUpSession, open_session
 from edge.policy.stepup import drop_method as _drop_method
 from edge.policy.stepup import resolve_challenge as _resolve_challenge
 from edge.policy.stepup import resolve_fallback as _resolve_fallback
 from edge.policy.thresholds import Thresholds
 
-IST = ZoneInfo("Asia/Kolkata")
 log = logging.getLogger("edge.policy.runtime")  # never logs secrets, codes or biometric data
 ENV_KEYS = ("KIOSK_ID", "EDGE_DATA_KEY", "SCHEDULE_BUNDLE_HMAC_KEY", "CARD_ID_PEPPER", "KIOSK_HMAC_KEY",
-            "CLOUD_API_URL", "CLOUD_API_KEY", "FORCE_OFFLINE", "DEMO_MODE", "EDGE_DATA_DIR", "BUNDLE_PATH")
-MAX_DEMO_OFFSET_S = 7 * 86400  # demo clock: +-7 days (larger offsets overflow datetime / brick the runtime)
-_HHMM = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
-NEVER_STORED = ["images", "face_crops", "depth_maps", "embeddings", "display_names", "totp_values", "raw_card_ids"]
-
-
-class AttemptClosedError(Exception):
-    """Attempt already reached a terminal ALLOW/DENY (HTTP 409 ATTEMPT_CLOSED)."""
-
-
-class AttemptNotFoundError(Exception):
-    """No step-up session for this attempt (HTTP 404 ATTEMPT_NOT_FOUND)."""
-
-
-class CloudUnavailableError(Exception):
-    """Cloud not configured / forced offline / unreachable (HTTP 503 CLOUD_UNAVAILABLE)."""
-
-    def __init__(self, message: str, report: Mapping[str, Any] | None = None) -> None:
-        super().__init__(message)
-        self.report = dict(report or {})
+            "CLOUD_API_URL", "CLOUD_API_KEY", "FORCE_OFFLINE", "DEMO_MODE", "EDGE_DATA_DIR", "BUNDLE_PATH",
+            "SCHEDULE_BUNDLE_KEY_ID", "CLOUD_TLS_CA_FILE")
 
 
 def read_env(project_root: Path) -> dict[str, str]:
@@ -107,31 +108,14 @@ def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _iso(dt: datetime | None) -> str | None:
-    return dt.astimezone(UTC).isoformat().replace("+00:00", "Z") if dt else None
-
-
-class _FixedRng:
-    """Forced random-challenge draw (FORCE / FORCE_NEXT): `forced` makes the engine bypass the rate (even 0.0)."""
-
-    forced = True
-
-    def __init__(self, value: float, on_use: Callable[[], None] | None = None) -> None:
-        self.value, self.on_use = value, on_use
-
-    def random(self) -> float:
-        if self.on_use:
-            self.on_use()
-        return self.value
-
-
-class PolicyRuntime:
+class PolicyRuntime(ClockMixin, ErasureMixin, ViewsMixin, BackgroundMixin):
     def __init__(self, *, cfg: Thresholds, kiosk_id: str, bundles: BundleStore, log: DecisionLog,
                  monitor: ConnectivityMonitor, credentials: CredentialStore, overlay: RevocationOverlay,
                  card_pepper: bytes | None, client: httpx.Client | None = None, kiosk_key: bytes | None = None,
                  demo_mode: bool = False, rng: Any = None, fallback_state: Any = None,
                  clock: Callable[[], datetime] | None = None, mono: Callable[[], float] | None = None,
-                 erasures: PendingErasures | None = None) -> None:
+                 erasures: PendingErasures | None = None, enrolments: PendingEnrolments | None = None,
+                 data_dir: Path | None = None, data_key: str | None = None) -> None:
         self.cfg = cfg
         self.kiosk_id = kiosk_id
         self.bundles = bundles
@@ -152,15 +136,22 @@ class PolicyRuntime:
         self.sessions: dict[str, StepUpSession] = {}
         self._responses: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._closed: OrderedDict[str, str] = OrderedDict()
-        self._events: deque[dict[str, Any]] = deque(maxlen=500)
-        self._event_id = 0
+        self._alerts = ops.AlertLog(self.now, _iso)  # F14: thread-safe (request + loop threads)
+        self._forced = ops.ForcedState(forced=bool(monitor.forced))  # env FORCE_OFFLINE: unlimited
         self._template_cache: dict[str, Any] = {"count": 0, "model": "unknown", "age_h": None}
         self.fallback_state = fallback_state if fallback_state is not None else InMemoryFallbackState()
         self.verifier = FallbackVerifier(cfg, self.fallback_state, totp_secret=credentials.totp_secret,
-                                         card_pepper=card_pepper, bundle=lambda: self.bundles.lvb,
-                                         card_revoked=overlay.card_revoked)
+                                         card_pepper=card_pepper, bundle=self._decision_bundle,
+                                         card_revoked=overlay.card_revoked, on_lockout=self._on_lockout)
         self._erase_hooks: list[Callable[[str], Any]] = []
+        self._sync_hooks: list[Callable[[], Any]] = []
+        self._reconcile_hooks: list[Callable[[datetime], Any]] = []
         self._erased: set[str] = set()  # erasures already applied locally in this process (TOTP + hooks)
+        self._erase_failed: set[str] = set()  # EO-05: a hook / TOTP removal failed -> retried every tick
+        self.enrolments = enrolments if enrolments is not None else PendingEnrolments(None, None)
+        self._data_dir, self._data_key = data_dir, data_key
+        self._orphan_seen: dict[str, tuple[Any, Any, Any]] = {}  # P2: ALERT_ORPHANED_QUEUE once per state change
+        self._pre_sync_hooks: list[Callable[[], Any]] = []
         self._erase_lock = threading.Lock()  # one purge pass at a time (tick thread vs. feed pull)
         self._cloud_match: deque[tuple[datetime, bool]] = deque(maxlen=20)  # (real time, Rekognition ok)
         self.sync = SyncAgent(cfg, log, bundles, monitor, client=client, kiosk_id=kiosk_id, kiosk_key=kiosk_key,
@@ -188,36 +179,94 @@ class PolicyRuntime:
         data_dir = Path(e.get("EDGE_DATA_DIR") or (root / "edge" / "data"))
         data_dir.mkdir(parents=True, exist_ok=True)
         bundle_key = (e.get("SCHEDULE_BUNDLE_HMAC_KEY") or "").encode() or None
+        demo = _truthy(e.get("DEMO_MODE"))
         bundles = BundleStore(Path(e.get("BUNDLE_PATH") or data_dir / "bundle.signed.json"), bundle_key, kiosk_id,
-                              clock=clock)
+                              clock=clock, key_id=e.get("SCHEDULE_BUNDLE_KEY_ID") or DEFAULT_KEY_ID,
+                              allow_documented_codes=demo)  # EO-02 key-id pin, EO-10 documented codes
         log = DecisionLog(data_dir / f"decisions_{kiosk_id}.sqlite", data_key, kiosk_id,
                           retention_hours=float(cfg.offline_store.max_retention_hours))
         fb_state = SqliteFallbackState(data_dir / "fallback_state.sqlite", data_key)  # device-wide
         # one-time: the pre-per-kiosk decisions.sqlite (unsynced records) -> per-kiosk queue, then archived 0600
         legacy = migrate_legacy_log(data_dir, data_key, log, fb_state, now=(clock or (lambda: datetime.now(UTC)))(),
                                     retention_hours=float(cfg.offline_store.max_retention_hours))
-        url = (e.get("CLOUD_API_URL") or "").strip()
+        # EAE-07: https only (loopback / DEMO_MODE=1 excepted) + optional pinned CA, same rules as edge/config.py
+        url = validate_cloud_url(e.get("CLOUD_API_URL") or "", demo_mode=demo)
         kiosk_key = (e.get("KIOSK_HMAC_KEY") or "").encode() or None
         client = None
         if url:
-            client = httpx.Client(base_url=url.rstrip("/"),
+            client = httpx.Client(base_url=url,
                                   timeout=float(cfg.connectivity.heartbeat_timeout_ms) / 1000.0,
                                   auth=KioskAuth(kiosk_id, kiosk_key or b"", e.get("CLOUD_API_KEY") or None),
-                                  transport=transport)
+                                  transport=transport, verify=cloud_tls_verify(e.get("CLOUD_TLS_CA_FILE") or ""))
         monitor = ConnectivityMonitor(cfg, configured=bool(url), forced_offline=_truthy(e.get("FORCE_OFFLINE")),
                                       **({"clock": clock} if clock else {}))
         pepper = (e.get("CARD_ID_PEPPER") or "").encode() or None
-        rt = cls(cfg=cfg, kiosk_id=kiosk_id, bundles=bundles, log=log, monitor=monitor,
-                 credentials=CredentialStore(data_dir / "credentials.enc", data_key),
+        erasures = PendingErasures(data_dir / "pending_erasures.enc", data_key)
+        enrolments = PendingEnrolments(data_dir / "pending_enrolments.enc", data_key)
+        credentials = CredentialStore(data_dir / "credentials.enc", data_key)
+        rt = cls(cfg=cfg, kiosk_id=kiosk_id, bundles=bundles, log=log, monitor=monitor, credentials=credentials,
                  overlay=RevocationOverlay(data_dir / "revocations.enc", data_key), card_pepper=pepper,
-                 client=client, kiosk_key=kiosk_key, demo_mode=_truthy(e.get("DEMO_MODE")), fallback_state=fb_state,
-                 clock=clock, erasures=PendingErasures(data_dir / "pending_erasures.enc", data_key))
+                 client=client, kiosk_key=kiosk_key, demo_mode=demo, fallback_state=fb_state,
+                 clock=clock, erasures=erasures, enrolments=enrolments, data_dir=data_dir, data_key=data_key)
+        rt._check_fallback_state(fb_state)
+        if getattr(log, "evidence_rebased", False):  # EO-06: deletion evidence missing (upgrade or tampering)
+            rt._emit("ALERT_LOG_EVIDENCE_REBASED", kiosk_id=kiosk_id)
+        for name, store in (("pending_erasures", erasures), ("pending_enrolments", enrolments),
+                            ("credentials", credentials)):
+            if getattr(store, "corrupt", None) is not None:  # EO-08: quarantined, degraded, never fatal
+                rt._emit("ALERT_STATE_FILE_QUARANTINED", file=name)
+        rt._purge_foreign_logs()
         if legacy is not None:
             rt.legacy_migration = legacy
             rt._emit("ALERT_LEGACY_LOG_MIGRATION" if legacy.get("error") else "LEGACY_LOG_MIGRATED", **legacy)
             logger = logging.getLogger("edge.policy.runtime")  # `log` is the DecisionLog in this scope
             (logger.warning if legacy.get("error") else logger.info)("legacy decision log migration: %s", legacy)
         return rt
+
+    def _check_fallback_state(self, fb: Any) -> None:
+        """EO-12: a deleted / replaced fallback_state.sqlite (new epoch while the log knows another) is an alert;
+        consumed codes and TOTP steps are always re-seeded from the decision log (tighten-only)."""
+        epoch = getattr(fb, "epoch", None)
+        if not isinstance(epoch, str):
+            return
+        known = self.log.fallback_epoch()
+        seeded = reseed_fallback_state(fb, self.log, self._real())
+        if known is not None and known != epoch:
+            self._emit("ALERT_FALLBACK_STATE_RESET", **seeded)
+        elif seeded["codes"] or seeded["totp_steps"]:
+            self._emit("FALLBACK_STATE_RESEEDED", **seeded)
+        self.log.set_fallback_epoch(epoch)
+
+    def _purge_foreign_logs(self) -> None:
+        """EO-07: retention for per-kiosk logs of other KIOSK_IDs on this device + an alert while they hold data."""
+        if self._data_dir is None or not self._data_key:
+            return
+        try:
+            report = purge_foreign_logs(self._data_dir, self._data_key, self.kiosk_id, now=self._real(),
+                                        retention_hours=float(self.cfg.offline_store.max_retention_hours))
+        except Exception as exc:  # noqa: BLE001 - maintenance must never stop the runtime
+            log.error("foreign log purge failed (%s)", type(exc).__name__)
+            return
+        current: dict[str, tuple[Any, Any, Any]] = {}
+        for entry in report:
+            if not (entry.get("queued") or entry.get("tombstones") or entry.get("error")):
+                continue
+            key = str(entry.get("file") or entry.get("kiosk_id"))
+            state = (entry.get("queued"), entry.get("tombstones"), entry.get("error"))
+            current[key] = state
+            if self._orphan_seen.get(key) != state:  # P2: alert once per (file, state), never every tick
+                self._emit("ALERT_ORPHANED_QUEUE", kiosk_id=entry.get("kiosk_id"), queued=state[0],
+                           tombstones=state[1], error=state[2])
+        self._orphan_seen = current
+
+    def _decision_bundle(self) -> Mapping[str, Any] | None:
+        """The verified bundle as decisions use it (EO-10: documented fixture codes dropped unless DEMO_MODE=1)."""
+        if hasattr(self.bundles, "decision_bundle"):
+            return self.bundles.decision_bundle
+        return self.bundles.lvb
+
+    def _on_lockout(self, kind: str, subject: str | None) -> None:
+        self._emit("ALERT_FALLBACK_LOCKOUT", lock=kind, subject=subject, kiosk_id=self.kiosk_id)
 
     # ------------------------------------------------------------ clocks / mode
     def real_now(self) -> datetime:
@@ -228,10 +277,14 @@ class PolicyRuntime:
         return self._real() + self._offset
 
     def _ctx(self):
-        return self.bundles.schedule_ctx(self.overlay.entries())
+        ctx = self.bundles.schedule_ctx(self.overlay.entries())
+        if getattr(self.overlay, "state_lost", False):  # EO-08: feed revocations may be missing
+            ctx = replace(ctx, revocations_incomplete=True)
+        return ctx
 
     def mode(self) -> str:
         """The mode the next attempt would use (stale online bundle -> OFFLINE, §8.1)."""
+        self._expire_forced()
         if self.monitor.mode() != ONLINE:
             return OFFLINE
         return ONLINE if online_bundle_ok(self._ctx(), self.now(), self.cfg.for_mode(ONLINE)) else OFFLINE
@@ -254,7 +307,28 @@ class PolicyRuntime:
             return set()
         merged = dict(lvb)
         merged["revocations"] = list(lvb.get("revocations") or []) + list(self.overlay.entries())
-        return sched_mod.entitled_user_ids(merged, zone, self.now())
+        return sched_mod.entitled_user_ids(merged, zone, self.now(), revocation_slack_s=self._revocation_slack_s())
+
+    def _revocation_slack_s(self) -> float:
+        return float(self.cfg.cache.clock_rollback_tolerance_s)  # F03: same bound as the rollback tolerance
+
+    def _merged_bundle(self) -> dict[str, Any]:
+        lvb = self.bundles.lvb or {}
+        merged = dict(lvb)
+        merged["revocations"] = list(lvb.get("revocations") or []) + list(self.overlay.entries())
+        return merged
+
+    def is_revoked_now(self, user_id: str) -> bool:
+        """Deny-only live check: ANY revocation the edge holds for `user_id` (bundle, user flag or feed), whatever
+        its revoked_at (F11 / F03). Fail-secure: no verified bundle -> only the feed counts."""
+        merged = self._merged_bundle()
+        u = (merged.get("users") or {}).get(user_id)
+        return sched_mod.revoked_any(merged, user_id, u if isinstance(u, Mapping) else None)
+
+    def excluded_user_ids(self) -> set[str]:
+        """Users the local matcher must never return (F12 full-gallery search): DPDP-erased or erase-pending users
+        (bundle ERASED, feed ERASE not lifted, queued purge, failed local purge)."""
+        return self.erased_user_ids() | set(self.overlay.pending_purge()) | set(self._erase_failed)
 
     def user_info(self, user_id: str) -> dict[str, Any] | None:
         """{"user_id", "display", "role"} from the verified bundle (for the kiosk / operator UI), else None."""
@@ -270,99 +344,6 @@ class PolicyRuntime:
         """A cloud call made outside decide() (e.g. email-OTP verify): failures count as heartbeat misses."""
         self.monitor.record(ok, "heartbeat_timeout" if ok else "match_timeout")
 
-    def set_forced_mode(self, mode: str) -> dict[str, Any]:
-        if mode not in ("OFFLINE", "AUTO"):
-            raise ValueError("forced mode must be OFFLINE or AUTO")
-        self.monitor.set_forced(mode == "OFFLINE")
-        return self.mode_status()
-
-    def set_random_challenge(self, mode: str) -> None:
-        """Random liveness challenge control: AUTO (configured rate) | FORCE (every would-be ALLOW) |
-        FORCE_NEXT (the next would-be ALLOW only) | OFF (never; eval/demo profile)."""
-        if mode not in ("AUTO", "FORCE", "FORCE_NEXT", "OFF"):
-            raise ValueError("random challenge mode must be AUTO, FORCE, FORCE_NEXT or OFF")
-        self._random_challenge = mode
-        self._force_next = mode == "FORCE_NEXT"
-
-    def _attempt_rng(self) -> Any:
-        if self._random_challenge == "OFF":
-            return None
-        if self._random_challenge == "FORCE":
-            return _FixedRng(0.0)
-        if self._force_next:
-            def used() -> None:
-                self._force_next = False
-                self._random_challenge = "AUTO"
-            return _FixedRng(0.0, on_use=used)
-        return self._rng
-
-    def set_demo_clock(self, *, set_local: str | None = None, offset_s: float | None = None,
-                       reset: bool = False) -> dict[str, Any]:
-        """POST /v1/admin/clock (DEMO_MODE=1 only, else PermissionError -> 403). Invalid input -> ValueError
-        (-> 422) and the clock is left unchanged: "HH:MM" (today, IST) or an ISO datetime; the resulting offset
-        must be finite and within +-MAX_DEMO_OFFSET_S (7 days) so now() can never overflow.
-        "HH:MM" stays *today* (API.md 3.14, test X13): a time before the LVB issued_at - tolerance is a clock
-        rollback (cache INVALID); the returned status flags it (`bundle_rollback`, `earliest_local`)."""
-        if not self.demo_mode:
-            raise PermissionError("demo clock requires DEMO_MODE=1")
-        real = self._real()
-        new = self._offset
-        try:
-            if reset:
-                new = timedelta(0)
-            elif set_local is not None:
-                new = self._demo_target(str(set_local), real) - real
-            elif offset_s is not None:
-                off = float(offset_s)
-                if not math.isfinite(off) or abs(off) > MAX_DEMO_OFFSET_S:
-                    raise ValueError(f"offset_s must be finite and within +-{MAX_DEMO_OFFSET_S} s")
-                new = timedelta(seconds=off)
-            if abs(new.total_seconds()) > MAX_DEMO_OFFSET_S:
-                raise ValueError(f"demo clock must stay within +-{MAX_DEMO_OFFSET_S // 86400} days of real time")
-            _ = real + new  # must not overflow
-        except (OverflowError, TypeError) as exc:
-            raise ValueError(f"invalid demo clock value: {exc}") from exc
-        with self._lock:
-            self._offset = new
-        return self._demo_clock_full()
-
-    @staticmethod
-    def _demo_target(set_local: str, real: datetime) -> datetime:
-        m = _HHMM.match(set_local)
-        if m:  # "HH:MM" today (IST)
-            return real.astimezone(IST).replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0,
-                                                microsecond=0)
-        if len(set_local) <= 5:
-            raise ValueError("set_local must be HH:MM (00:00-23:59) or an ISO-8601 datetime")
-        target = datetime.fromisoformat(set_local)  # ValueError on garbage
-        return target.replace(tzinfo=IST) if target.tzinfo is None else target
-
-    def _demo_clock_full(self) -> dict[str, Any]:
-        now = self.now()
-        out: dict[str, Any] = {"active": self._offset != timedelta(0),
-                               "now_local": now.astimezone(IST).strftime("%H:%M"),
-                               "now_utc": _iso(now), "offset_s": int(self._offset.total_seconds()),
-                               "date_local": now.astimezone(IST).date().isoformat()}
-        out.update(self._rollback_view(now))
-        return out
-
-    def _rollback_view(self, now: datetime) -> dict[str, Any]:
-        """Control-panel warning (docs: the demo clock never re-signs): the earliest wall time the installed
-        bundle accepts (issued_at - cache.clock_rollback_tolerance_s) and whether `now` is before it."""
-        lvb = self.bundles.lvb
-        issued = sched_mod.parse_ts(lvb.get("issued_at")) if lvb else None
-        if issued is None:
-            return {"bundle_issued_at": None, "earliest_utc": None, "earliest_local": None,
-                    "earliest_date_local": None, "bundle_rollback": False, "cache_state": "INVALID"}
-        earliest = issued - timedelta(seconds=float(self.cfg.cache.clock_rollback_tolerance_s))
-        el = earliest.astimezone(IST)
-        if el.second or el.microsecond:  # first whole minute a "HH:MM" demo time may use
-            el = el.replace(second=0, microsecond=0) + timedelta(minutes=1)
-        return {"bundle_issued_at": lvb.get("issued_at"), "earliest_utc": _iso(earliest),
-                "earliest_local": el.strftime("%H:%M"), "earliest_date_local": el.date().isoformat(),
-                "bundle_rollback": now < earliest,
-                "cache_state": sched_mod.cache_state(lvb, True, now, self.cfg.cache)}
-
     def reset_rate_limit(self) -> None:
         self.limiter.reset()
 
@@ -376,17 +357,6 @@ class PolicyRuntime:
 
     def set_totp_secret(self, user_id: str, secret_b32: str) -> None:
         self.credentials.set_totp_secret(user_id, secret_b32)
-
-    def totp_status(self, user_id: str) -> dict[str, Any]:
-        """Enrolment UI: TOTP works only if the VERIFIED bundle marks the user `fallback.totp_enrolled` (the gate,
-        set by the cloud on a confirmed enrolment) AND this edge holds the secret. bundle_enrolled None = the
-        user is not in the bundle (or no bundle)."""
-        u = ((self.bundles.lvb or {}).get("users") or {}).get(user_id)
-        flag = bool(((u.get("fallback") or {}) if isinstance(u, Mapping) else {}).get("totp_enrolled")) \
-            if isinstance(u, Mapping) else None
-        cached = bool(self.credentials.totp_secret(user_id))
-        return {"user_id": user_id, "bundle_enrolled": flag, "secret_cached": cached,
-                "usable": bool(flag) and cached}
 
     def _local_methods(self, d: Decision) -> Decision:
         """Drop TOTP from a SECOND_FACTOR offer when this edge holds no TOTP secret for the candidate (the engine
@@ -402,43 +372,6 @@ class PolicyRuntime:
             return d
         return replace(d, next_action=replace(d.next_action, methods=kept))
 
-    def access_users(self) -> dict[str, Any]:
-        """Bundle-side view for GET /v1/admin/access/users (offline = this view only, read-only): every user of
-        the VERIFIED bundle with role, zones, extra windows, validity, revocation, fallback enrolment flags
-        (never the card hash) and the effective windows today at this kiosk's zone. Empty without a bundle."""
-        lvb = self.bundles.lvb
-        zone = self.kiosk_zone()
-        base = {"bundle_version": self.bundles.version, "issued_at": (lvb or {}).get("issued_at"), "zone": zone,
-                "roles": sorted((lvb or {}).get("roles") or {}), "zones": sorted((lvb or {}).get("zones") or {}),
-                "users": []}
-        if not lvb:
-            return base
-        now = self.now()
-        today = now.astimezone(sched_mod._tz(lvb)).date()
-        merged = dict(lvb)
-        merged["revocations"] = list(lvb.get("revocations") or []) + list(self.overlay.entries())
-        out = []
-        for uid, u in sorted((lvb.get("users") or {}).items()):
-            if not isinstance(u, Mapping):
-                continue
-            fb = u.get("fallback") if isinstance(u.get("fallback"), Mapping) else {}
-            try:
-                windows = sched_mod.day_windows(merged, uid, zone, today) if zone else []
-            except (KeyError, ValueError, TypeError):
-                windows = []
-            out.append({
-                "user_id": uid, "display": u.get("display"), "role": u.get("role"),
-                "zones_add": list(u.get("zones_add") or []), "zones_remove": list(u.get("zones_remove") or []),
-                "extra_windows": copy_windows(u.get("extra_windows")),
-                "valid_from": u.get("valid_from"), "valid_until": u.get("valid_until"),
-                "revoked": sched_mod.revoked_at_or_before(merged, uid, u, now),
-                "totp_enrolled": bool(fb.get("totp_enrolled")),
-                "card_enrolled": isinstance(fb.get("card_id_hash"), str) and bool(fb.get("card_id_hash")),
-                "windows_today": windows,
-            })
-        base["users"] = out
-        return base
-
     def refresh_bundle_now(self, *, expect_version: int | None = None) -> int:
         """POST /v1/admin/bundle/refresh: pull + verify + install the newest cloud bundle now; returns the installed
         bundle_version. Fail-secure: an unverifiable / older bundle never replaces the LVB. Raises
@@ -452,7 +385,7 @@ class PolicyRuntime:
         prev = self.bundles.version
         with self.sync._lock:
             try:
-                self.sync._pull_bundle(report)
+                self.sync._pull_bundle(report, force=True)  # no If-None-Match: renews issued_at (SC2-D2)
             except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
                 self.monitor.record(False, "heartbeat_timeout")
                 raise CloudUnavailableError(f"CLOUD_UNAVAILABLE: {type(exc).__name__}: {exc}", report) from exc
@@ -466,16 +399,20 @@ class PolicyRuntime:
                                         report)
         if version != prev:
             self._emit("BUNDLE_INSTALLED", version=version, previous=prev)
+        self._after_sync({"bundle": status})
         return version
 
     # ------------------------------------------------------------ events
     def _emit(self, kind: str, **data: Any) -> None:
-        self._event_id += 1
-        self._events.append({"id": self._event_id, "type": kind, "at": _iso(self.now()), **data})
+        self._alerts.emit(kind, **data)
 
     def events(self, since_id: int = 0) -> list[dict[str, Any]]:
-        """Policy events for GET /v1/events (e.g. ALERT_RATE_LIMIT_LOCKOUT, BUNDLE_REJECTED)."""
-        return [e for e in list(self._events) if e["id"] > since_id]
+        """Policy events (e.g. ALERT_RATE_LIMIT_LOCKOUT, ALERT_FALLBACK_LOCKOUT), oldest first. Thread-safe."""
+        return self._alerts.since(since_id)
+
+    def recent_alerts(self, limit: int = 50) -> list[dict[str, Any]]:
+        """F14: newest `limit` (1..200) ALERT_* + security events, oldest first, for an authenticated route."""
+        return self._alerts.recent_alerts(limit)
 
     # ------------------------------------------------------------ decisions
     def _rebase_t0(self, signals: AttemptSignals) -> AttemptSignals:
@@ -525,6 +462,7 @@ class PolicyRuntime:
     def decide(self, signals: AttemptSignals | Mapping[str, Any], latency_ms: Mapping[str, int] | None = None
                ) -> dict[str, Any]:
         t_start = time.perf_counter()
+        self._expire_forced()  # a forced OFFLINE past its deadline reverts before this attempt
         with self._lock:
             wall, real = self.now(), self._real()
             mode = self.monitor.mode()
@@ -587,7 +525,20 @@ class PolicyRuntime:
             raise AttemptClosedError(attempt_id)
         return s
 
+    def _revoked_before_allow(self, d: Decision) -> Decision:
+        """F11: a USER revocation received while the step-up was open denies (deny-only, any revoked_at)."""
+        uid = d.candidate_user_id
+        if d.decision != ALLOW or not uid or not self.is_revoked_now(uid):
+            return d
+        codes = ["SCHEDULE_REVOKED"] + (["OFFLINE_MODE"] if d.mode == OFFLINE else [])
+        return replace(d, decision=DENY, reason_codes=tuple(order_codes(codes)), resolved_codes=(),
+                       next_action=NextAction("CONTACT_DESK"), stage="schedule", schedule_result="REVOKED",
+                       display_message=GENERIC_DESK_MESSAGE)
+
     def _finish_step(self, s2: StepUpSession, d: Decision, wall: datetime, t_start: float) -> dict[str, Any]:
+        d = self._revoked_before_allow(d)
+        if d.decision == DENY:
+            s2 = replace(s2, status="DENIED", last=d)
         self.sessions[d.attempt_id] = s2
         d = self._persist(d, wall)
         if d.decision != STEP_UP:
@@ -617,11 +568,20 @@ class PolicyRuntime:
             s = self._session(attempt_id)
             sub = submission if isinstance(submission, FallbackSubmission) else \
                 FallbackSubmission.model_validate(submission)
+            if self._email_otp_unverifiable(s, sub):  # F10 / R11: drop the method, count nothing
+                self.monitor.record(False, "match_timeout")
+                return self.drop_method(attempt_id, "EMAIL_OTP")
             try:
                 s2, d = _resolve_fallback(s, sub, real, self.cfg, self.verifier, wall_now=wall)
             except SessionClosed as exc:
                 raise AttemptClosedError(attempt_id) from exc
             return self._finish_step(s2, d, wall, t_start)
+
+    def _email_otp_unverifiable(self, s: StepUpSession, sub: FallbackSubmission) -> bool:
+        """An ONLINE session's EMAIL_OTP submission that could not be cloud-verified (verified is None) because the
+        edge is no longer ONLINE: R11 drop instead of a counted failure. Never when it is the last method."""
+        return (sub.method == "EMAIL_OTP" and sub.email_otp_verified is None and s.mode == ONLINE
+                and "EMAIL_OTP" in s.methods and len(s.methods) > 1 and self.mode() != ONLINE)
 
     def drop_method(self, attempt_id: str, method: str) -> dict[str, Any]:
         """Stop offering `method` on an open step-up (e.g. EMAIL_OTP when the cloud verify is down) and
@@ -646,302 +606,29 @@ class PolicyRuntime:
         with self._lock:
             return self._responses.get(attempt_id)
 
-    # ------------------------------------------------------------ status / store / sync
-    def mode_status(self) -> dict[str, Any]:
-        st = self.monitor.status()
-        wall = self.now()
-        lvb = self.bundles.lvb
-        eff = self.mode()
-        if st["mode"] == ONLINE and eff == OFFLINE:
-            st = {**st, "mode": OFFLINE, "state": OFFLINE, "reason": "bundle_stale"}
-        T = self.cfg.for_mode(eff)
-        cache = sched_mod.cache_state(lvb, True, wall, self.cfg.cache) if lvb else "INVALID"
-        left = self.limiter.retry_after_int(self._mono())
-        age = self.bundles.refresh_age_s()
-        return {
-            **st,
-            "schedule_bundle": {
-                "version": self.bundles.version,
-                "issued_at": lvb.get("issued_at") if lvb else None,
-                "expires_at": lvb.get("expires_at") if lvb else None,
-                "signature_valid": lvb is not None,
-                "cache_state": cache,
-                "refresh_age_s": None if age is None else int(age),
-                "rejected": self.bundles.alerts[-5:],
-            },
-            "revocation_seq": self.overlay.seq,
-            "template_cache": dict(self._template_cache),
-            "sync_queue_depth": self.log.queue_depth(),
-            "demo_clock": self._demo_clock_full() if self.demo_mode else None,
-            "kiosk_id": self.kiosk_id,
-            "zone": self.kiosk_zone(),
-            "policy_version": self.cfg.policy_version,
-            "rate_limit": {"enabled": self.limiter.enabled, "locked": left is not None, "retry_after_s": left},
-            "last_sync": {"at": _iso(self.sync.last_sync_at), "report": self.sync.last_report},
-            "server_flags": self.sync.flags[-20:],
-            "random_challenge": self._random_challenge,
-            "policy_bars": self._policy_bars(T, eff),
-            "cloud_match": self._cloud_match_status(),
-        }
-
-    def _cloud_match_status(self) -> dict[str, Any]:
-        """P7 visibility: a Rekognition miss makes that ATTEMPT offline while heartbeats keep the kiosk ONLINE.
-        `degraded` = the latest online attempt fell back to an offline decision (kiosk can explain the badge)."""
-        cm = list(self._cloud_match)
-        misses = [t for t, ok in cm if not ok]
-        oks = [t for t, ok in cm if ok]
-        return {"enabled": bool(self.cfg.match.rekognition.enabled), "recent": len(cm), "misses": len(misses),
-                "last_miss_at": _iso(max(misses)) if misses else None, "last_ok_at": _iso(max(oks)) if oks else None,
-                "degraded": bool(cm) and not cm[-1][1]}
-
-    # ------------------------------------------------------------ local erasure (DPDP)
-    def add_erase_hook(self, fn: Callable[[str], Any]) -> None:
-        """Register a callback run once per user with an ERASED revocation (bundle or feed), e.g. edge-ml's
-        template-store delete. Replayed for users already erased before the hook was registered."""
-        with self._lock:
-            self._erase_hooks.append(fn)
-            done = sorted(self._erased)
-        for uid in done:
-            self._run_erase_hook(fn, uid)
-
-    def _run_erase_hook(self, fn: Callable[[str], Any], uid: str) -> None:
-        try:
-            fn(uid)
-        except Exception as exc:  # noqa: BLE001 - one failing hook must not stop the others / the tick
-            log.error("erase hook failed for a user (%s)", type(exc).__name__)
-
-    def erased_user_ids(self) -> set[str]:
-        """Users currently suspended by a DPDP erasure: an ERASED revocation of the verified bundle or an ERASE
-        feed event not yet lifted by a READMIT (docs/API.md §4.3)."""
-        lvb = self.bundles.lvb or {}
-        return {str(r.get("user_id")) for r in lvb.get("revocations") or []
-                if isinstance(r, Mapping) and r.get("reason") == "ERASED" and r.get("user_id")} \
-            | self.overlay.erased_users()
-
-    def apply_erasures(self) -> list[str]:
-        """DPDP erasure, local side: drop the user's TOTP secret and run the erase hooks (templates), once per
-        erasure. Sources: ERASED revocations of the verified bundle, ERASE feed events (overlay erasure state) and
-        the overlay's durable purge list (one entry per ERASE event, so an ERASE followed by a READMIT in the same
-        pull still purges the pre-erasure data). The once-per-user marker is dropped when the erasure is lifted
-        (bundle no longer lists it / READMIT), so a later erasure purges again. Runs after every feed pull and at
-        every tick."""
-        with self._erase_lock:
-            suspended = self.erased_user_ids()
-            queued = self.overlay.pending_purge()
-            with self._lock:
-                self._erased &= suspended  # lifted erasures: forget the marker
-                todo = sorted((suspended | set(queued)) - self._erased)
-                hooks = list(self._erase_hooks)
-            for uid in todo:
-                self.credentials.remove(uid)
-                for fn in hooks:
-                    self._run_erase_hook(fn, uid)
-                with self._lock:
-                    if uid in suspended:
-                        self._erased.add(uid)
-                    self._emit("USER_ERASED_LOCAL", user_id=uid)
-            if queued:
-                self.overlay.purged(queued)
-            return todo
-
-    def reinstate_user(self, user_id: str) -> bool:
-        """Re-enrolment of a re-admitted user (edge-ml enroll, after the bundle no longer carries the erasure): drop
-        only the overlay's erasure state for `user_id` (and a purge that has not run yet) and the once-per-user
-        marker. ADMIN / security revocations stay. Returns True if erasure state was removed."""
-        with self._erase_lock:
-            had = self.overlay.reinstate(user_id)
-            with self._lock:
-                self._erased.discard(user_id)
-            if had:
-                self._emit("USER_REINSTATED_LOCAL", user_id=user_id)
-            return had
-
     # ------------------------------------------------------------ pending cloud erasures (R-J)
-    def queue_cloud_erasure(self, user_id: str) -> dict[str, str]:
+    # Defined here, not in ErasureMixin: callers / tests feature-detect it on the class (delattr -> "no queue").
+    def queue_cloud_erasure(self, user_id: str, actor: str | None = None) -> dict[str, Any]:
         """DELETE /v1/enroll/{user_id} could not reach the cloud (OFFLINE / transport / non-2xx): persist the cloud
-        erasure (user_id + queued_at only, encrypted) for replay at every sync. Idempotent. ValueError on an
-        invalid user_id (^u_[0-9a-z]{4}$)."""
-        out = self.sync.erasures.add(user_id, self._real())
-        self._emit("CLOUD_ERASURE_QUEUED", user_id=out["user_id"])
+        erasure (user_id, queued_at, actor; encrypted) for replay at every sync (DELETE ...?actor=). Idempotent.
+        ValueError on an invalid user_id (^u_[0-9a-z]{4}$) or actor (staff:<id> | key:<id> | legacy:admin_token)."""
+        out = self.sync.erasures.add(user_id, self._real(), actor=valid_actor(actor))
+        self._emit("CLOUD_ERASURE_QUEUED", user_id=out["user_id"], actor=out.get("actor"))
         return out
 
-    def pending_cloud_erasures(self) -> list[dict[str, str]]:
-        """[{user_id, queued_at}] still waiting for the cloud (GET /v1/admin/access/users pending_cloud_erasures)."""
-        return self.sync.erasures.items()
-
-    def replay_cloud_erasures(self) -> dict[str, Any]:
-        """Flush the pending cloud erasures now ({done, failed, pending}); also runs inside every sync cycle.
-        CloudUnavailableError when not configured, forced OFFLINE or unreachable (entries stay queued)."""
-        if self._client is None:
-            raise CloudUnavailableError("cloud not configured (CLOUD_API_URL empty)")
-        if self.monitor.forced:
-            raise CloudUnavailableError("forced OFFLINE")
-        try:
-            out = self.sync.replay_erasures()
-        except httpx.HTTPError as exc:
-            self.monitor.record(False, "heartbeat_timeout")
-            raise CloudUnavailableError(f"CLOUD_UNAVAILABLE: {type(exc).__name__}: {exc}") from exc
-        self.monitor.record(True)
-        for uid in out["done"]:
-            self._emit("CLOUD_ERASURE_DONE", user_id=uid)
-        return out
-
-    def _policy_bars(self, T: Thresholds, eff: str) -> dict[str, Any]:
-        """The bars the engine applies in the effective mode. Identity: Rekognition online when enabled,
-        otherwise the local matcher with the OFFLINE bars (engine stage 4), so report those."""
-        rek = eff == ONLINE and bool(T.match.rekognition.enabled)
-        MB = (T if rek else self.cfg.for_mode(OFFLINE)).match.local
-        L = T.liveness
-        return {
-            "pad_pass": L.pad.pass_min, "flash_pass_r": L.flash.pass_min_r,
-            "match_allow": MB.allow_min_cosine, "match_margin": MB.min_margin_top1_top2,
-            "random_rate": T.challenge.random_rate,
-            "ambient_exception": bool(L.flash.ambient_exception_enabled) and eff == ONLINE,
-            "moire_unsure": L.moire.unsure_score, "device_unsure": L.device_detector.unsure_conf,
-            "flash_enforce": enforced(L.flash), "moire_enforce": enforced(L.moire),
-            "m2_rgb_enforce": enforced(L.mask, "m2_rgb_enforce"), "rekognition": rek,
-            "rekognition_timeout_ms": T.latency_budget_ms.rekognition_timeout,
-            "rekognition_probe_deadline_ms": T.latency_budget_ms.rekognition_probe_deadline,
-        }
-
-    def store_view(self) -> dict[str, Any]:
-        """GET /v1/admin/store (SC2d demo): exactly what is stored, decrypted minimal records."""
-        with self._lock:
-            ok, bad = self.log.verify_chain()
-            try:
-                db_bytes = os.path.getsize(self.log.path)
-            except OSError:
-                db_bytes = None
-            return {
-                "records": self.log.records(),
-                "queue_depth": self.log.queue_depth(),
-                "tombstones": self.log.tombstones(),
-                "chain_head": self.log.chain_head(),
-                "db_bytes": db_bytes,
-                "never_stored": list(NEVER_STORED),
-                "pending": self.log.pending(),
-                "chain_ok": ok,
-                "chain_bad_seq": bad,
-                "fields": list(RECORD_FIELDS),
-                "encryption": "AES-256-GCM (HKDF from EDGE_DATA_KEY), per-row AAD kiosk|seq|attempt",
-                "retention_hours": float(self.cfg.offline_store.max_retention_hours),
-            }
-
+    # ------------------------------------------------------------ status / store / sync
     def sync_now(self) -> dict[str, Any]:
         """POST /v1/admin/sync. Raises CloudUnavailableError (-> 503) when the cloud cannot be used."""
         if self._client is None:
             raise CloudUnavailableError("cloud not configured (CLOUD_API_URL empty)")
         if self.monitor.forced:
             raise CloudUnavailableError("forced OFFLINE")
+        self._before_sync()
         report = self.sync.run_once()
         if report.get("error"):
             raise CloudUnavailableError(str(report["error"]), report)
+        self._after_sync(report)
         return report
-
-    # ------------------------------------------------------------ background work
-    def tick(self) -> None:
-        """One maintenance pass: retention purge, abandoned step-ups, stale pending records."""
-        wall, real = self.now(), self._real()
-        self.apply_erasures()
-        with self._lock:
-            self.log.purge_expired(real)  # retention is real elapsed time, never the demo clock
-            T_totp = self.cfg.fallback.totp
-            self.fallback_state.purge_totp_before(
-                int(real.timestamp()) // int(T_totp.period_s) - int(T_totp.window_steps) - 1)
-            for aid, s in list(self.sessions.items()):
-                res = expire_if_due(s, real)
-                if res is not None:
-                    _, last = res
-                    try:
-                        self.log.append_final(minimal_record(last), created_real=real)
-                    except Exception:  # noqa: BLE001 - already final
-                        log.debug("abandoned step-up %s already final", aid)
-                    self.sessions.pop(aid, None)
-                    self._closed[aid] = last.decision
-            ttl = timedelta(seconds=float(self.cfg.stepup.session_ttl_s) + 60)
-            for rec in self.log.stale_pending(wall - ttl):
-                if rec["attempt_id"] not in self.sessions:
-                    try:
-                        self.log.append_final(rec, created_real=self._real())
-                    except Exception:  # noqa: BLE001 - already final
-                        log.debug("stale pending record %s already final", rec["attempt_id"])
-
-    def heartbeat(self) -> bool:
-        """GET {CLOUD_API_URL}/v1/health; keeps running while forced (AUTO -> SYNCING needs fresh results).
-        On success (not forced) also pulls the revocation feed (§5.1: every heartbeat)."""
-        if self._client is None:
-            self.monitor.record(False, "not_configured")
-            return False
-        try:
-            r = self._client.get(str(self.cfg.connectivity.health_path), auth=None)
-            ok = r.status_code == 200
-        except httpx.HTTPError:
-            ok = False
-        self.monitor.record(ok)
-        if ok and not self.monitor.forced:
-            try:
-                newly = self.sync.pull_revocations()
-                for uid in newly:
-                    self._emit("REVOCATION_APPLIED", user_id=uid)
-            except (httpx.HTTPError, ValueError, KeyError):
-                pass
-        return ok
-
-    def _loop(self) -> None:
-        C, S = self.cfg.connectivity, self.cfg.sync
-        next_hb = next_tick = next_sync = 0.0
-        backoff = float(S.backoff_initial_s)
-        refresh_s = float(self.cfg.cache.bundle_refresh_interval_min) * 60
-        last_refresh = 0.0
-        while not self._stop.is_set():
-            t = time.monotonic()
-            try:
-                if t >= next_hb:
-                    self.heartbeat()
-                    next_hb = t + float(C.heartbeat_interval_s)
-                if t >= next_tick:
-                    self.tick()
-                    next_tick = t + 15
-                state = self.monitor.state
-                due = state == SYNCING or (state == ONLINE and (self.log.queue_depth() > 0
-                                                                or len(self.sync.erasures) > 0  # R-J replay
-                                                                or t - last_refresh > refresh_s))
-                if self._client is not None and not self.monitor.forced and due and t >= next_sync:
-                    rep = self.sync.run_once()
-                    if rep.get("error"):
-                        jitter = 1 + float(S.backoff_jitter) * (2 * self._rng.random() - 1)
-                        next_sync = t + backoff * jitter
-                        backoff = min(backoff * 2, float(S.backoff_max_s))
-                    else:
-                        backoff, next_sync, last_refresh = float(S.backoff_initial_s), t + 2, t
-            except Exception:  # noqa: BLE001 - the background loop must never die
-                next_sync = t + backoff
-            self._stop.wait(0.5)
-
-    def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, name="policy-runtime", daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=3)
-        self._thread = None
-
-
-def copy_windows(extra: Any) -> dict[str, list[dict[str, Any]]]:
-    """Plain-JSON copy of users[].extra_windows ({ZONE: [{days, start, end}]}); malformed entries dropped."""
-    out: dict[str, list[dict[str, Any]]] = {}
-    if not isinstance(extra, Mapping):
-        return out
-    for z, ws in extra.items():
-        if isinstance(ws, list):
-            out[str(z)] = [{k: (list(w[k]) if k == "days" and w.get(k) is not None else w.get(k))
-                            for k in ("days", "start", "end")} for w in ws if isinstance(w, Mapping)]
-    return out
 
 
 class _Stub:
@@ -952,11 +639,17 @@ class _Stub:
 
 
 __all__ = [
+    "IST",
+    "MAX_DEMO_OFFSET_S",
+    "NEVER_STORED",
     "OFFLINE",
     "ONLINE",
     "SYNCING",
+    "TICK_INTERVAL_S",
     "AttemptClosedError",
     "AttemptNotFoundError",
     "CloudUnavailableError",
     "PolicyRuntime",
+    "copy_windows",
+    "read_env",
 ]

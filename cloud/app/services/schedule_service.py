@@ -34,11 +34,9 @@ on a second one); Restore = PUT access with consent + restore (all of the user's
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import logging
 import re
-import secrets
 import time
 import uuid
 from collections.abc import Callable
@@ -51,8 +49,14 @@ from ..clock import Clock, epoch_s, iso_z, parse_ts
 from ..config import Settings
 from ..policy_bridge import PolicyBridge, load_documented_override_values
 from ..thresholds import CloudThresholds
-from .code_hygiene import documented_code_ids, is_documented, set_edge_min_iterations, strip_documented_codes
-from .kv import KV
+from . import override_codes  # SC2 D8 staff override codes (names below re-exported here)
+from .code_hygiene import documented_code_ids, set_edge_min_iterations, strip_documented_codes
+from .kv import KV, StoreUnavailable
+from .override_codes import CONSUMED_CODES as CONSUMED_CODES  # re-exported: tests import it from here
+from .override_codes import MASTER_ONLY_KEYS, STAFF_REGISTRY, consumed_ids
+from .override_codes import MAX_ACTIVE_CODES_PER_STAFF as MAX_ACTIVE_CODES_PER_STAFF
+from .override_codes import check_override_codes as _check_override_codes
+from .override_codes import codes_for_kiosk as _codes_for_kiosk
 
 log = logging.getLogger("hid.cloud.schedule")
 
@@ -64,7 +68,12 @@ READMIT_REASONS = ("READMIT", "RESTORE")
 NS_COUNTERS = "counters"
 NS_KIOSK_BUNDLE = "schedule_kiosk"  # key = kiosk_id: last accepted uploaded bundle (served verbatim)
 NS_AUDIT = "admin_audit"  # key = "<ts>#<id>": who changed which access / codes (control panel ledger)
+NS_BUNDLE_ISSUE = "bundle_issue"  # key = kiosk_id: {version, issued_at, expires_at} of the last cloud issue
 AUDIT_TTL_S = 30 * 86400
+# A feed gap (seq allocated, event not visible) younger than this may be an in-flight write: the watermark stops
+# before it. Older gaps are burnt seqs (failed / retried publish) and are skipped.
+FEED_GAP_GRACE_S = 120
+LIST_TYPED = ("holidays", "exceptions", "visitor_passes", "revocations")
 DAYS = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
 _HHMM = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$|^24:00$")
 _UPLOAD_DROP_KEYS = ("signature", "issued_at", "expires_at")
@@ -165,6 +174,45 @@ def validate_schedule_doc(doc: Any, *, caller_kiosk: str | None = None) -> None:
             if bad:
                 raise BundleRejected("VALIDATION_ERROR", f"user {uid}: {key} has unknown zones {bad}")
         _check_windows(f"users.{uid}.extra_windows", u.get("extra_windows") or {}, zones, same_day=False)
+    _check_elements(doc, zones)
+
+
+def _str_list(v: Any) -> bool:
+    return isinstance(v, list) and all(isinstance(x, str) for x in v)
+
+
+def _check_elements(doc: dict, zones: dict) -> None:
+    """Element types of the list sections (F8): a non-object holiday / exception / pass / code used to be accepted
+    and then crashed filter_for_kiosk for EVERY kiosk (500 on every bundle fetch)."""
+    for key in LIST_TYPED:
+        v = doc.get(key)
+        if v is not None and (not isinstance(v, list) or not all(isinstance(x, dict) for x in v)):
+            raise BundleRejected("VALIDATION_ERROR", f"{key} must be a list of objects")
+    for i, h in enumerate(doc.get("holidays") or []):
+        cz = h.get("closed_zones")
+        if not (cz == "ALL" or (_str_list(cz) and all(z in zones for z in cz))):
+            raise BundleRejected("VALIDATION_ERROR", f"holidays[{i}].closed_zones must be \"ALL\" or known zones")
+    for key in ("exceptions", "visitor_passes"):
+        for i, e in enumerate(doc.get(key) or []):
+            if not _str_list(e.get("zones")):
+                raise BundleRejected("VALIDATION_ERROR", f"{key}[{i}].zones must be a list of zone names")
+    for i, vp in enumerate(doc.get("visitor_passes") or []):
+        if not isinstance(vp.get("user_id"), str):
+            raise BundleRejected("VALIDATION_ERROR", f"visitor_passes[{i}].user_id must be a string")
+    for i, r in enumerate(doc.get("revocations") or []):
+        if not isinstance(r.get("user_id"), str):
+            raise BundleRejected("VALIDATION_ERROR", f"revocations[{i}].user_id must be a string")
+    _check_override_codes(doc.get("override_codes"))
+
+
+def dry_run_bundles(doc: dict, key: str, key_id: str) -> None:
+    """Build + sign the bundle of every kiosk before a document is published (fail before, not at every GET)."""
+    for kid in doc.get("kiosks") or {}:
+        try:
+            sign_bundle(filter_for_kiosk(doc, kid), key, key_id)
+        except Exception as exc:  # noqa: BLE001 - any failure means the doc would break that kiosk
+            raise BundleRejected("VALIDATION_ERROR", f"the document cannot be served to kiosk {kid} "
+                                                     f"({type(exc).__name__})") from exc
 
 
 def _erased_suspension(doc: dict, uid: str) -> bool:
@@ -221,6 +269,21 @@ def sign_bundle(bundle: dict, key: str, key_id: str) -> dict:
     out["signature"] = {"alg": "HMAC-SHA256", "key_id": key_id, "value": hmac_hex(key, canonical_json(body)),
                         "canonicalization": CANONICALIZATION}
     return out
+
+
+def _bundle_code_ids(bundle: dict) -> set[str]:
+    oc = bundle.get("override_codes") if isinstance(bundle.get("override_codes"), dict) else {}
+    return {str(c.get("code_id")) for c in oc.get("codes") or [] if isinstance(c, dict)}
+
+
+def bundle_etag(bundle: dict) -> str:
+    """ETag = "v<bundle_version>-<issued_at epoch>" (V2 §E): a re-issue of the same version (fresh stamps) is a new
+    representation, so a kiosk holding an ageing copy gets 200, not 304."""
+    try:
+        issued = epoch_s(parse_ts(str(bundle.get("issued_at"))))
+    except ValueError:
+        issued = 0
+    return f'"v{bundle.get("bundle_version")}-{issued}"'
 
 
 def verify_bundle(bundle: dict, key: str) -> bool:
@@ -291,11 +354,21 @@ def filter_for_kiosk(doc: dict, kiosk_id: str) -> dict:
         "visitor_passes": passes,
         "users": users,
         "revocations": [r for r in doc.get("revocations") or [] if r.get("user_id") in users],
-        "override_codes": copy.deepcopy(doc.get("override_codes") or {}),
+        "override_codes": _codes_for_kiosk(doc, kiosk_id),
     }
     if "card_id_hash_scheme" in doc:
         out["card_id_hash_scheme"] = doc["card_id_hash_scheme"]
     return out
+
+
+def _carry_master_only(old: dict, new: dict) -> None:
+    """A replaced / uploaded document keeps the cloud's staff registry and consumed-code list (never in a bundle,
+    so an uploaded or fetched-then-edited document cannot carry them)."""
+    for key in MASTER_ONLY_KEYS:
+        if key in old:
+            new[key] = copy.deepcopy(old[key])
+        else:
+            new.pop(key, None)
 
 
 def _carry_revocations(old: dict, new: dict) -> list[str]:
@@ -328,6 +401,7 @@ class ScheduleService:
         self.policy = policy
         self._cache: dict | None = None
         self._cache_at = 0.0
+        self._last_kiosks: set[str] | None = None  # last-good kiosk list (store outage: auth keeps working)
         set_edge_min_iterations(thresholds.override_pbkdf2_iterations)
 
     # ------------------------------------------------------------------ master document
@@ -427,29 +501,36 @@ class ScheduleService:
         raise ScheduleConflict("concurrent schedule updates; retry")
 
     def replace(self, new_doc: dict, reason: str = "admin:replace", *, caller_kiosk: str | None = None,
-                actor: str | None = None) -> int:
-        """PUT /v1/admin/schedule. Validated (validate_schedule_doc) and never un-revokes: revocations of the
-        current master missing from `new_doc` (e.g. a doc fetched before a revocation) are carried over."""
+                actor: str | None = None, audit_meta: dict | None = None) -> int:
+        """PUT /v1/admin/schedule. Validated (validate_schedule_doc + a dry-run build/sign of every kiosk's bundle)
+        and never un-revokes: revocations of the current master missing from `new_doc` (e.g. a doc fetched before a
+        revocation) are carried over, like the staff registry and the consumed-code list (master-only)."""
         validate_schedule_doc(new_doc, caller_kiosk=caller_kiosk)
-        clean = {k: v for k, v in new_doc.items() if k not in _UPLOAD_DROP_KEYS}
+        clean = {k: v for k, v in new_doc.items() if k not in _UPLOAD_DROP_KEYS + MASTER_ONLY_KEYS}
         carried: list[str] = []
 
         def _m(doc: dict) -> None:
             old = copy.deepcopy(doc)
             doc.clear()
             doc.update(copy.deepcopy(clean))
+            carried.clear()
             carried.extend(_carry_revocations(old, doc))
+            _carry_master_only(old, doc)
             doc["revocations_version"] = max(int(old.get("revocations_version", 0) or 0),
                                              int(clean.get("revocations_version", 0) or 0))
+            doc["bundle_version"] = int(old.get("bundle_version", 0) or 0) + 1  # what publish will stamp
+            dry_run_bundles(doc, self.s.schedule_bundle_hmac_key, self.s.bundle_key_id)
 
         version, _ = self.publish(_m, reason)
         self.audit("SCHEDULE_REPLACE", kiosk_id=caller_kiosk, actor=actor, bundle_version=version,
-                   revocations_carried_over=carried)
+                   revocations_carried_over=carried, **(audit_meta or {}))
         return version
 
     # ------------------------------------------------------------------ uploaded (operator-signed) bundles
-    def accept_kiosk_bundle(self, kiosk_id: str, bundle: Any) -> dict:
-        """PUT /v1/admin/schedule/{kiosk_id}: verify an operator-signed bundle and make it authoritative."""
+    def accept_kiosk_bundle(self, kiosk_id: str, bundle: Any, *, actor: str | None = None,
+                            audit_meta: dict | None = None) -> dict:
+        """PUT /v1/admin/schedule/{kiosk_id}: verify an operator-signed bundle and make it authoritative. Every
+        acceptance (not an identical re-upload) leaves a SCHEDULE_UPLOAD audit entry."""
         if not isinstance(bundle, dict):
             raise BundleRejected("VALIDATION_ERROR", "body must be a signed bundle JSON object")
         sig = bundle.get("signature") if isinstance(bundle.get("signature"), dict) else {}
@@ -479,6 +560,10 @@ class ScheduleService:
             raise BundleRejected("VALIDATION_ERROR", "bundle expires_at must be ISO-8601 with timezone") from exc
         if expires <= now:
             raise BundleRejected("VALIDATION_ERROR", "bundle already expired; re-sign it")
+        resurrected = sorted(_bundle_code_ids(bundle) & set(consumed_ids(master["doc"], now)))
+        if resurrected:  # CA-03: a code retired fleet-wide must never become usable again through an upload
+            raise BundleRejected("VALIDATION_ERROR", f"bundle contains override codes already consumed fleet-wide "
+                                                     f"{resurrected}; re-sign without them", reason="CODE_CONSUMED")
 
         value = str(sig.get("value"))
         stored = self.kv.get(NS_KIOSK_BUNDLE, kiosk_id)
@@ -496,16 +581,26 @@ class ScheduleService:
             full = set(master["doc"].get("kiosks") or {}) <= set(kiosks)
             mode = "replaced" if full else "codes_merged"
 
+            if full:  # it becomes the master: same structural checks as PUT /v1/admin/schedule
+                validate_schedule_doc({k: v for k, v in bundle.items() if k != "signature"})
+            else:
+                _check_override_codes(bundle.get("override_codes"))
+
             def _m(doc: dict) -> None:
+                carried.clear()
                 if full:
                     old = copy.deepcopy(doc)
                     doc.clear()
-                    doc.update({k: copy.deepcopy(v) for k, v in bundle.items() if k not in _UPLOAD_DROP_KEYS})
+                    doc.update({k: copy.deepcopy(v) for k, v in bundle.items()
+                                if k not in _UPLOAD_DROP_KEYS + MASTER_ONLY_KEYS})
                     carried.extend(_carry_revocations(old, doc))
+                    _carry_master_only(old, doc)
                     doc["revocations_version"] = max(int(old.get("revocations_version", 0)),
                                                      int(doc.get("revocations_version", 0) or 0))
                 else:
                     doc["override_codes"] = copy.deepcopy(bundle.get("override_codes") or {"codes": []})
+                doc["bundle_version"] = version
+                dry_run_bundles(doc, self.s.schedule_bundle_hmac_key, self.s.bundle_key_id)
 
             self.publish(_m, f"upload:{kiosk_id}:{mode}", version=version,
                          meta={"source_signature": value, "source_kiosk": kiosk_id})
@@ -515,14 +610,18 @@ class ScheduleService:
                 "verbatim": not carried, "revocations_carried_over": carried}
         self.kv.put(NS_KIOSK_BUNDLE, kiosk_id, item)
         self._cache = None
+        n_codes = len((bundle.get("override_codes") or {}).get("codes") or [])
         log.info("kiosk %s: uploaded bundle v%s accepted (%s, %d override codes, %d revocations carried over)",
-                 kiosk_id, version, mode, len((bundle.get("override_codes") or {}).get("codes") or []), len(carried))
+                 kiosk_id, version, mode, n_codes, len(carried))
+        self.audit("SCHEDULE_UPLOAD", kiosk_id=kiosk_id, actor=actor, bundle_version=version, master=mode,
+                   resumed=resumed or None, override_codes=n_codes, revocations_carried_over=carried,
+                   key_id=sig.get("key_id"), expires_at=iso_z(expires), **(audit_meta or {}))
         return self._upload_result(kiosk_id, item, unchanged=False)
 
     @staticmethod
     def _upload_result(kiosk_id: str, item: dict, *, unchanged: bool) -> dict:
         b = item["bundle"]
-        return {"kiosk_id": kiosk_id, "bundle_version": int(item["version"]), "etag": f'"{item["version"]}"',
+        return {"kiosk_id": kiosk_id, "bundle_version": int(item["version"]), "etag": bundle_etag(b),
                 "unchanged": unchanged, "master": item.get("master"),
                 "served": "verbatim" if item.get("verbatim", True) else "cloud_resigned",
                 "override_codes": len((b.get("override_codes") or {}).get("codes") or []),
@@ -538,6 +637,11 @@ class ScheduleService:
             return None
         if not item or not item.get("verbatim", True) or int(item["version"]) < master_version:
             return None
+        consumed = set(consumed_ids(self.current()["doc"], self.clock.now()))
+        if _bundle_code_ids(item.get("bundle") or {}) & consumed:
+            log.warning("uploaded bundle for %s holds a consumed override code; serving the cloud-signed bundle",
+                        kiosk_id)
+            return None
         if documented_code_ids(item.get("bundle") or {}):
             log.warning("uploaded bundle for %s holds documented override codes; serving the cloud-signed bundle",
                         kiosk_id)
@@ -550,10 +654,17 @@ class ScheduleService:
         return item["bundle"]
 
     def known_kiosks(self) -> set[str]:
+        """Kiosk ids of the master (HMAC key lookup). A store failure falls back to the last-good set; with none,
+        StoreUnavailable (503) - an outage must never look like "unknown kiosk" (401)."""
         try:
-            return set((self.current(max_age_s=5.0)["doc"].get("kiosks") or {}).keys())
-        except Exception:
-            return set()
+            kiosks = set((self.current(max_age_s=5.0)["doc"].get("kiosks") or {}).keys())
+        except Exception as exc:  # noqa: BLE001 - any store / decode failure
+            if self._last_kiosks is not None:
+                log.warning("schedule unreadable (%s); using the last-good kiosk list", type(exc).__name__)
+                return set(self._last_kiosks)
+            raise StoreUnavailable("schedule store unavailable") from exc
+        self._last_kiosks = kiosks
+        return kiosks
 
     def kiosk_zone(self, kiosk_id: str) -> str | None:
         k = (self.current()["doc"].get("kiosks") or {}).get(kiosk_id)
@@ -577,7 +688,8 @@ class ScheduleService:
         return int(cur["value"]) if cur else 0
 
     def revoke(self, *, rtype: str, target_id: str, reason: str, revoked_at: datetime | None = None,
-               force: bool = False, kiosk_id: str | None = None, actor: str | None = None) -> dict:
+               force: bool = False, kiosk_id: str | None = None, actor: str | None = None,
+               audit_meta: dict | None = None) -> dict:
         if rtype not in {"USER", "CARD"}:
             raise ValueError("type must be USER or CARD")
         if reason == "ERASED":  # only DELETE /v1/enroll creates an erasure (request model refuses it too)
@@ -588,12 +700,14 @@ class ScheduleService:
                 raise UnknownUser(target_id)
             self._refuse_if_revoked(fresh, target_id)
         ts = iso_z(revoked_at or self.clock.now())
-        seq = self._next_seq()
-        event = {"seq": seq, "type": rtype, "target_id": target_id, "revoked_at": ts, "reason": reason}
 
-        def _m(doc: dict) -> None:
+        def _m(doc: dict) -> int:
             if rtype == "USER":
                 self._refuse_if_revoked(doc, target_id)  # CAS retry on a doc revoked meanwhile: still no duplicate
+            # seq allocated per attempt inside the publish: the winning publish always holds the higher seq, so the
+            # feed order equals the publication order (a lost CAS burns its seq: a gap the feed skips later)
+            seq = self._next_seq()
+            if rtype == "USER":
                 u = (doc.get("users") or {}).get(target_id)
                 if isinstance(u, dict):
                     u["revoked"] = True
@@ -605,13 +719,14 @@ class ScheduleService:
                     if fb.get("card_id_hash") == target_id:
                         fb["card_id_hash"] = None
             doc["revocations_version"] = max(seq, int(doc.get("revocations_version", 0)))
+            return seq
 
         # publish first: a failed publish must not leave an orphan feed event (the burnt seq is a harmless gap)
-        version, _ = self.publish(_m, f"revoke:{rtype}:{reason}")
-        self.kv.put(NS_REV, f"{seq:012d}", event)
+        version, seq = self.publish(_m, f"revoke:{rtype}:{reason}")
+        event = self._write_event(seq, rtype, target_id, reason, revoked_at=ts)
         event["bundle_version"] = version
         self.audit("REVOKE", kiosk_id=kiosk_id, actor=actor, user_id=target_id if rtype == "USER" else None,
-                   type=rtype, reason=reason, bundle_version=version, seq=seq)
+                   type=rtype, reason=reason, bundle_version=version, seq=seq, **(audit_meta or {}))
         return event
 
     @staticmethod
@@ -619,16 +734,16 @@ class ScheduleService:
         if user_state(doc, uid)[0] == "REVOKED":
             raise BundleRejected("INVALID_STATE", f"user {uid} is already revoked", reason="ALREADY_REVOKED")
 
-    def erase_user(self, user_id: str, *, kiosk_id: str | None = None) -> dict:
+    def erase_user(self, user_id: str, *, kiosk_id: str | None = None, actor: str | None = None,
+                   audit_meta: dict | None = None) -> dict:
         """DPDP erasure of the BIOMETRIC data: the campus entitlement (users[uid]: role, zones, windows) is kept
         but suspended by an ERASED revocation (bundle) until the user enrols again with consent or an admin
         re-applies access. fallback.totp_enrolled is cleared (the edge drops the secret on ERASED). The feed gets
         a non-deny ERASE event (not a USER revocation: the edge overlay is deny-only and permanent)."""
         ts = iso_z(self.clock.now())
-        seq = self._next_seq()
-        event = {"seq": seq, "type": "ERASE", "target_id": user_id, "revoked_at": ts, "reason": "ERASED"}
 
-        def _m(doc: dict) -> bool:
+        def _m(doc: dict) -> tuple[int, bool]:
+            seq = self._next_seq()
             u = (doc.get("users") or {}).get(user_id)
             if isinstance(u, dict):
                 fb = u.setdefault("fallback", {})
@@ -637,11 +752,12 @@ class ScheduleService:
                                   if not (r.get("user_id") == user_id and r.get("reason") == "ERASED")]
             doc["revocations"].append({"user_id": user_id, "revoked_at": ts, "reason": "ERASED"})
             doc["revocations_version"] = max(seq, int(doc.get("revocations_version", 0)))
-            return isinstance(u, dict)
+            return seq, isinstance(u, dict)
 
-        version, kept = self.publish(_m, "erase")
-        self.kv.put(NS_REV, f"{seq:012d}", event)
-        self.audit("ERASE", kiosk_id=kiosk_id, user_id=user_id, bundle_version=version, seq=seq)
+        version, (seq, kept) = self.publish(_m, "erase")
+        event = self._write_event(seq, "ERASE", user_id, "ERASED", revoked_at=ts)
+        self.audit("ERASE", kiosk_id=kiosk_id, actor=actor, user_id=user_id, bundle_version=version, seq=seq,
+                   **(audit_meta or {}))
         event["bundle_version"] = version
         event["schedule_entry_removed"] = False
         event["schedule_entry_kept"] = kept
@@ -660,6 +776,7 @@ class ScheduleService:
         want_card = isinstance(user, dict) and card_id_hash is not None and fb.get("card_id_hash") != card_id_hash
         want_readmit = _erased_suspension(doc, user_id)
         if not (want_totp or want_card or want_readmit):
+            self.reemit_missing_readmit(user_id)
             return {"bundle_version": int(self.current()["version"]), "in_schedule": isinstance(user, dict),
                     "role": (user or {}).get("role"), "readmitted": False, "changed": False}
 
@@ -671,12 +788,14 @@ class ScheduleService:
                     f["totp_enrolled"] = bool(totp_enrolled)
                 if card_id_hash is not None:
                     f["card_id_hash"] = card_id_hash
-            return {"readmitted": _readmit(d, user_id), "in_schedule": isinstance(u, dict),
-                    "role": (u or {}).get("role")}
+            readmitted = _readmit(d, user_id)
+            return {"readmitted": readmitted, "in_schedule": isinstance(u, dict), "role": (u or {}).get("role"),
+                    "feed_seq": self._next_seq() if readmitted else None}
 
         version, out = self.publish(_m, "enroll:fallback")
+        feed_seq = out.pop("feed_seq")
         if out["readmitted"]:
-            self._feed_event("READMIT", user_id, "READMIT")  # §4.3: consented enrolment
+            self._write_event(feed_seq, "READMIT", user_id, "READMIT")  # §4.3: consented enrolment
             self.audit("READMIT", kiosk_id=kiosk_id, user_id=user_id, bundle_version=version, via="enrolment")
         return {"bundle_version": version, "changed": True, **out}
 
@@ -686,11 +805,37 @@ class ScheduleService:
         return out["bundle_version"] if out["in_schedule"] else None
 
     def _feed_event(self, etype: str, target_id: str, reason: str) -> int:
+        seq = self._next_seq()
+        self._write_event(seq, etype, target_id, reason)
+        return seq
+
+    def _write_event(self, seq: int, etype: str, target_id: str, reason: str, *, revoked_at: str | None = None) -> dict:
+        """Feed event (GET /v1/revocations). `published_at` lets the feed watermark tell an in-flight write from a
+        burnt seq (revocations_since)."""
         if etype == "READMIT" and reason not in READMIT_REASONS:  # contract enums.readmit_reason (docs/API.md §4.3)
             raise ValueError(f"READMIT feed reason must be one of {READMIT_REASONS}, not {reason!r}")
-        seq = self._next_seq()
-        self.kv.put(NS_REV, f"{seq:012d}", {"seq": seq, "type": etype, "target_id": target_id,
-                                            "revoked_at": iso_z(self.clock.now()), "reason": reason})
+        now = iso_z(self.clock.now())
+        event = {"seq": seq, "type": etype, "target_id": target_id, "revoked_at": revoked_at or now, "reason": reason,
+                 "published_at": now}
+        self.kv.put(NS_REV, f"{seq:012d}", event)
+        return dict(event)
+
+    def reemit_missing_readmit(self, user_id: str) -> int | None:
+        """Idempotent repair (F10): the master says the user is ACTIVE but the feed's last word on them is still a
+        deny (USER) or ERASE - the READMIT / RESTORE event was lost after its publish (store hiccup, crash). The
+        edge overlay would keep denying a restored user forever, so the missing event is emitted again."""
+        if user_state(self.current()["doc"], user_id)[0] != "ACTIVE":
+            return None
+        mine = sorted((it for _, it in self.kv.list(NS_REV) if it.get("target_id") == user_id),
+                      key=lambda it: int(it.get("seq", 0)))
+        since_lift: list[str] = []
+        for it in mine:
+            since_lift = [] if it.get("type") == "READMIT" else [*since_lift, str(it.get("type"))]
+        if not any(t in ("USER", "ERASE") for t in since_lift):
+            return None
+        reason = "RESTORE" if "USER" in since_lift else "READMIT"
+        seq = self._feed_event("READMIT", user_id, reason)
+        log.warning("feed repair: re-emitted READMIT/%s for %s (seq %d)", reason, user_id, seq)
         return seq
 
     # ------------------------------------------------------------------ audit ledger (control panel)
@@ -760,7 +905,21 @@ class ScheduleService:
         ids = {str(c.get("staff_id")) for c in (doc.get("override_codes") or {}).get("codes") or []
                if isinstance(c, dict) and c.get("staff_id")}
         ids |= {str(x) for x in doc.get("staff_ids") or [] if isinstance(x, str)}
+        ids |= {str(x) for x in (doc.get(STAFF_REGISTRY) or {})}
         return sorted(ids)
+
+    def match_status(self, user_id: str, row: dict | None) -> str | None:
+        """POST /v1/match user_status from user_state() (F18): REVOKED -> REVOKED, ERASED suspension -> SUSPENDED,
+        ACTIVE -> ACTIVE; a user outside the schedule falls back to the enrolment row's status."""
+        status = user_state(self.current()["doc"], user_id)[0]
+        if status == "REVOKED":
+            return "REVOKED"
+        if status == "ERASED":
+            return "SUSPENDED"
+        if status == "ACTIVE":
+            return "ACTIVE"
+        row_status = (row or {}).get("status")
+        return row_status if row_status in ("ACTIVE", "SUSPENDED", "REVOKED") else None
 
     @staticmethod
     def _entry_fields(u: dict | None) -> dict:
@@ -773,7 +932,7 @@ class ScheduleService:
                 "fallback": {"totp_enrolled": bool(fb.get("totp_enrolled")), "card": bool(fb.get("card_id_hash"))}}
 
     def update_access(self, user_id: str, change: dict[str, Any], *, kiosk_id: str | None = None,
-                      actor: str | None = None) -> dict:
+                      actor: str | None = None, audit_meta: dict | None = None) -> dict:
         """PUT /v1/admin/users/{user_id}/access (docs/API.md §3.18.2 state rules, §4.9a). `change` holds only the
         fields the caller sent (role always; consent / restore are flags, not stored fields).
 
@@ -858,11 +1017,14 @@ class ScheduleService:
             users[user_id] = u
             return {"created": old is None, "diff": diff, "readmitted": readmitted, "restored": restored,
                     "previous_status": status, "user": copy.deepcopy(u),
-                    "previous_role": None if old is None else old.get("role")}
+                    "previous_role": None if old is None else old.get("role"),
+                    "feed": [(self._next_seq(), reason)
+                             for reason, on in (("READMIT", readmitted), ("RESTORE", restored)) if on]}
 
         try:
             version, out = self.publish(_m, f"admin:access:{user_id}", meta={"actor": actor, "kiosk_id": kiosk_id})
         except _Unchanged:
+            self.reemit_missing_readmit(user_id)  # a retry after a lost READMIT / RESTORE event repairs the feed
             rec = self.current()
             u = (rec["doc"].get("users") or {}).get(user_id) or {}
             return {"user_id": user_id, "bundle_version": int(rec["version"]), "created": False, "unchanged": True,
@@ -870,10 +1032,8 @@ class ScheduleService:
                     "user": self._public_user(rec["doc"], user_id, u), "changed_at": None,
                     "warnings": self._access_warnings(rec["doc"], user_id, u)}
         # feed events only after a successful publish (no orphan event); the edge drops its overlay entries
-        if out["readmitted"]:
-            self._feed_event("READMIT", user_id, "READMIT")
-        if out["restored"]:
-            self._feed_event("READMIT", user_id, "RESTORE")
+        for seq, reason in out["feed"]:
+            self._write_event(seq, "READMIT", user_id, reason)
         action = ("USER_CREATE" if out["created"] else "RESTORE" if out["restored"]
                   else "READMIT" if out["readmitted"] else "ACCESS_UPDATE")
         self.audit(action, kiosk_id=kiosk_id, actor=actor, user_id=user_id, bundle_version=version,
@@ -881,7 +1041,7 @@ class ScheduleService:
                    role_change=[out["previous_role"], out["user"].get("role")]
                    if out["previous_role"] != out["user"].get("role") else None,
                    previous_status=out["previous_status"], readmitted=out["readmitted"] or None,
-                   restored=out["restored"] or None)
+                   restored=out["restored"] or None, **(audit_meta or {}))
         log.info("access for %s %s by %s/%s -> v%s", user_id, action, kiosk_id, actor, version)
         doc = self.current()["doc"]
         return {"user_id": user_id, "bundle_version": version, "created": out["created"], "unchanged": False,
@@ -908,69 +1068,58 @@ class ScheduleService:
         return out
 
     def rotate_codes(self, staff_id: str, count: int, *, replace_existing: bool = True, kiosk_id: str | None = None,
-                     actor: str | None = None) -> dict:
+                     actor: str | None = None, audit_meta: dict | None = None) -> dict:
         """POST /v1/admin/codes/rotate: mint `count` fresh one-time staff override codes. Only PBKDF2 hashes are
-        stored; the plaintext is returned once. Documented fixture codes (OVR-001..003) are dropped."""
-        documented = load_documented_override_values()
-        if documented is None:  # fail secure: hygiene would strip every code, so a minted code could never work
-            raise BundleRejected("CLOUD_UNAVAILABLE", "documented-code list unavailable (scripts/sign_bundle.py "
-                                                      "missing from the build); cannot mint override codes",
-                                 reason="CODES_UNAVAILABLE")
-        length = int(self.t.override_code_length)
-        now = self.clock.now().replace(microsecond=0)
-        _, expires = self.bundle_times()
-        valid_until = iso_z(expires + timedelta(hours=self.t.override_valid_after_expiry_h))
+        stored; the plaintext is returned once. Documented fixture codes (OVR-001..003) are dropped, and so are codes
+        hashed with too few iterations (all listed in dropped_code_ids + the audit entry).
 
-        def _m(doc: dict) -> dict:
-            oc = doc.get("override_codes") if isinstance(doc.get("override_codes"), dict) else {}
-            oc.setdefault("kdf", "PBKDF2-HMAC-SHA256")
-            iterations = max(int(oc.get("iterations") or 0), int(self.t.override_pbkdf2_iterations))
-            if int(oc.get("iterations") or 0) != iterations and oc.get("codes"):
-                # the edge hashes with max(bundle, thresholds) iterations: codes hashed with fewer never verify
-                log.warning("override codes re-based to %d PBKDF2 iterations; older codes dropped", iterations)
-                oc["codes"] = []
-            oc["iterations"] = iterations
-            doc["override_codes"] = oc
-            dropped = strip_documented_codes(doc, documented)
-            if replace_existing:
-                dropped += [str(c.get("code_id")) for c in oc.get("codes") or [] if c.get("staff_id") == staff_id]
-                oc["codes"] = [c for c in oc.get("codes") or [] if c.get("staff_id") != staff_id]
-            taken = {str(c.get("code_id")) for c in oc.get("codes") or []}
-            minted = []
-            stamp = now.strftime("%m%d%H%M%S")
-            while len(minted) < count:
-                code = f"{secrets.randbelow(10 ** length):0{length}d}"
-                salt = secrets.token_hex(8)
-                entry = {"code_id": f"OVR-R{stamp}-{len(minted) + 1:02d}", "staff_id": staff_id, "salt": salt,
-                         "valid_until": valid_until,
-                         "hash": hashlib.pbkdf2_hmac("sha256", code.encode(), bytes.fromhex(salt), iterations).hex()}
-                if entry["code_id"] in taken:
-                    entry["code_id"] += f"-{secrets.token_hex(2)}"
-                if is_documented(entry, iterations, documented):
-                    continue  # astronomically unlikely; never hand out a documented value
-                taken.add(entry["code_id"])
-                oc.setdefault("codes", []).append(entry)
-                minted.append({"code_id": entry["code_id"], "code": code})
-            return {"minted": minted, "dropped": dropped}
+        SC2 D8: the staff_id is bound to the kiosk that first rotates it (master staff registry; another kiosk ->
+        409 STAFF_ID_TAKEN, and its codes only reach that kiosk's bundle); at most MAX_ACTIVE_CODES_PER_STAFF
+        active codes per staff_id (422 TOO_MANY_ACTIVE_CODES). New codes have thresholds code_length digits.
+        Logic: override_codes.rotate_codes."""
+        return override_codes.rotate_codes(self, staff_id, count, documented=load_documented_override_values(),
+                                           replace_existing=replace_existing, kiosk_id=kiosk_id, actor=actor,
+                                           audit_meta=audit_meta)
 
-        version, out = self.publish(_m, f"admin:codes:rotate:{staff_id}", meta={"actor": actor, "kiosk_id": kiosk_id})
-        live = {str(c.get("code_id")) for c in (self.current()["doc"].get("override_codes") or {}).get("codes") or []}
-        if not all(m["code_id"] in live for m in out["minted"]):  # defence in depth: publish-time hygiene
-            raise BundleRejected("INTERNAL", "minted codes did not survive publication; nothing handed out")
-        self.audit("CODES_ROTATE", kiosk_id=kiosk_id, actor=actor, staff_id=staff_id, bundle_version=version,
-                   minted_code_ids=[m["code_id"] for m in out["minted"]], dropped_code_ids=out["dropped"])
-        return {"staff_id": staff_id, "bundle_version": version, "codes": out["minted"],
-                "dropped_code_ids": out["dropped"], "code_length": length, "valid_until": valid_until,
-                "one_time": True,
-                "warning": "Shown once: store these codes safely (each works once, for this staff_id only). The cloud "
-                           "keeps only PBKDF2 hashes; kiosks get them with the next bundle refresh."}
+    def consume_code(self, code_id: str, *, kiosk_id: str, attempt_id: str) -> int | None:
+        """A synced STAFF_OVERRIDE ALLOW used `code_id`: drop it from the master and list it in the signed
+        `consumed_code_ids` of every bundle until its original valid_until (other kiosks / older copies can never
+        honour it again). Returns the new bundle_version, or None when it was already consumed.
+        Logic: override_codes.consume_code."""
+        return override_codes.consume_code(self, code_id, kiosk_id=kiosk_id, attempt_id=attempt_id)
+
+    def code_owner(self, code_id: str, doc: dict | None = None) -> str | None:
+        """staff_id a known code was minted for (master codes or the consumed list); None when unknown."""
+        return override_codes.code_owner(doc if doc is not None else self.current()["doc"], code_id)
+
+    def code_kiosk(self, code_id: str, doc: dict | None = None) -> str | None:
+        """Owner kiosk of a known code's staff_id (staff registry); None when unknown or unregistered."""
+        return override_codes.code_kiosk(doc if doc is not None else self.current()["doc"], code_id)
 
     def revocations_since(self, since: int) -> tuple[int, list[dict]]:
-        items = [it for _, it in self.kv.list(NS_REV) if int(it.get("seq", 0)) > since]
-        items.sort(key=lambda it: int(it["seq"]))
+        """(watermark, events with since < seq <= watermark). The watermark is the highest seq up to which every
+        event is visible, NOT the counter (F1): a seq allocated by an in-flight publish whose event is not written
+        yet would otherwise be skipped forever (the edge keeps max(seq)). A gap older than FEED_GAP_GRACE_S is a
+        burnt seq and is stepped over. Key-range read: only keys after `since` are fetched."""
+        items = sorted((it for _, it in self.kv.list(NS_REV, start=f"{since + 1:012d}")
+                        if int(it.get("seq", 0)) > since), key=lambda it: int(it["seq"]))
+        now = self.clock.now()
+        mark, out = since, []
         for it in items:
+            seq = int(it["seq"])
+            if seq != mark + 1 and self._recent_event(it, now):
+                break
             it.pop("_rev", None)
-        return self.revocation_seq(), items
+            mark = seq
+            out.append(it)
+        return mark, out
+
+    @staticmethod
+    def _recent_event(it: dict, now: datetime) -> bool:
+        try:
+            return (now - parse_ts(str(it.get("published_at")))).total_seconds() < FEED_GAP_GRACE_S
+        except ValueError:
+            return False  # seeded / legacy events carry no published_at: old by definition
 
     # ------------------------------------------------------------------ bundles
     def bundle_times(self) -> tuple[datetime, datetime]:
@@ -980,20 +1129,48 @@ class ScheduleService:
         ttl_h = min(self.s.bundle_ttl_hours, self.t.bundle_max_staleness_hours)
         return issued, issued + timedelta(hours=ttl_h)
 
+    def _issue_times(self, kiosk_id: str, version: int) -> tuple[datetime, datetime]:
+        """Stamps of this kiosk's bundle: the previous issue is reused while it is the same version and younger than
+        ttl/2 (stable ETag -> 304); otherwise a fresh issue (issued_at = now) is recorded and served (200), so an
+        online kiosk never ages towards expiry on 304s (EO-01)."""
+        issued, expires = self.bundle_times()
+        half = (expires - issued) / 2
+        try:
+            last = self.kv.get(NS_BUNDLE_ISSUE, kiosk_id)
+        except Exception:  # noqa: BLE001 - store hiccup: a fresh issue is always safe
+            last = None
+        if last and int(last.get("version", -1)) == version:
+            try:
+                prev_issued, prev_expires = parse_ts(str(last["issued_at"])), parse_ts(str(last["expires_at"]))
+            except (KeyError, ValueError):
+                prev_issued = None
+            if prev_issued is not None and timedelta(0) <= issued - prev_issued < half:
+                return prev_issued, prev_expires
+        try:
+            self.kv.put(NS_BUNDLE_ISSUE, kiosk_id, {"version": version, "issued_at": iso_z(issued),
+                                                    "expires_at": iso_z(expires)},
+                        ttl=epoch_s(expires) + 86400)
+        except Exception:  # noqa: BLE001 - only the ETag stability suffers
+            log.warning("bundle issue record for %s not written", kiosk_id)
+        return issued, expires
+
     def signed_bundle(self, kiosk_id: str) -> tuple[dict, str]:
-        """Signed per-kiosk bundle + ETag. ETag = '"<bundle_version>"' (content version; the stamps
-        change on every issue, so If-None-Match with the same version -> 304)."""
+        """Signed per-kiosk bundle + ETag (bundle_etag: version + issued_at). Within ttl/2 of the last issue of the
+        same version the same stamps are re-used (deterministic signature, same ETag, If-None-Match -> 304)."""
         rec = self.current()
         if kiosk_id not in (rec["doc"].get("kiosks") or {}):
             raise UnknownKiosk(kiosk_id)
         uploaded = self._stored_bundle(kiosk_id, int(rec["version"]))
         if uploaded is not None:
-            return copy.deepcopy(uploaded), f'"{uploaded["bundle_version"]}"'
+            return copy.deepcopy(uploaded), bundle_etag(uploaded)
         bundle = filter_for_kiosk(rec["doc"], kiosk_id)
         strip_documented_codes(bundle)  # every re-sign: OVR-001..003 never get a signature
-        issued, expires = self.bundle_times()
+        issued, expires = self._issue_times(kiosk_id, int(rec["version"]))
         bundle["issued_at"] = iso_z(issued)
         bundle["expires_at"] = iso_z(expires)
+        consumed = consumed_ids(rec["doc"], issued)
+        if consumed:  # signed array; the edge rejects these code ids even from an older cached copy
+            bundle["consumed_code_ids"] = consumed
         # Lead decision: override codes stay usable N h past bundle expiry (expired-cache STAFF_OVERRIDE path);
         # N = thresholds.yaml fallback.staff_override.valid_after_expiry_h (same source as scripts/sign_bundle.py).
         codes_valid_until = iso_z(expires + timedelta(hours=self.t.override_valid_after_expiry_h))
@@ -1001,7 +1178,7 @@ class ScheduleService:
             if isinstance(code, dict):
                 code["valid_until"] = codes_valid_until
         signed = sign_bundle(bundle, self.s.schedule_bundle_hmac_key, self.s.bundle_key_id)
-        return signed, f'"{bundle["bundle_version"]}"'
+        return signed, bundle_etag(signed)
 
     # ------------------------------------------------------------------ evaluation (shared code)
     def evaluate(self, user_id: str, zone: str, t0: datetime, doc: dict | None = None) -> str:

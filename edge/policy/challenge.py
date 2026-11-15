@@ -2,6 +2,16 @@
 
 Exactly one deformation action (SMILE | OPEN_MOUTH | PUFF_CHEEKS, mandatory - eye-cut paper masks
 can blink) + one of BLINK | TURN_LEFT | TURN_RIGHT, random order. Never blink-only.
+
+KNOWN LIMITATION (audit F01, architectural, NOT fixed here): verification judges ActionEvidence that the kiosk
+client measured and asserts (blendshape peaks, timings, landmark shift, same_track). The edge binds it to the
+issued challenge_id / nonce / TTL and checks identity of the last challenge frame against the candidate, but it
+does not itself measure the deformation or blink, nor run PAD / device / moire on the challenge frames. A modified
+kiosk page or a local process on the kiosk host can therefore forge a passing challenge (the kiosk API binds
+127.0.0.1 only; RBAC v2 A treats the kiosk OS account as trusted). Proper fix (RBAC v2 H, deferred): compute
+landmarks / blendshapes server-side from the uploaded challenge frames bound to the nonce timing, run the
+liveness stack on them, raise challenge.min_identity_cosine to the allow bar and authenticate the kiosk client.
+Until then a passed CHALLENGE must not be described as server-verified liveness.
 """
 
 from __future__ import annotations

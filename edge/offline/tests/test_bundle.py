@@ -17,6 +17,7 @@ from edge.policy.tests.builders import (
 )
 
 NOW = datetime(2026, 11, 14, 4, 35, tzinfo=UTC)
+# key_id=None: fixtures mix sign_bundle (demo-k1) and builders.sign_fixture_bundle (test-k1); pinning is tested in test_os_bundle.py
 
 
 def test_canonical_form_matches_the_documented_one():
@@ -48,7 +49,7 @@ def store(tmp_path, bundle=None, kiosk="KIOSK_LIB_01"):
     if bundle is not None:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(bundle), encoding="utf-8")
-    return BundleStore(p, TEST_BUNDLE_KEY, kiosk)
+    return BundleStore(p, TEST_BUNDLE_KEY, kiosk, key_id=None)
 
 
 def test_boot_with_valid_file_has_lvb_but_no_refresh(tmp_path):
@@ -134,7 +135,7 @@ def test_store_written_atomically_and_reloadable(tmp_path):
     s = store(tmp_path, None)
     b = sign_bundle(load_example_bundle(), TEST_BUNDLE_KEY)
     assert s.install(b, NOW)[0]
-    s2 = BundleStore(tmp_path / "bundle.signed.json", TEST_BUNDLE_KEY, "KIOSK_LIB_01")
+    s2 = BundleStore(tmp_path / "bundle.signed.json", TEST_BUNDLE_KEY, "KIOSK_LIB_01", key_id=None)
     assert s2.lvb == b and not list(tmp_path.glob(".bundle-*"))
 
 

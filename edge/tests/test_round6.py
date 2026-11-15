@@ -31,13 +31,14 @@ from fastapi.testclient import TestClient
 
 from edge.config import PROJECT_ROOT
 from edge.tests.conftest import requires_models
+from edge.tests.contract_cloud import staff_headers
 
 KIOSK = "KIOSK_MAIN_01"
 BUNDLE_KEY = "round6-bundle-key"
 EDGE_ADMIN = "round6-edge-admin"
 CLOUD_ADMIN = "round6-cloud-admin"
 ADMIN = {"X-Admin-Token": EDGE_ADMIN}
-CLOUD_URL = "http://fake-cloud.test"
+CLOUD_URL = "https://fake-cloud.test"  # EAE-07: plain http is refused unless DEMO_MODE=1
 PLAINTEXT_CODES = ["OVR-7Q2K-91XZ", "OVR-M4P8-0TRA"]
 
 
@@ -71,7 +72,9 @@ class FakeCloudServer:
             raise httpx.ConnectError("fake cloud down", request=request)
         m, path = request.method, request.url.path
         body = json.loads(request.content) if request.content else None
-        self.requests.append({"method": m, "path": path, "headers": dict(request.headers), "json": body})
+        rid = body.pop("request_id", None) if isinstance(body, dict) else None  # probe 10b per-call nonce
+        self.requests.append({"method": m, "path": path, "headers": dict(request.headers), "json": body,
+                              "request_id": rid})
         for (fm, fp), (status, fbody, fh) in self.fail.items():
             if fm == m and path.startswith(fp):
                 return httpx.Response(status, json=fbody, headers=fh)
@@ -225,7 +228,7 @@ def test_access_put_applies_role_and_hours_within_the_request(online):
     assert ctx.runtime.user_info("u_3c4d")["role"] == "faculty"  # the next decision uses the new role
     assert out["user"]["extra_windows"]["MAIN_GATE"][0]["end"] == "23:30" and out["user"]["bundle_role"] == "faculty"
     sent = fake.calls("PUT", "/v1/admin/users/u_3c4d/access")[-1]
-    assert sent["json"] == upd and sent["headers"]["x-admin-token"] == CLOUD_ADMIN
+    assert sent["json"] == {**upd, "actor": "legacy:admin_token"} and sent["headers"]["x-admin-token"] == CLOUD_ADMIN
     # "Add user": a new user_id is forwarded the same way (the cloud creates it)
     r2 = c.put("/v1/admin/access/users/u_n3w1", json={"role": "staff", "display": "New Staff", "consent": True},
                headers=ADMIN)
@@ -262,7 +265,7 @@ def test_access_put_bad_user_id_and_zone_check_left_to_the_cloud(online):
     # R-H: the edge bundle is filtered to MAIN_GATE, so a LIBRARY window is forwarded (the cloud validates zones)
     ok = {"role": "student", "extra_windows": {"LIBRARY": [{"days": ["SUN"], "start": "20:00", "end": "23:59"}]}}
     assert c.put("/v1/admin/access/users/u_3c4d", json=ok, headers=ADMIN).status_code == 200
-    assert fake.calls("PUT", "/v1/admin/users/u_3c4d/access")[-1]["json"] == ok
+    assert fake.calls("PUT", "/v1/admin/users/u_3c4d/access")[-1]["json"] == {**ok, "actor": "legacy:admin_token"}
 
 
 def test_access_changes_offline_are_503_and_the_view_is_bundle_only(online):
@@ -271,7 +274,8 @@ def test_access_changes_offline_are_503_and_the_view_is_bundle_only(online):
     r = c.put("/v1/admin/access/users/u_3c4d", json={"role": "faculty"}, headers=ADMIN)
     assert r.status_code == 503 and r.json()["error"]["code"] == "CLOUD_UNAVAILABLE"
     assert r.json()["error"]["reason"] == "OFFLINE"
-    assert c.post("/v1/admin/access/codes/rotate", json={"staff_id": "s_guard01"}, headers=ADMIN).status_code == 503
+    guard = staff_headers(_ctx, "guard01", ["security_officer"])  # RBAC v2 D: codes need a staff session
+    assert c.post("/v1/admin/access/codes/rotate", json={"staff_id": "s_guard01"}, headers=guard).status_code == 503
     assert c.post("/v1/admin/access/users/u_3c4d/revoke", headers=ADMIN).status_code == 503
     view = c.get("/v1/admin/access/users", headers=ADMIN).json()
     assert view["source"] == "bundle" and view["read_only"] is True and view["read_only_code"] == "OFFLINE"
@@ -284,14 +288,16 @@ def test_access_changes_offline_are_503_and_the_view_is_bundle_only(online):
 def test_codes_rotate_returns_plaintext_once_no_store_never_logged(online, caplog):
     c, _ctx, fake = online
     with caplog.at_level(logging.DEBUG):
-        r = c.post("/v1/admin/access/codes/rotate", json={"staff_id": "s_guard01", "count": 2}, headers=ADMIN)
+        r = c.post("/v1/admin/access/codes/rotate", json={"staff_id": "s_guard01", "count": 2},
+                   headers=staff_headers(_ctx, "guard01", ["security_officer"]))
     assert r.status_code == 200, r.text
     assert r.headers["cache-control"] == "no-store"
     # R-D: FLAT codes (an old cloud's plain strings are wrapped with code_id null), applied once installed
     assert [x["code"] for x in r.json()["codes"]] == PLAINTEXT_CODES and r.json()["bundle"]["applied"] is True
     assert "cloud" not in r.json() and r.json()["one_time"] is True
     assert fake.calls("POST", "/v1/admin/codes/rotate")[-1]["json"] == {"staff_id": "s_guard01", "count": 2,
-                                                                        "replace_existing": True}
+                                                                        "replace_existing": True,
+                                                                        "actor": "staff:s_guard01"}
     assert not any(code in caplog.text for code in PLAINTEXT_CODES)
     for bad in ({"staff_id": "guard"}, {"staff_id": "s_g"}, {"staff_id": "s_Guard01"}, {"staff_id": "s_guard01",
                                                                                          "count": 11}):
@@ -303,7 +309,8 @@ def test_revoke_forwards_admin_reason_and_refuses_erased(online):
     r = c.post("/v1/admin/access/users/u_3c4d/revoke", headers=ADMIN)
     assert r.status_code == 200, r.text
     assert fake.calls("POST", "/v1/admin/revocations")[-1]["json"] == {"type": "USER", "target_id": "u_3c4d",
-                                                                       "reason": "ADMIN"}  # never `force`
+                                                                       "reason": "ADMIN",
+                                                                       "actor": "legacy:admin_token"}  # never `force`
     assert r.json()["type"] == "USER" and r.json()["reason"] == "ADMIN"
     assert c.post("/v1/admin/access/users/u_3c4d/revoke", json={"reason": "ERASED"}, headers=ADMIN).status_code == 422
 
@@ -524,8 +531,9 @@ def test_erased_user_can_re_enrol_and_the_erasure_entry_is_cleared(online_models
 
     c, ctx, _ = online_models
     rt = ctx.runtime
+    # EAE-11: the erasure predates the installed bundle (issued 02:30Z), which no longer carries it = re-admitted
     rt.overlay.apply({"items": [{"type": "USER", "target_id": "u_3c4d", "reason": "ERASED",
-                                 "revoked_at": "2026-11-14T04:00:00Z"}], "revocation_seq": 7})
+                                 "revoked_at": "2026-11-14T02:00:00Z"}], "revocation_seq": 7})
     rt._erased.add("u_3c4d")
     assert is_revoked(ctx, "u_3c4d") is False
     r = _enrol(c)

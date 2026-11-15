@@ -1,5 +1,8 @@
 /** Small dashboard primitives (light theme for projector legibility). */
 import { useState, type ReactNode } from 'react'
+import { useAuth } from '../shared/auth/context'
+import { authErrorText } from '../shared/auth/authErrorText'
+import { needsText } from '../shared/auth/permissions'
 
 export function Card({ title, actions, children, className = '' }: { title: string; actions?: ReactNode; children: ReactNode; className?: string }) {
   return (
@@ -30,25 +33,33 @@ const TONES: Record<Tone, string> = {
   danger: 'bg-[#d03b3b] text-white hover:bg-[#b83232]',
 }
 
-/** Button that runs an async action, shows busy state and the last result/error inline. */
+/**
+ * Button that runs an async action, shows busy state and the last result/error inline. `perm`: the edge
+ * permission the action needs; without it the button is disabled with "Needs <perm>" (the edge enforces it too).
+ */
 export function ActionButton({
   label,
   run,
   tone = 'default',
   disabled = false,
+  perm,
 }: {
   label: string
   run: () => Promise<unknown>
   tone?: Tone
   disabled?: boolean
+  perm?: string
 }) {
+  const { can } = useAuth()
+  const allowed = !perm || can(perm)
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null)
   return (
     <span className="inline-flex flex-col items-start gap-1">
       <button
         type="button"
-        disabled={busy || disabled}
+        disabled={busy || disabled || !allowed}
+        title={allowed ? undefined : needsText(perm ?? '')}
         onClick={async () => {
           setBusy(true)
           setMsg(null)
@@ -56,7 +67,7 @@ export function ActionButton({
             const r = await run()
             setMsg({ ok: true, text: summarise(r) })
           } catch (e) {
-            setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) })
+            setMsg({ ok: false, text: authErrorText(e) })
           } finally {
             setBusy(false)
           }
@@ -65,6 +76,7 @@ export function ActionButton({
       >
         {busy ? '…' : label}
       </button>
+      {!allowed ? <span className="text-xs text-[#8a6d00]">{needsText(perm ?? '')}</span> : null}
       {msg ? (
         <span className={`max-w-[22rem] truncate text-xs ${msg.ok ? 'text-[#006300]' : 'text-[#d03b3b]'}`} title={msg.text}>
           {msg.ok ? 'OK' : 'Error'}
@@ -83,4 +95,14 @@ function summarise(r: unknown): string {
   } catch {
     return String(r)
   }
+}
+
+/** Card body shown instead of a panel the principal may not use. */
+export function NeedsCard({ title, perm, children }: { title: string; perm: string; children?: ReactNode }) {
+  return (
+    <Card title={title}>
+      <p className="text-sm text-[#8a6d00]">{needsText(perm)}</p>
+      {children}
+    </Card>
+  )
 }

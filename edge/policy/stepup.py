@@ -8,6 +8,7 @@ attempts_left = submissions still allowed for the pending step, including the ne
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -196,8 +197,14 @@ def resolve_fallback(s: StepUpSession, sub: FallbackSubmission, now: datetime, c
     T = cfg.for_mode(s.mode)
     ok, info = False, None
     if sub.method in s.methods:  # method not offered -> failure without verification (R8)
-        res = verifier.verify(sub, s.origin.candidate_user_id, s.mode, now, wall_now=wall)
+        res = verifier.verify(sub, s.origin.candidate_user_id, s.mode, now, wall_now=wall, zone=s.origin.zone,
+                              kiosk_id=s.origin.kiosk_id)
         ok, info = res.ok, res.fallback
+        if not ok and res.locked_until is not None:  # KF-03: locked method -> not a factor failure, say so
+            d = current_decision(s, cfg, extra_codes=("FALLBACK_LOCKED",), now=wall)
+            wait = max(1, math.ceil((res.locked_until - now).total_seconds()))
+            d = replace(d, next_action=replace(d.next_action, retry_after_s=wait))
+            return replace(s, last=d), d
     if not ok:
         s = replace(s, factor_failures=s.factor_failures + 1)
         if s.factor_failures < int(T.stepup.max_attempts_per_step):  # R8

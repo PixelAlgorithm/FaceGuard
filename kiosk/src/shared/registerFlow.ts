@@ -7,11 +7,14 @@
  *  2. POST /v1/enroll (meta without a role: the role always comes from the signed schedule);
  *  3. cloud_state / warnings[] are turned into notes (failed = blocking-style, skipped_offline = offline note).
  * Offline, people already in the installed bundle can still enrol; new people cannot be registered.
+ * RBAC (design v2 §B): step 1 needs access:edit (not held by the enroller role); without it the flow stops
+ * before any write with "Ask an admin to add <user_id> to the schedule". The audit actor is set by the edge
+ * from the signed-in principal; the `actor` field below is a hint the edge ignores.
  */
 import { getApi } from '../api'
 import { asApiError, type EnrollMeta, type EnrollResponse } from '../api/types'
 import { applyAccess, errorText, versionText, notifyAccessChanged, type ApplyOutcome, type Identity } from './accessDirectory'
-import { registerPlan, type RegisterPlan } from './accessRules'
+import { askAdminText, gatePlan, registerPlan, type RegisterPlan } from './accessRules'
 
 export const CONSENT_VERSION = '2026-11-14.v1'
 
@@ -80,12 +83,13 @@ export function enrolNotes(r: EnrollResponse): Note[] {
 /**
  * Run the R-A flow for one person. `who` is the person's directory entry (null = unknown everywhere);
  * `online` = schedule writes possible now (AccessDirectory.canEdit); `listLoaded` = the Users & Access list
- * is loaded (without it the kiosk cannot know the schedule state and lets the edge decide at enrolment).
+ * is loaded (without it the kiosk cannot know the schedule state and lets the edge decide at enrolment);
+ * `canEditAccess` = the signed-in principal holds access:edit (default true for legacy callers).
  */
 export async function registerPerson(
   token: string,
   who: Identity | null,
-  ctx: { online: boolean; listLoaded: boolean },
+  ctx: { online: boolean; listLoaded: boolean; canEditAccess?: boolean },
   input: RegisterInput,
 ): Promise<RegisterOutcome> {
   const api = getApi()
@@ -101,8 +105,11 @@ export async function registerPerson(
       )
     : { kind: 'enrol', role: who?.bundle_role ?? who?.role ?? '' }
   if (input.forceReadmit && online && plan.kind !== 'blocked') plan = { kind: 'put-then-enrol', readmit: true, create: false }
+  plan = gatePlan(plan, ctx.canEditAccess ?? true)
   if (plan.kind === 'blocked') {
-    return { ...base, ok: false, stage: 'plan', plan, error: BLOCKED_TEXT[plan.why], reason: plan.why === 'REVOKED' ? 'USER_REVOKED' : plan.why === 'OFFLINE' ? 'OFFLINE' : null }
+    const error = plan.why === 'NEEDS_ACCESS_EDIT' ? askAdminText(input.userId) : BLOCKED_TEXT[plan.why]
+    const reason = plan.why === 'REVOKED' ? 'USER_REVOKED' : plan.why === 'OFFLINE' || plan.why === 'NEEDS_ACCESS_EDIT' ? plan.why : null
+    return { ...base, ok: false, stage: 'plan', plan, error, reason }
   }
 
   let apply: ApplyOutcome | null = null

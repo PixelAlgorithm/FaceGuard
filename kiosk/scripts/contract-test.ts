@@ -60,6 +60,22 @@ import {
   validUntilText,
   versionText,
 } from '../src/shared/accessRules.ts'
+import {
+  parseApiKeyCreated,
+  parseApiKeyList,
+  parseAuthAuditPage,
+  parseAuthMe,
+  parseAuthStatus,
+  parseLoginResult,
+  parseMfaEnrolment,
+  parseRolesCatalog,
+  parseStaffItem,
+  parseStaffList,
+} from '../src/api/authParse.ts'
+import { activityHeaders, authHeaders, credentialError, noteUserInput, shouldSignOutOn401 } from '../src/api/credentials.ts'
+import { normalizeMode } from '../src/api/normalize.ts'
+import { storeIntegrity } from '../src/admin/storeIntegrity.ts'
+import { EDGE_ROUTE_PERMISSION, PERM } from '../src/shared/auth/permissions.ts'
 
 type Obj = Record<string, unknown>
 interface Example {
@@ -72,13 +88,27 @@ interface Example {
 interface Route {
   id: string
   side: string
+  method: string
+  path: string
+  permission?: string | null
+  permission_any_of?: string[]
   examples: Example[]
   errors: Example[]
+}
+interface AuthRoute extends Route {
+  response_headers?: Record<string, string>
 }
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const file = path.resolve(here, process.env.HID_CONTRACT_JSON ?? '../../docs/contracts/admin_access.examples.json')
-const doc = JSON.parse(readFileSync(file, 'utf8')) as { api_version: string; field_limits: Obj; enums: Record<string, string[]>; routes: Route[] }
+const doc = JSON.parse(readFileSync(file, 'utf8')) as {
+  api_version: string
+  field_limits: Obj
+  enums: Record<string, string[]>
+  routes: Route[]
+  auth: Record<string, Obj>
+  auth_routes: AuthRoute[]
+}
 
 let passed = 0
 const failures: string[] = []
@@ -280,6 +310,97 @@ check('M2 versionText(null) = pending refresh', versionText(null) === 'pending r
 check('M2 bundleApplied: failed pull is never applied', !bundleApplied({ result: 'failed', installed_version: 99 }, null))
 check('M2 bundleApplied: unknown version + successful pull = applied (edge rule)', bundleApplied({ result: 'not_modified', installed_version: 49 }, null))
 check('M2 bundleApplied: known version must be installed', !bundleApplied({ result: 'installed', installed_version: 49 }, 50) && bundleApplied({ result: 'installed', installed_version: 50 }, 50))
+
+// ---------------------------------------------------------------- RBAC (design v2 §C/§F): per-route permission + auth header contract
+for (const route of [...doc.routes, ...(doc.auth_routes ?? [])]) {
+  check(`route ${route.id} declares a permission (string or null)`, route.permission === null || typeof route.permission === 'string', String(route.permission))
+  if (route.side !== 'edge') continue
+  const kiosk = EDGE_ROUTE_PERMISSION[route.id]
+  check(`route ${route.id}: kiosk gate permission = contract permission`, kiosk === route.permission, `${String(kiosk)} vs ${String(route.permission)}`)
+}
+for (const [id, perm] of Object.entries(EDGE_ROUTE_PERMISSION)) {
+  check(`kiosk permission ${id} is in the contract`, [...doc.routes, ...(doc.auth_routes ?? [])].some((r) => r.id === id), String(perm))
+  if (perm !== null) check(`kiosk permission ${id} uses a PERM constant`, (Object.values(PERM) as string[]).includes(perm), perm)
+}
+const rotateRoute = doc.routes.find((r) => r.id === 'edge.access.codes.rotate')
+check('codes rotate: any of codes:rotate / codes:rotate_any', isDeepStrictEqual(rotateRoute?.permission_any_of, [PERM.codesRotate, PERM.codesRotateAny]))
+for (const k of ['edge_session', 'edge_api_key', 'edge_legacy_admin', 'edge_activity']) check(`auth contract has ${k}`, !!doc.auth?.[k])
+check('auth edge_session header = Authorization', isDeepStrictEqual(doc.auth?.edge_session?.headers, ['Authorization']))
+check('auth edge_activity header = X-FG-Activity', isDeepStrictEqual(doc.auth?.edge_activity?.headers, ['X-FG-Activity']))
+check('authHeaders: fgs_ session -> Bearer', isDeepStrictEqual(authHeaders('fgs_abc'), { Authorization: 'Bearer fgs_abc' }))
+check('authHeaders: fgk_ key -> Bearer', isDeepStrictEqual(authHeaders('fgk_k7q2m9x1.s3cret'), { Authorization: 'Bearer fgk_k7q2m9x1.s3cret' }))
+check('authHeaders: legacy token -> X-Admin-Token', isDeepStrictEqual(authHeaders('legacy-token'), { 'X-Admin-Token': 'legacy-token' }))
+check('authHeaders: empty -> none', isDeepStrictEqual(authHeaders(''), {}))
+check('KAO-12 credentialError: smart quote rejected', credentialError('dummy“token') !== null)
+check('KAO-12 credentialError: space rejected', credentialError('fgs_a b') !== null)
+check('KAO-12 credentialError: normal token ok', credentialError('fgs_Abc-_123') === null)
+check('401 on a session request signs out', shouldSignOutOn401('/v1/admin/staff', 'fgs_x'))
+check('401 on login never signs out', !shouldSignOutOn401('/v1/auth/login', 'fgs_x'))
+check('401 with an API key / legacy token does not sign a session out', !shouldSignOutOn401('/v1/admin/store', 'fgk_k.s') && !shouldSignOutOn401('/v1/admin/store', 'legacy'))
+check('X-FG-Activity on writes', isDeepStrictEqual(activityHeaders('POST', 0), { 'X-FG-Activity': '1' }))
+check('no X-FG-Activity on an idle GET poll', isDeepStrictEqual(activityHeaders('GET', 10_000_000), {}))
+noteUserInput(20_000_000)
+check('X-FG-Activity on a GET right after user input', isDeepStrictEqual(activityHeaders('GET', 20_000_400), { 'X-FG-Activity': '1' }))
+check('no X-FG-Activity on a GET 5 s after input', isDeepStrictEqual(activityHeaders('GET', 20_005_000), {}))
+
+const AUTH_PARSERS: Record<string, (b: unknown) => unknown> = {
+  'edge.auth.status': parseAuthStatus,
+  'edge.auth.login': parseLoginResult,
+  'edge.auth.me': parseAuthMe,
+  'edge.auth.mfa.enroll': parseMfaEnrolment,
+  'edge.auth.password': (b) => b,
+  'edge.admin.staff.list': (b) => ({ items: parseStaffList(b) }),
+  'edge.admin.staff.create': (b) => ({ item: parseStaffItem(b) }),
+  'edge.admin.staff.patch': (b) => ({ item: parseStaffItem(b) }),
+  'edge.admin.api_keys.list': (b) => ({ items: parseApiKeyList(b) }),
+  'edge.admin.api_keys.create': parseApiKeyCreated,
+  'edge.admin.roles': parseRolesCatalog,
+  'edge.admin.auth.audit': parseAuthAuditPage,
+}
+for (const route of doc.auth_routes ?? []) {
+  const parse = AUTH_PARSERS[route.id]
+  check(`auth route ${route.id} has a kiosk parser`, !!parse)
+  if (!parse) continue
+  for (const ex of route.examples) {
+    const parsed = attempt(`${route.id} / ${ex.name}: parse`, () => parse(ex.response.body))
+    if (parsed !== undefined) check(`${route.id} / ${ex.name}: parse(body) deep-equals body`, isDeepStrictEqual(parsed, ex.response.body), diff(parsed, ex.response.body))
+  }
+  for (const ex of route.errors) {
+    const b = ex.response.body as { error: Obj }
+    const err = apiErrorFromBody(ex.response.status, ex.response.body)
+    check(`${route.id} / error ${ex.name}: code`, err.code === b.error.code, `${err.code} vs ${String(b.error.code)}`)
+    check(`${route.id} / error ${ex.name}: reason`, err.reason === ((b.error.reason as string | undefined) ?? null))
+    if ('mfa_ticket' in b.error) check(`${route.id} / error ${ex.name}: mfa_ticket kept`, err.extra.mfa_ticket === b.error.mfa_ticket)
+    if ('required' in b.error) check(`${route.id} / error ${ex.name}: required kept`, isDeepStrictEqual(err.extra.required, b.error.required))
+    if ('problems' in b.error) check(`${route.id} / error ${ex.name}: problems kept`, isDeepStrictEqual(err.extra.problems, b.error.problems))
+    if ('retry_after_s' in b.error) check(`${route.id} / error ${ex.name}: retry_after_s kept`, err.extra.retry_after_s === b.error.retry_after_s)
+  }
+}
+const loginFake = { token: 'not-a-session', token_type: 'Bearer', principal: {} }
+check('login: a non-fgs_ token is rejected', attempt('strict login', () => { try { parseLoginResult(loginFake); return false } catch { return true } }) === true)
+check(
+  'principal without permissions is rejected (never invent permissions)',
+  attempt('strict principal', () => { try { parseAuthMe({ principal: { kind: 'staff', id: 's_x', roles: [] } }); return false } catch { return true } }) === true,
+)
+check('auth status: unknown store state shown as UNAVAILABLE', parseAuthStatus({ store: 'WEIRD' }).store === 'UNAVAILABLE')
+
+// ---------------------------------------------------------------- KAO-04: enrol response with a cloud transport failure
+const transport = exBody('edge.enroll.post', 'cloud_transport_failed')
+check('KAO-04 contract has edge.enroll.post / cloud_transport_failed', !!transport && (transport.cloud as Obj | undefined)?.status === null)
+const transportParsed = attempt('KAO-04 parseEnroll(cloud transport failure)', () => parseEnroll(transport))
+check('KAO-04 parseEnroll keeps the committed enrolment + error', !!transportParsed && isDeepStrictEqual(transportParsed, transport), diff(transportParsed, transport))
+
+// ---------------------------------------------------------------- KAO-07: offline store integrity banner
+check('KAO-07 chain_ok false -> integrity FAIL', storeIntegrity({ chain_ok: false, chain_bad_seq: [3], records: [] }).ok === false)
+check('KAO-07 UNDECRYPTABLE row -> integrity FAIL', storeIntegrity({ chain_ok: true, records: [{ seq: 1, error: 'UNDECRYPTABLE (tampered)' }] }).ok === false)
+check('KAO-07 missing chain_ok -> not verified (never PASS)', storeIntegrity({ records: [{ seq: 1 }] }).ok === null)
+check('KAO-07 intact chain -> ok', storeIntegrity({ chain_ok: true, chain_bad_seq: [], records: [{ seq: 1 }] }).ok === true)
+
+// ---------------------------------------------------------------- KAO-09: unknown mode is never shown as ONLINE / 0 queued
+const unknownMode = normalizeMode({ mode: null })
+check('KAO-09 unknown mode -> OFFLINE (fail-safe)', unknownMode.mode === 'OFFLINE' && unknownMode.reason === 'mode_unknown', JSON.stringify([unknownMode.mode, unknownMode.reason]))
+check('KAO-09 missing sync_queue_depth -> null (not 0)', unknownMode.sync_queue_depth === null)
+check('KAO-09 ONLINE stays ONLINE', normalizeMode({ mode: 'ONLINE', sync_queue_depth: 2 }).mode === 'ONLINE' && normalizeMode({ mode: 'ONLINE', sync_queue_depth: 2 }).sync_queue_depth === 2)
 
 function diff(a: unknown, b: unknown, p = ''): string {
   if (isDeepStrictEqual(a, b)) return ''

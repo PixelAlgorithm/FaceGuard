@@ -197,13 +197,40 @@ def _median_stack(z: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------------- geometry helpers
+# Physical plausibility of camera intrinsics (input validation, not a decision threshold): the focal length
+# lies between 0.2x and 5x the reference size (horizontal FOV ~ 137 deg .. 11 deg), fx/fy within 2x of each
+# other, the principal point inside the reference image, the reference size inside the protocol frame limits.
+# Anything else is a malformed or forged upload: back-projection would overflow (svd spins forever, DE-03) or
+# make the plane/quadric fits meaningless (DE-05).
+INTRINSICS_FOCAL_MIN_RATIO = 0.2
+INTRINSICS_FOCAL_MAX_RATIO = 5.0
+INTRINSICS_ASPECT_MAX_RATIO = 2.0
+INTRINSICS_REF_MIN_PX = 8.0
+INTRINSICS_REF_MAX_PX = 8192.0
+
+
+def intrinsics_plausible(fx: float, fy: float, cx: float, cy: float, ref_w: float, ref_h: float) -> bool:
+    """True when the pinhole intrinsics (at reference size ref_w x ref_h) can describe a real camera."""
+    vals = (fx, fy, cx, cy, ref_w, ref_h)
+    if not all(isinstance(t, (int, float)) and math.isfinite(t) for t in vals):
+        return False
+    if not all(INTRINSICS_REF_MIN_PX <= r <= INTRINSICS_REF_MAX_PX for r in (ref_w, ref_h)):
+        return False
+    lo, hi = INTRINSICS_FOCAL_MIN_RATIO, INTRINSICS_FOCAL_MAX_RATIO
+    if not (lo * ref_w <= fx <= hi * ref_w and lo * ref_h <= fy <= hi * ref_h):
+        return False
+    if not (1.0 / INTRINSICS_ASPECT_MAX_RATIO <= fx / fy <= INTRINSICS_ASPECT_MAX_RATIO):
+        return False
+    return 0.0 <= cx <= ref_w and 0.0 <= cy <= ref_h
+
+
 @dataclass(frozen=True)
 class _Cam:
     fx: float
     fy: float
     cx: float
     cy: float
-    source: str  # "intrinsics" | "default_fov"
+    source: str  # "intrinsics" | "estimated_fov" (phone FOV guess: no D4) | "default_fov"
 
     def backproject(self, u: Any, v: Any, z: Any) -> np.ndarray:
         u, v, z = (np.asarray(t, dtype=np.float64) for t in (u, v, z))
@@ -220,10 +247,10 @@ def _camera(intrinsics: Any, width: int, height: int, algo: Mapping[str, float])
             fx, fy, cx, cy = (float(intrinsics[k]) for k in ("fx", "fy", "cx", "cy"))
             rw = float(intrinsics.get("ref_width") or width)
             rh = float(intrinsics.get("ref_height") or height)
-            vals = (fx, fy, cx, cy, rw, rh)
-            if all(math.isfinite(t) for t in vals) and fx > 0 and fy > 0 and rw > 0 and rh > 0:
+            if intrinsics_plausible(fx, fy, cx, cy, rw, rh):
                 sx, sy = width / rw, height / rh
-                return _Cam(fx * sx, fy * sy, cx * sx, cy * sy, "intrinsics")
+                source = "estimated_fov" if intrinsics.get("estimated") else "intrinsics"
+                return _Cam(fx * sx, fy * sy, cx * sx, cy * sy, source)
         except (KeyError, TypeError, ValueError):
             pass
     f = (width / 2.0) / math.tan(math.radians(float(algo["default_hfov_deg"])) / 2.0)
@@ -488,6 +515,9 @@ def _prepare(
         prep.reason = "TOO_FEW_POINTS"
         return prep
     pts = prep.cam.backproject(uu, vv, zz)
+    if not np.isfinite(pts).all():  # never hand inf/NaN to svd (it can spin instead of raising)
+        prep.reason = "NON_FINITE_GEOMETRY"
+        return prep
     plane = _fit_plane(pts, int(algo["fit_iters"]), float(algo["fit_keep"]))
     prep.plane = plane
     prep.d1 = _trimmed_rms(_dot3(pts - plane.c, plane.n), float(algo["rms_trim"]))
@@ -961,6 +991,12 @@ def _num(v: Any) -> float | None:
     return f if math.isfinite(f) else None
 
 
+def _capped(zone: str, v: float | None, ceiling: Any) -> str:
+    """PASS above the configured plausibility ceiling -> UNSURE (mirrors edge/policy/liveness.py, DE-05)."""
+    cap = _num(ceiling)
+    return "UNSURE" if zone == "PASS" and v is not None and cap is not None and v > cap else zone
+
+
 def _zone_gt(v: float | None, fail_below: float, pass_above: float) -> str:
     """FAIL if v < fail; PASS if v > pass; else UNSURE (D1, D2)."""
     if v is None:
@@ -984,24 +1020,26 @@ def classify(signal: Mapping[str, Any], cfg: Any, *, blendshape_moved: bool | No
         checks["d0"] = (
             "FAIL" if d0 < d["d0_valid_fail_below"] else "UNSURE" if d0 < d["d0_valid_pass_min"] else "PASS"
         )
-    checks["d1"] = _zone_gt(
-        _num(signal.get("d1_plane_rms_mm")), d["d1_plane_rms_fail_mm"], d["d1_plane_rms_pass_mm"]
-    )
-    checks["d2"] = _zone_gt(
-        _num(signal.get("d2_quad_rms_mm")), d["d2_quad_rms_fail_mm"], d["d2_quad_rms_pass_mm"]
-    )
+    d1, d2 = _num(signal.get("d1_plane_rms_mm")), _num(signal.get("d2_quad_rms_mm"))
+    checks["d1"] = _capped(_zone_gt(d1, d["d1_plane_rms_fail_mm"], d["d1_plane_rms_pass_mm"]), d1,
+                           d.get("d1_plane_rms_max_mm"))
+    checks["d2"] = _capped(_zone_gt(d2, d["d2_quad_rms_fail_mm"], d["d2_quad_rms_pass_mm"]), d2,
+                           d.get("d2_quad_rms_max_mm"))
     d3 = _num(signal.get("d3_nose_relief_mm"))
     if d3 is not None:
-        checks["d3"] = (
+        zone = (
             "FAIL"
             if d3 < d["d3_nose_relief_fail_mm"]
             else "PASS"
             if d3 >= d["d3_nose_relief_pass_mm"]
             else "UNSURE"
         )
+        checks["d3"] = _capped(zone, d3, d.get("d3_nose_relief_max_mm"))
     d4 = _num(signal.get("d4_ipd_mm"))
-    if d4 is not None and (signal.get("absolute") or not d.get("require_absolute_depth_for_d4", True)):
-        checks["d4"] = "FAIL" if (d4 < d["d4_ipd_min_mm"] or d4 > d["d4_ipd_max_mm"]) else "PASS"
+    d4_required = bool(signal.get("absolute") or not d.get("require_absolute_depth_for_d4", True))
+    if d4_required:  # mirrors edge/policy/liveness.py: required but not measured -> UNSURE, never NA/pass
+        out_of_band = d4 is not None and (d4 < d["d4_ipd_min_mm"] or d4 > d["d4_ipd_max_mm"])
+        checks["d4"] = "UNSURE" if d4 is None else "FAIL" if out_of_band else "PASS"
     mouth, forehead = _num(signal.get("m1_mouth_residual_mm")), _num(signal.get("m1_forehead_residual_mm"))
     if mouth is not None and m:
         if forehead is None or forehead > m["m1_forehead_residual_max_mm"]:
@@ -1036,7 +1074,11 @@ def classify(signal: Mapping[str, Any], cfg: Any, *, blendshape_moved: bool | No
     cues += [
         c for c, k in (("MASK_CUE_EDGE", "m2"), ("MASK_CUE_SHAPE", "m3")) if checks[k] in ("STRONG", "WEAK")
     ]
-    unsure = checks["d0"] == "UNSURE" or any(checks[k] in ("UNSURE", "NA") for k in ("d1", "d2", "d3"))
+    unsure = (
+        checks["d0"] == "UNSURE"
+        or any(checks[k] in ("UNSURE", "NA") for k in ("d1", "d2", "d3"))
+        or checks["d4"] == "UNSURE"
+    )
     deny_count = int(m.get("strong_cue_deny_count", 2)) if m else 2
     if hard or rigid or len(strong) >= deny_count:
         codes = hard + (["MASK_CUE_RIGID"] if rigid else []) + (strong if len(strong) >= deny_count else [])

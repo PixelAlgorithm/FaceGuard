@@ -51,7 +51,9 @@ def test_register_new_faculty_puts_access_first_then_enrols_as_faculty(make_env)
     users = env.c.get("/v1/admin/users", headers=ADMIN).json()["users"]
     assert next(u for u in users if u["user_id"] == "u_kv02")["role"] == "faculty"
     sent = env.cloud.calls("PUT", "/v1/admin/users/u_kv02/access")[-1]
-    assert sent["json"] == {"display": "Prof. Arjun T.", "role": "faculty", "consent": True, "actor": "register"}
+    # RBAC v2 D: the client's actor ("register") is ignored; the edge sends the authenticated principal
+    assert sent["json"] == {"display": "Prof. Arjun T.", "role": "faculty", "consent": True,
+                            "actor": "legacy:admin_token"}
     assert sent["headers"]["x-admin-token"] and sent["headers"]["x-signature"]
 
 
@@ -107,7 +109,7 @@ def test_revoke_then_restore(make_env):
     out = r.json()
     assert out["user"]["status"] == "REVOKED" and out["user"]["today"]["status_now"] == "REVOKED"
     assert env.cloud.calls("POST", "/v1/admin/revocations")[-1]["json"] == {
-        "type": "USER", "target_id": "u_3c4d", "reason": "LOST_BADGE", "actor": "cp"}
+        "type": "USER", "target_id": "u_3c4d", "reason": "LOST_BADGE", "actor": "legacy:admin_token"}
     again = env.c.post("/v1/admin/access/users/u_3c4d/revoke", headers=ADMIN)
     assert again.status_code == 409 and again.json()["error"]["reason"] == "ALREADY_REVOKED"
     reg = env.c.put("/v1/admin/access/users/u_3c4d", json={"role": "student", "consent": True}, headers=ADMIN)

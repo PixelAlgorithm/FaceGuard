@@ -1,8 +1,7 @@
 /** Persistent ONLINE / OFFLINE / SYNCING badge + sync-queue depth from GET /v1/mode. */
 import { MOCK_ENABLED } from '../config'
+import { badgeTone, bundleText, type BadgeTone } from './badgeTone'
 import { useModeStatus } from './modeStore'
-
-type BadgeTone = 'online' | 'degraded' | 'offline' | 'syncing' | 'down' | 'unknown'
 
 const TONE: Record<BadgeTone, { dot: string; label: string; ring: string }> = {
   online: { dot: 'bg-emerald-400', label: 'ONLINE', ring: 'ring-emerald-400/40' },
@@ -10,25 +9,36 @@ const TONE: Record<BadgeTone, { dot: string; label: string; ring: string }> = {
   // are decided locally (OFFLINE rules, P7) and synced later.
   degraded: { dot: 'bg-amber-400', label: 'ONLINE · cloud slow – deciding locally', ring: 'ring-amber-400/50' },
   offline: { dot: 'bg-red-500', label: 'OFFLINE', ring: 'ring-red-500/50' },
+  forced: { dot: 'bg-red-500', label: 'OFFLINE (forced)', ring: 'ring-red-500/50' },
+  // the edge answered but its mode could not be read: treated as OFFLINE (normalizeMode, audit KAO-09)
+  modeUnknown: { dot: 'bg-amber-400', label: 'MODE UNKNOWN – treated as OFFLINE', ring: 'ring-amber-400/50' },
   syncing: { dot: 'bg-amber-400 soft-pulse', label: 'SYNCING', ring: 'ring-amber-400/50' },
   down: { dot: 'bg-zinc-400', label: 'EDGE UNREACHABLE', ring: 'ring-zinc-400/50' },
   unknown: { dot: 'bg-zinc-500 soft-pulse', label: 'CONNECTING', ring: 'ring-zinc-500/40' },
 }
 
-export function ModeBadge({ size = 'lg', showBundle = false }: { size?: 'lg' | 'sm'; showBundle?: boolean }) {
+/**
+ * `bundleVersion`: the installed bundle version from an authenticated source (access list / mode detail);
+ * the public /v1/mode no longer carries it (KA-03), so without it the badge shows the public cache state.
+ */
+export function ModeBadge({
+  size = 'lg',
+  showBundle = false,
+  bundleVersion = null,
+}: {
+  size?: 'lg' | 'sm'
+  showBundle?: boolean
+  bundleVersion?: number | string | null
+}) {
   const { mode, reachable } = useModeStatus()
-  const tone: BadgeTone = !reachable
-    ? 'down'
-    : !mode
-      ? 'unknown'
-      : mode.state === 'SYNCING'
-        ? 'syncing'
-        : mode.state === 'OFFLINE' || mode.mode === 'OFFLINE'
-          ? 'offline'
-          : mode.cloud_match?.degraded
-            ? 'degraded'
-            : 'online'
+  const tone: BadgeTone = badgeTone(
+    mode
+      ? { mode: mode.mode, state: mode.state, forced: mode.forced, reason: mode.reason, degraded: mode.cloud_match?.degraded === true }
+      : null,
+    reachable,
+  )
   const t = TONE[tone]
+  const bundle = bundleText(bundleVersion ?? mode?.schedule_bundle?.version ?? null, mode?.cache_state ?? null)
   const big = size === 'lg'
   const queue = mode?.sync_queue_depth ?? null
   return (
@@ -47,9 +57,7 @@ export function ModeBadge({ size = 'lg', showBundle = false }: { size?: 'lg' | '
           · queue <span className="font-semibold tabular-nums text-white">{queue}</span>
         </span>
       ) : null}
-      {showBundle && mode?.schedule_bundle?.version !== undefined && mode?.schedule_bundle?.version !== null ? (
-        <span className="font-normal text-white/70">· bundle v{String(mode.schedule_bundle.version)}</span>
-      ) : null}
+      {showBundle && bundle ? <span className="font-normal text-white/70">· {bundle}</span> : null}
       {MOCK_ENABLED ? (
         <span className="rounded bg-fuchsia-600 px-2 py-0.5 text-[0.75em] font-bold tracking-wider">MOCK</span>
       ) : null}

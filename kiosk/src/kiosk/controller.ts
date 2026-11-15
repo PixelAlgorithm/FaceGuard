@@ -23,7 +23,7 @@ import {
   type SessionStartRequest,
   type SessionStartResponse,
 } from '../api/types'
-import { THRESHOLDS, UI, clearKioskOverride, getKioskId, kioskIdSource } from '../config'
+import { DEBUG_ENABLED, THRESHOLDS, UI, clearKioskOverride, getKioskId, kioskIdSource } from '../config'
 import { CaptureCancelled, runFlashCapture, type CaptureOutput } from '../capture/attemptCapture'
 import { CameraError, NO_LOCK, lockExposure, restoreExposure, trackSettingsSummary, type ExposureLock } from '../capture/camera'
 import {
@@ -40,7 +40,12 @@ import { grabProbeFrame, sendProbe, type ProbeOutcome } from '../capture/probe'
 import { assessQuality, type Guidance } from '../capture/quality'
 import { epochNow, sleep } from '../capture/time'
 import { CaptureLock } from '../shared/captureLock'
-import { describeDecision, reasonText, triesLeftText, type DecisionCopy } from './reasons'
+import { errorAction, prefetchAllowed } from './errorPolicy'
+import { FallbackFlow } from './fallbackFlow'
+import { once } from './once'
+import { firstValue } from './retry'
+import { userCancelAllowed } from './viewRules'
+import { describeDecision, type DecisionCopy } from './reasons'
 
 export interface ClientTiming {
   sessionStartMs: number | null
@@ -131,23 +136,17 @@ export interface KioskSnapshot {
   engineReady: boolean
 }
 
-/**
- * session/start for a kiosk_id this edge does not serve (edge/app.py _kiosk_refusal): 409 INVALID_STATE
- * "kiosk switch to X refused ..." (DEMO_MODE=1) or 403 FORBIDDEN "kiosk_id not served by this edge".
- * A configuration error, never a transient one: retrying loops forever on every face.
- */
-export function isKioskRefusal(code: string, message: string): boolean {
-  return (code === 'INVALID_STATE' && /kiosk switch/i.test(message)) || (code === 'FORBIDDEN' && /kiosk_id not served/i.test(message))
-}
+export { isKioskRefusal } from './errorPolicy'
 
-const TRANSIENT_CODES = new Set([
-  'NONCE_EXPIRED',
-  'NONCE_REUSED',
-  'ATTEMPT_CLOSED',
-  'ATTEMPT_NOT_FOUND',
-  'VALIDATION_ERROR',
-  'INVALID_STATE',
-])
+/** Challenge diagnostics in the console only in dev builds or with the debug overlay (KF-M3). */
+const CHALLENGE_DIAGNOSTICS = import.meta.env.DEV || DEBUG_ENABLED
+
+/** session/start client.camera_label / user_agent limit on the edge (edge-app F10). */
+const CLIENT_TEXT_MAX = 256
+
+/** Last challenge frame: grab attempts and the gap between them (KF-M1). */
+const FRAME_GRAB_TRIES = 3
+const FRAME_GRAB_GAP_MS = 120
 
 /** Shown while another tab (the /operator console) holds the one-capturing-tab lock. */
 export const CAPTURE_PAUSED_NOTE = 'The operator console is capturing on this computer. Operator: press T here to take over.'
@@ -180,6 +179,15 @@ export class KioskController {
   }
   private readonly listeners = new Set<() => void>()
   private readonly api = getApi()
+  /** SECOND_FACTOR step (kiosk/fallbackFlow.ts); this controller is its host. */
+  private readonly fallback = new FallbackFlow(this.api, {
+    current: () => (this.snap.view.kind === 'fallback' ? this.snap.view.vm : null),
+    show: (vm) => this.setView({ kind: 'fallback', vm }),
+    decided: (resp) => this.handleDecision(resp, this.stepUpTiming(resp)),
+    fatal: (err) => this.handleError(err),
+    touch: () => this.touch(),
+    gen: () => this.gen,
+  })
   private engine: VisionEngine | null = null
   private booting = false
   /** Generation counter: bumped on every attempt start and reset; stale async work bails out. */
@@ -435,8 +443,9 @@ export class KioskController {
       kiosk_id: getKioskId(),
       claimed_user_id: null,
       client: {
-        camera_label: engine?.camera.label ?? '',
-        user_agent: navigator.userAgent,
+        // the edge validates these at <= 256 characters (422 otherwise): never fail an attempt on a long label
+        camera_label: (engine?.camera.label ?? '').slice(0, CLIENT_TEXT_MAX),
+        user_agent: navigator.userAgent.slice(0, CLIENT_TEXT_MAX),
         screen: { width: window.screen.width, height: window.screen.height, refresh_hz: engine?.refreshHz ?? 60 },
       },
       flash_enabled: this.snap.flashEnabled && THRESHOLDS.flash.enabled,
@@ -450,6 +459,8 @@ export class KioskController {
 
   /** Fire session/start while the quality gate is still dwelling (removes the round trip after t0). */
   private prefetchSession(): void {
+    // KF-06: recapture_of closes the parent attempt on the edge, so a recapture start is sent once, at lock.
+    if (!prefetchAllowed(this.recaptureOf)) return
     const req = this.sessionRequest()
     const key = this.sessionKey(req)
     const p = this.prefetched
@@ -497,15 +508,15 @@ export class KioskController {
     this.setView({ kind: 'capturing' })
 
     const baselineFrames: FrameAnalysis[] = [lockFrame]
-    const stopBaseline = engine.onFrame((f) => {
+    const stopBaseline = once(engine.onFrame((f) => {
       if (f.face && f.perfMs <= lockFrame.perfMs + THRESHOLDS.challenge.baselineMs) baselineFrames.push(f)
-    })
+    }))
     const timing: ClientTiming = { sessionStartMs: null, captureWindowMs: null, encodeMs: null, uploadAndEdgeMs: null }
     const exposurePromise = UI.lockExposure ? lockExposure(engine.track) : Promise.resolve(NO_LOCK)
     const exposure = Promise.race([exposurePromise, sleep(250).then(() => NO_LOCK)])
     let lock: ExposureLock = NO_LOCK
     // Whatever happens (even a late lock), restore the camera's previous modes after this attempt.
-    const restore = () => void exposurePromise.then((l) => restoreExposure(engine.track, l))
+    const restore = once(() => void exposurePromise.then((l) => restoreExposure(engine.track, l)))
     timing.lockProcessedMs = Math.round(epochNow() - this.faceLockAtMs)
     try {
       const req: SessionStartRequest = { ...this.sessionRequest(), kiosk_id: kioskId }
@@ -518,7 +529,9 @@ export class KioskController {
       if (!safety.ok) {
         // Photosensitivity guard: never paint it - restart on the accessible non-flash path.
         console.warn(`[kiosk] refusing flash sequence (${safety.reason}); using flash_enabled=false`)
-        session = await this.api.sessionStart({ ...req, flash_enabled: false })
+        // the first start already consumed recapture_of (the edge closed the parent): never re-send it (KF-06)
+        const { recapture_of: _consumed, ...rest } = req
+        session = await this.api.sessionStart({ ...rest, flash_enabled: false })
         if (!alive()) return
       }
       timing.sessionStartMs = Math.round(performance.now() - t1)
@@ -580,6 +593,10 @@ export class KioskController {
       if (e instanceof CaptureCancelled || !alive()) return
       this.handleError(e)
     } finally {
+      // KF-09: every exit (early return on reset, error, success) unsubscribes the baseline listener and
+      // restores the camera modes exactly once.
+      stopBaseline()
+      restore()
       if (this.abort === abort) this.abort = null
     }
   }
@@ -702,26 +719,10 @@ export class KioskController {
       return
     }
     if (type === 'SECOND_FACTOR' && (resp.next_action.methods?.length ?? 0) > 0) {
-      const v = this.snap.view
-      if (v.kind === 'fallback' && v.vm.decision.attempt_id === resp.attempt_id) {
-        // R8: code rejected but attempts remain -> stay on the code screen with an explanation.
-        const left = resp.next_action.attempts_left
-        this.setView({
-          kind: 'fallback',
-          vm: {
-            ...v.vm,
-            decision: resp,
-            methods: resp.next_action.methods ?? v.vm.methods,
-            busy: false,
-            error: `${reasonText('FALLBACK_FAILED', 'STEP_UP')}${left !== null ? ` (${triesLeftText(left)})` : ''}`,
-            attemptsLeft: left,
-          },
-        })
-        this.touch()
-        return
-      }
+      // R8 / R11 / FALLBACK_LOCKED on the attempt already on screen: reconciled in place (fallbackFlow.ts)
+      if (this.fallback.sameAttempt(resp)) return
       show(UI.stepUpIntroMs, true)
-      this.after(UI.stepUpIntroMs, () => this.enterFallback(resp))
+      this.after(UI.stepUpIntroMs, () => this.fallback.enter(resp))
       return
     }
     // STEP_UP with no automatic path (CONTACT_DESK / NONE / malformed): fail secure, ask for help.
@@ -733,56 +734,79 @@ export class KioskController {
     this.tintSink?.(null)
     const err = asApiError(e)
     console.error('[kiosk] request failed', e)
-    if (err && (err.code === 'RATE_LIMITED' || err.status === 429)) {
-      this.rateLimitedUntil = Date.now() + 60_000
-      this.enterScanning(0, 'Too many attempts – please wait')
-      return
-    }
-    // Stale / replayed nonce: silently start a fresh session (no message to the user).
-    if (err && (err.code === 'NONCE_EXPIRED' || err.code === 'NONCE_REUSED') && this.nonceRestarts < 3) {
-      this.nonceRestarts += 1
-      this.recaptureOf = null
-      this.stepUpStartedAt = null
-      this.enterScanning(0)
-      return
-    }
-    if (err && isKioskRefusal(err.code, err.message)) {
-      // Operator error: the selected kiosk id is not served by this edge. Drop the override (admin selector
-      // or ?kiosk=) so the kiosk returns to its own id instead of failing on every face.
-      const refused = getKioskId()
-      const source = kioskIdSource()
-      clearKioskOverride()
-      const retryMs = 8000
-      this.prefetched = null
-      this.clearTimers()
-      this.setView({
-        kind: 'service-error',
-        title: 'Kiosk not configured for this gate',
-        message: `This edge does not serve kiosk “${refused}”${source === 'query' ? ' (from ?kiosk= in the address)' : source === 'admin' ? ' (picked in the control panel)' : ''}. Switched back to ${getKioskId()}. Please contact the desk.`,
-        retryAt: Date.now() + retryMs,
-      })
-      this.after(retryMs, () => this.reset())
-      return
-    }
-    this.serviceErrors += 1
-    if (err && TRANSIENT_CODES.has(err.code) && this.serviceErrors < 3) {
-      this.recaptureOf = null
-      this.stepUpStartedAt = null
-      this.enterScanning(800, 'Let’s try that again')
-      return
-    }
-    const unreachable = err?.isUnreachable ?? false
-    const retryMs = 5000
-    this.clearTimers()
-    this.setView({
-      kind: 'service-error',
-      title: unreachable ? 'Access check unavailable' : 'Something went wrong',
-      message: unreachable
-        ? 'The kiosk service is not responding, so no access can be granted. Please contact the desk.'
-        : `Please contact the desk.${err ? ` (${err.code})` : ''}`,
-      retryAt: Date.now() + retryMs,
+    const kind = this.snap.view.kind
+    const action = errorAction({
+      code: err?.code ?? 'UNKNOWN',
+      status: err?.status ?? 0,
+      message: err?.message ?? '',
+      unreachable: err?.isUnreachable ?? false,
+      nonceRestarts: this.nonceRestarts,
+      serviceErrors: this.serviceErrors,
+      inStepUp: kind === 'challenge' || kind === 'fallback',
     })
+    switch (action.kind) {
+      case 'rate-limited':
+        this.rateLimitedUntil = Date.now() + 60_000
+        this.enterScanning(0, 'Too many attempts – please wait')
+        return
+      case 'nonce-restart':
+        // Stale / replayed nonce on the primary attempt: silently start a fresh session.
+        this.nonceRestarts += 1
+        this.recaptureOf = null
+        this.stepUpStartedAt = null
+        this.enterScanning(0)
+        return
+      case 'kiosk-refusal':
+        this.showKioskRefusal()
+        return
+      case 'step-up-lost':
+        // KF-M2: the open step-up is never abandoned silently; say so, then start over.
+        this.serviceErrors += 1
+        this.showServiceError('Verification not completed', 'This check timed out or was interrupted. Please try again, or ask the desk.')
+        return
+      case 'transient':
+        this.serviceErrors += 1
+        this.recaptureOf = null
+        this.stepUpStartedAt = null
+        this.enterScanning(800, 'Let’s try that again')
+        return
+      case 'service-error':
+        this.serviceErrors += 1
+        this.showServiceError(
+          action.unreachable ? 'Access check unavailable' : 'Something went wrong',
+          action.unreachable
+            ? 'The kiosk service is not responding, so no access can be granted. Please contact the desk.'
+            : `Please contact the desk.${err ? ` (${err.code})` : ''}`,
+        )
+        return
+    }
+  }
+
+  /** Terminal service-error screen; resets to scanning after `retryMs`. */
+  private showServiceError(title: string, message: string, retryMs = 5000): void {
+    this.recaptureOf = null
+    this.stepUpStartedAt = null
+    this.clearTimers()
+    window.clearTimeout(this.idleTimer)
+    this.setView({ kind: 'service-error', title, message, retryAt: Date.now() + retryMs })
     this.after(retryMs, () => this.reset())
+  }
+
+  /**
+   * Operator error: the selected kiosk id is not served by this edge. Drop the override (admin selector
+   * or ?kiosk=) so the kiosk returns to its own id instead of failing on every face.
+   */
+  private showKioskRefusal(): void {
+    const refused = getKioskId()
+    const source = kioskIdSource()
+    clearKioskOverride()
+    this.prefetched = null
+    const where = source === 'query' ? ' (from ?kiosk= in the address)' : source === 'admin' ? ' (picked in the control panel)' : ''
+    this.showServiceError(
+      'Kiosk not configured for this gate',
+      `This edge does not serve kiosk “${refused}”${where}. Switched back to ${getKioskId()}. Please contact the desk.`,
+      8000,
+    )
   }
 
   // ------------------------------------------------ step-up: challenge
@@ -848,32 +872,43 @@ export class KioskController {
       stopRecent()
       this.debugTracker = null
     }
-    console.info(
-      '[challenge]',
-      results
-        .map(
-          (r, i) =>
-            `${r.action}: frames=${framesPerAction[i]} baseline=${r.baseline} peak=${r.peak} started=${r.started_at_ms !== null}` +
-            ` completed=${r.completed_at_ms !== null} lost=${r.tracking_lost}` +
-            (r.started_at_ms !== null ? ` reaction=${r.started_at_ms - r.prompted_at_ms}ms` : '') +
-            (r.yaw_peak_deg !== null ? ` yaw_peak=${r.yaw_peak_deg}` : '') +
-            (r.landmark_shift !== null ? ` shift=${r.landmark_shift}` : ''),
-        )
-        .join(' | '),
-      `same_track=${continuity.sameTrack()} (${continuity.describe()}) engine_fps=${engine.processedFps().toFixed(1)}`,
-    )
-    for (const [i, r] of results.entries()) {
-      const deform = r.action === 'SMILE' || r.action === 'OPEN_MOUTH' || r.action === 'PUFF_CHEEKS'
-      if (deform && (r.landmark_shift ?? 0) > 0.1 && r.peak - r.baseline < 0.05) {
-        console.warn(
-          `[challenge] ${r.action}: landmarks moved (shift ${r.landmark_shift}) but the blendshape stayed flat - check ?debug=1; if the bars do not move, try ?delegate=cpu`,
-        )
+    // KF-M3: per-action peaks / baselines are a tuning oracle for spoofs: never logged in production builds.
+    if (CHALLENGE_DIAGNOSTICS) {
+      console.info(
+        '[challenge]',
+        results
+          .map(
+            (r, i) =>
+              `${r.action}: frames=${framesPerAction[i]} baseline=${r.baseline} peak=${r.peak} started=${r.started_at_ms !== null}` +
+              ` completed=${r.completed_at_ms !== null} lost=${r.tracking_lost}` +
+              (r.started_at_ms !== null ? ` reaction=${r.started_at_ms - r.prompted_at_ms}ms` : '') +
+              (r.yaw_peak_deg !== null ? ` yaw_peak=${r.yaw_peak_deg}` : '') +
+              (r.landmark_shift !== null ? ` shift=${r.landmark_shift}` : ''),
+          )
+          .join(' | '),
+        `same_track=${continuity.sameTrack()} (${continuity.describe()}) engine_fps=${engine.processedFps().toFixed(1)}`,
+      )
+      for (const [i, r] of results.entries()) {
+        const deform = r.action === 'SMILE' || r.action === 'OPEN_MOUTH' || r.action === 'PUFF_CHEEKS'
+        if (deform && (r.landmark_shift ?? 0) > 0.1 && r.peak - r.baseline < 0.05) {
+          console.warn(
+            `[challenge] ${r.action}: landmarks moved (shift ${r.landmark_shift}) but the blendshape stayed flat - check ?debug=1; if the bars do not move, try ?delegate=cpu`,
+          )
+        }
+        if (framesPerAction[i] < 10) console.warn(`[challenge] ${r.action}: only ${framesPerAction[i]} camera frames analysed in the step window`)
       }
-      if (framesPerAction[i] < 10) console.warn(`[challenge] ${r.action}: only ${framesPerAction[i]} camera frames analysed in the step window`)
     }
     this.setView({ kind: 'challenge', vm: { ...base, phase: 'submitting', index: spec.actions.length - 1 } })
     try {
-      const frame = await engine.grabJpeg(this.uploadMaxWidth, this.uploadJpegQuality).catch(() => null)
+      // KF-M1: without its last frame the edge cannot match identity and DENIES the challenge outright, so a
+      // capture glitch is retried and, if it persists, nothing is submitted (the step is not decided).
+      const frame = await firstValue(() => engine.grabJpeg(this.uploadMaxWidth, this.uploadJpegQuality), FRAME_GRAB_TRIES, FRAME_GRAB_GAP_MS)
+      if (!alive()) return
+      if (frame === null) {
+        console.warn('[challenge] last frame could not be captured; not submitting')
+        this.showServiceError('Verification not completed', 'The camera did not deliver a picture. Please try again, or ask the desk.')
+        return
+      }
       const meta: ChallengeMeta = {
         challenge_id: spec.challenge_id,
         nonce: spec.nonce,
@@ -934,23 +969,6 @@ export class KioskController {
 
   // ------------------------------------------------ step-up: second factor / fallback
 
-  private enterFallback(resp: DecisionResponse): void {
-    const methods = resp.next_action.methods ?? []
-    this.setView({
-      kind: 'fallback',
-      vm: {
-        decision: resp,
-        methods,
-        selected: methods.length === 1 ? methods[0] : null,
-        otp: null,
-        busy: false,
-        error: null,
-        attemptsLeft: resp.next_action.attempts_left,
-      },
-    })
-    this.touch()
-  }
-
   /** Any interaction on the fallback screen keeps it alive; inactivity abandons the attempt. */
   touch = (): void => {
     window.clearTimeout(this.idleTimer)
@@ -960,75 +978,26 @@ export class KioskController {
     }, UI.fallbackIdleMs)
   }
 
-  private patchFallback(patch: Partial<FallbackViewModel>): void {
-    const v = this.snap.view
-    if (v.kind === 'fallback') this.setView({ kind: 'fallback', vm: { ...v.vm, ...patch } })
-  }
+  selectMethod = (method: FallbackMethod | null): void => this.fallback.select(method)
 
-  selectMethod = (method: FallbackMethod | null): void => {
-    this.patchFallback({ selected: method, error: null })
-    this.touch()
-  }
+  requestOtp = (): Promise<void> => this.fallback.requestOtp()
 
-  requestOtp = async (): Promise<void> => {
-    const v = this.snap.view
-    if (v.kind !== 'fallback' || v.vm.busy) return
-    const gen = this.gen
-    this.patchFallback({ busy: true, error: null })
-    this.touch()
-    try {
-      const otp = await this.api.sendOtp(v.vm.decision.attempt_id)
-      if (gen === this.gen) this.patchFallback({ otp, busy: false })
-    } catch (e) {
-      if (gen !== this.gen) return
-      const err = asApiError(e)
-      if (err?.reason === 'NO_EMAIL_ON_FILE') {
-        // the edge dropped EMAIL_OTP from this step (API.md §3.5): offer the remaining methods only
-        const methods = v.vm.methods.filter((m) => m !== 'EMAIL_OTP')
-        if (!methods.length) {
-          this.patchFallback({ busy: false, error: 'No e-mail address on file. Please ask the desk for help.' })
-          return
-        }
-        this.patchFallback({ busy: false, methods, selected: methods.length === 1 ? methods[0] : null, error: 'No e-mail address on file. Please choose another method.' })
-        return
-      }
-      if (err && (err.code === 'RATE_LIMITED' || err.status === 429)) {
-        const wait = err.extra.retry_after_s
-        this.patchFallback({ busy: false, error: `A code was sent a moment ago. Please check your e-mail${wait ? ` or ask again in ${Math.ceil(wait)} s` : ''}.` })
-        return
-      }
-      this.patchFallback({
-        busy: false,
-        error: err ? `Could not send the email code (${err.code}). Choose another method.` : 'Could not send the email code.',
-      })
-    }
-  }
-
-  submitFallback = async (req: FallbackRequest): Promise<void> => {
-    const v = this.snap.view
-    if (v.kind !== 'fallback' || v.vm.busy) return
-    const gen = this.gen
-    this.patchFallback({ busy: true, error: null })
-    this.touch()
-    try {
-      const resp = await this.api.submitFallback(v.vm.decision.attempt_id, req)
-      if (gen !== this.gen) return
-      this.handleDecision(resp, this.stepUpTiming(resp))
-    } catch (e) {
-      if (gen !== this.gen) return
-      const err = asApiError(e)
-      if (err && (err.code === 'ATTEMPT_CLOSED' || err.code === 'ATTEMPT_NOT_FOUND')) {
-        this.handleError(err)
-        return
-      }
-      this.patchFallback({
-        busy: false,
-        error: err ? (err.isUnreachable ? 'Kiosk service not responding.' : err.message) : 'Verification failed.',
-      })
-    }
-  }
+  submitFallback = (req: FallbackRequest): Promise<void> => this.fallback.submit(req)
 
   // ------------------------------------------------ operator / user controls
+
+  /**
+   * User Cancel / operator Esc. Refused while the edge is deciding (KF-10): the decision it returns for this
+   * attempt is always shown. Returns whether the reset happened.
+   */
+  cancelByUser = (): boolean => {
+    const v = this.snap.view
+    const state =
+      v.kind === 'fallback' ? { kind: v.kind, busy: v.vm.busy } : v.kind === 'challenge' ? { kind: v.kind, phase: v.vm.phase } : { kind: v.kind }
+    if (!userCancelAllowed(state)) return false
+    this.reset()
+    return true
+  }
 
   reset = (): void => {
     this.gen++

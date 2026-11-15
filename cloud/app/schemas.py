@@ -8,6 +8,9 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, 
 
 ID = r"^[A-Za-z0-9_.:\-]{1,128}$"
 USER_ID = r"^[A-Za-z0-9_.\-]{1,64}$"
+# Optional per-call nonce the edge adds to POST/PUT bodies: two identical admin calls in one second otherwise carry
+# the same kiosk signature and the second is refused as a replay (probe rbac-e2e 10b). Audited as-is, never trusted.
+REQUEST_ID = r"^[A-Za-z0-9_-]{8,64}$"
 
 
 class MatchRequest(BaseModel):
@@ -53,8 +56,10 @@ class EnrollMeta(BaseModel):
     # "the enrolling kiosk provisioned a TOTP secret" (the secret lives on the edge only). The cloud never
     # mints a seed: it only records fallback.totp_enrolled in the schedule. totp_enrolled wins when sent.
     provision_totp: bool = False
-    totp_enrolled: bool | None = None
+    totp_enrolled: bool | None = None  # absent = unchanged (the edge sends it only when this device holds a secret)
     liveness_session_id: str | None = Field(default=None, max_length=128)
+    actor: str | None = Field(default=None, max_length=64)  # asserted by the edge; recorded, never trusted
+    request_id: str | None = Field(default=None, pattern=REQUEST_ID)  # per-call nonce (distinct signatures)
 
     @field_validator("email", mode="before")
     @classmethod
@@ -225,6 +230,7 @@ class AdminRevokeRequest(BaseModel):
     revoked_at: str | None = None
     force: StrictBool = False  # USER revocation of a user_id unknown to the schedule and the enrolment store
     actor: str | None = Field(default=None, pattern=ACTOR)
+    request_id: str | None = Field(default=None, pattern=REQUEST_ID)  # per-call nonce (distinct signatures)
 
     @field_validator("reason")
     @classmethod
@@ -282,6 +288,7 @@ class AccessUpdateRequest(BaseModel):
     valid_from: str | None = None
     valid_until: str | None = None
     actor: str | None = Field(default=None, pattern=ACTOR)  # who made the change (audit); kiosk id is added
+    request_id: str | None = Field(default=None, pattern=REQUEST_ID)  # per-call nonce (distinct signatures)
 
     @field_validator("zones_add")
     @classmethod
@@ -335,6 +342,7 @@ class CodesRotateRequest(BaseModel):
     count: int = Field(default=ROTATE_COUNT_DEFAULT, ge=ROTATE_COUNT_MIN, le=ROTATE_COUNT_MAX)
     replace_existing: StrictBool = True  # drop this staff member's previous codes (rotation); edge parity
     actor: str | None = Field(default=None, pattern=ACTOR)
+    request_id: str | None = Field(default=None, pattern=REQUEST_ID)  # per-call nonce (distinct signatures)
 
 
 # ---------------------------------------------------------------- v1.4 admin-access response shapes
@@ -486,6 +494,7 @@ class HealthResponse(BaseModel):
     uptime_s: int
     server_time: str
     checked_at: str | None
+    deploy_stamp: str | None = None  # HID_DEPLOY_STAMP (YYYYMMDDTHHMMSSZ) set at deploy: replace-checks of infra
 
 
 class AdminContactRequest(BaseModel):
@@ -495,3 +504,17 @@ class AdminContactRequest(BaseModel):
     email: str = Field(pattern=r"^[^@\s]{1,64}@[^@\s]{1,253}\.[A-Za-z]{2,}$", max_length=254)
     consent: Literal[True]
     consent_version: str = Field(min_length=1, max_length=40)  # = EnrollMeta / edge schemas.py
+    actor: str | None = Field(default=None, pattern=ACTOR)  # audit (resolved per credential, cloud/app/rbac.py)
+    request_id: str | None = Field(default=None, pattern=REQUEST_ID)  # per-call nonce (distinct signatures)
+
+
+class OfflineEnrolRecord(BaseModel):
+    """POST /v1/enroll/offline-record: an edge enrolled a face while the cloud was unreachable (no images, ever)."""
+    model_config = ConfigDict(extra="forbid")
+    user_id: str = Field(pattern=USER_ID)
+    kiosk_id: str = Field(pattern=ID)
+    at: str = Field(min_length=10, max_length=40)
+    template_count: int = Field(ge=1, le=64)
+    model: str = Field(min_length=1, max_length=128)
+    actor: str | None = Field(default=None, max_length=64)
+    request_id: str | None = Field(default=None, pattern=REQUEST_ID)  # per-call nonce (distinct signatures)

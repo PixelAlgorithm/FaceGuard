@@ -12,7 +12,9 @@ import { getApi, type EraseResponse, type HealthResponse } from '../../api'
 import { canvasToJpeg } from '../../capture/imageStats'
 import { sleep } from '../../capture/time'
 import { ERASE_CLOUD_TEXT, ROLE_SOURCE_TEXT, errorText, useAccessDirectory } from '../../shared/accessDirectory'
-import { displayError, registerPlan, userIdError } from '../../shared/accessRules'
+import { askAdminText, displayError, gatePlan, registerPlan, userIdError } from '../../shared/accessRules'
+import { useAuth } from '../../shared/auth/context'
+import { PERM } from '../../shared/auth/permissions'
 import { CaptureLock, useLockState } from '../../shared/captureLock'
 import { CONSENT_VERSION, registerPerson, type RegisterOutcome } from '../../shared/registerFlow'
 import { toast } from '../../shared/toast'
@@ -64,7 +66,15 @@ export function EnrolPanel({ token }: { token: string }) {
   const api = getApi()
   const videoRef = useRef<HTMLVideoElement>(null)
   const [stream, setStream] = useState<MediaStream | null>(null)
-  const dir = useAccessDirectory(token, 'enrol-card')
+  const { can } = useAuth()
+  const mayEditAccess = can(PERM.accessEdit)
+  // accessEdit: true -> dir.canEdit means "the schedule is writable here"; the permission is applied by gatePlan
+  const dir = useAccessDirectory(token, 'enrol-card', {
+    accessRead: can(PERM.accessRead),
+    enrolRead: can(PERM.enrolRead),
+    accessEdit: true,
+    bundleRefresh: can(PERM.bundleRefresh),
+  })
   const [form, setForm] = useState<Form>({ user_id: '', display_name: '', email: '', role: null, card_id: '', provision_totp: false, consent: false })
   const autoName = useRef('')
   const [shots, setShots] = useState<Shot[]>([])
@@ -114,7 +124,7 @@ export function EnrolPanel({ token }: { token: string }) {
   const existing = dir.identities.find((u) => u.user_id === userId) ?? null
   const scheduleRole = existing && existing.status !== 'NOT_IN_SCHEDULE' ? existing.role : null
   const role = form.role ?? scheduleRole ?? (dir.roles.includes('student') ? 'student' : (dir.roles[0] ?? null))
-  const plan = dir.access ? registerPlan(existing?.row ?? null, dir.canEdit, role, form.display_name) : null
+  const plan = dir.access ? gatePlan(registerPlan(existing?.row ?? null, dir.canEdit, role, form.display_name), mayEditAccess) : null
   const erased = existing?.status === 'ERASED'
 
   /** Picked or typed id: name / role from the schedule, TOTP default off for an enrolled person. */
@@ -178,7 +188,7 @@ export function EnrolPanel({ token }: { token: string }) {
     const o = await registerPerson(
       token,
       existing,
-      { online: dir.canEdit, listLoaded: !!dir.access },
+      { online: dir.canEdit, listLoaded: !!dir.access, canEditAccess: mayEditAccess },
       {
         userId,
         display: form.display_name,
@@ -187,7 +197,7 @@ export function EnrolPanel({ token }: { token: string }) {
         cardId: form.card_id,
         provisionTotp: form.provision_totp,
         frames: shots.map((s) => s.blob),
-        actor: 'control-panel',
+        actor: 'control-panel', // informational: the edge derives the real actor from the session
         forceReadmit,
       },
     )
@@ -291,7 +301,9 @@ export function EnrolPanel({ token }: { token: string }) {
               ? `${userId} is revoked: restore them first (Users & access → Restore).`
               : plan.why === 'NOT_AT_THIS_KIOSK'
                 ? `${userId} has no access at this kiosk’s zone.`
-                : 'Pick a role first.'}
+                : plan.why === 'NEEDS_ACCESS_EDIT'
+                  ? askAdminText(userId)
+                  : 'Pick a role first.'}
         </p>
       ) : null}
       {erased && plan?.kind !== 'blocked' ? (
@@ -338,9 +350,9 @@ export function EnrolPanel({ token }: { token: string }) {
 
       <div className="mt-3 flex flex-wrap items-start gap-2">
         <ActionButton label={shots.length ? 'Re-capture 5 frames' : 'Capture 5 frames'} disabled={!stream || prompt !== null || lockState !== 'held'} run={capture} />
-        <ActionButton label={erased ? 'Re-admit and enrol' : 'Enrol'} tone="primary" disabled={!ready || !token} run={() => enrol(false)} />
-        {outcome?.reason === 'ERASED_IN_BUNDLE' && dir.canEdit ? (
-          <ActionButton label="Re-admit and enrol" tone="primary" disabled={!ready || !token} run={() => enrol(true)} />
+        <ActionButton label={erased ? 'Re-admit and enrol' : 'Enrol'} tone="primary" perm={PERM.enrolWrite} disabled={!ready || !token} run={() => enrol(false)} />
+        {outcome?.reason === 'ERASED_IN_BUNDLE' && dir.canEdit && mayEditAccess ? (
+          <ActionButton label="Re-admit and enrol" tone="primary" perm={PERM.enrolWrite} disabled={!ready || !token} run={() => enrol(true)} />
         ) : null}
       </div>
       {!form.consent ? <p className="mt-1 text-xs text-[#8f1d1d]">Consent is required before enrolment.</p> : null}
@@ -384,6 +396,7 @@ export function EnrolPanel({ token }: { token: string }) {
         />
         <ActionButton
           label="Erase"
+          perm={PERM.enrolErase}
           tone="danger"
           disabled={!eraseOk || !token}
           run={async () => {

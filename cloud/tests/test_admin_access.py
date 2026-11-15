@@ -18,7 +18,7 @@ from cloud.app.services import schedule_service as sched_mod
 from cloud.app.services.schedule_service import NS_KIOSK_BUNDLE, NS_SCHED, ScheduleConflict, verify_bundle
 from cloud.tools.fakeimg import make_fake_jpeg
 
-from .conftest import ADMIN, BUNDLE_KEY, PEPPER, T0, Signed
+from .conftest import ADMIN, BUNDLE_KEY, PEPPER, T0, Signed, etag
 
 ADMIN_H = {"X-Admin-Token": ADMIN}
 # Sat 14 Nov 2026 22:30 IST: student Main Gate window ends 22:00 (+15 min grace), faculty ends 23:00
@@ -153,9 +153,11 @@ def test_extended_hours_and_role_change_apply_and_are_audited(main, services):
 
     a = main.get("/v1/admin/audit?user_id=u_3c4d", headers=ADMIN_H).json()["items"]
     assert a[-1]["action"] == "ACCESS_UPDATE" and a[-1]["role_change"] == ["student", "faculty"]
-    assert a[-1]["kiosk_id"] == "KIOSK_MAIN_01" and a[-1]["actor"] == "warden" and a[-1]["ts_utc"]
+    # V2 §E: the legacy credential is the actor (a client-supplied actor is only honoured from an edge_proxy key)
+    assert a[-1]["kiosk_id"] == "KIOSK_MAIN_01" and a[-1]["actor"] == "legacy:admin_token" and a[-1]["ts_utc"]
+    assert a[-1]["actor_assurance"] == "legacy"
     hist = services.kv.get("schedule_hist", f"{r.json()['bundle_version']:08d}")
-    assert hist["actor"] == "warden" and hist["reason"] == "admin:access:u_3c4d"
+    assert hist["actor"] == "legacy:admin_token" and hist["reason"] == "admin:access:u_3c4d"
 
 
 def test_identical_put_is_unchanged_without_version_bump(main, services):
@@ -314,8 +316,9 @@ def test_rotate_codes_returns_plaintext_once_and_stores_hashes(main, services):
     assert r.status_code == 201, r.text
     assert "no-store" in r.headers["cache-control"]
     out = r.json()
-    assert out["bundle_version"] == 43 and len(out["codes"]) == 3 and out["code_length"] == 8
-    assert all(len(c["code"]) == 8 and c["code"].isdigit() for c in out["codes"])
+    # EO-11: new codes are thresholds code_length (10) digits; legacy 8-digit codes stay accepted by the edge
+    assert out["bundle_version"] == 43 and len(out["codes"]) == 3 and out["code_length"] == 10
+    assert all(len(c["code"]) == 10 and c["code"].isdigit() for c in out["codes"])
     # nothing in the store holds a plaintext code (master, history, audit)
     dump = json.dumps([services.kv.list(ns) for ns in ("schedule", "schedule_hist", "admin_audit")])
     assert not any(c["code"] in dump for c in out["codes"])
@@ -365,7 +368,7 @@ def test_dirty_master_gets_a_hygiene_version_bump_on_read(main, services):
     rev = rec.pop("_rev")
     assert services.kv.cas(NS_SCHED, "current", rec, rev)
     services.schedule._cache = None
-    r = main.get("/v1/schedule/KIOSK_MAIN_01", headers={"If-None-Match": '"42"'})
+    r = main.get("/v1/schedule/KIOSK_MAIN_01", headers={"If-None-Match": etag(42)})
     assert r.status_code == 200 and r.json()["bundle_version"] == 43 and r.json()["override_codes"]["codes"] == []
     assert services.kv.get(NS_SCHED, "current")["doc"]["override_codes"]["codes"] == []  # persisted
 
@@ -541,7 +544,7 @@ def test_restore_of_a_revoked_and_erased_user_lifts_both(main, services):
     assert [(i["type"], i["reason"]) for i in feed] == [("READMIT", "READMIT"), ("READMIT", "RESTORE")]
     assert check(main, "u_3c4d", T0) == "IN_WINDOW"
     a = main.get("/v1/admin/audit?user_id=u_3c4d", headers=ADMIN_H).json()["items"][-1]
-    assert a["action"] == "RESTORE" and a["previous_status"] == "REVOKED" and a["actor"] == "cp"
+    assert a["action"] == "RESTORE" and a["previous_status"] == "REVOKED" and a["actor"] == "legacy:admin_token"
 
 
 def test_edit_of_a_revoked_user_without_consent_keeps_the_revocation(main, services):

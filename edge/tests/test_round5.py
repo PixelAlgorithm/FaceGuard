@@ -330,7 +330,7 @@ def test_probe_identity_binding(lite_settings, probe_thresholds, tmp_path, probe
 
 def test_probe_with_nobody_entitled_never_binds(lite_settings, probe_thresholds, tmp_path):
     ctx = probe_ctx(lite_settings, probe_thresholds, tmp_path, cloud=FakeCloud())
-    ctx.runtime = StubRuntime("ONLINE")  # no entitled_user_ids -> empty gallery filter (fail-secure)
+    ctx.runtime = StubRuntime("ONLINE")  # neither excluded_ nor entitled_user_ids -> no candidate (fail-secure)
     att, _, _, cm, _ = asyncio.run(run_probe_then_frames(ctx, LEVEL_A, LEVEL_A))
     assert cm == CloudMatch(ok=False) and att.probe.outcome["binding"] == "no_local_match"
 
@@ -409,7 +409,9 @@ def test_session_probe_frames_returns_a_decision(client):
 
 # ------------------------------------------------------------------ 2. template-append gate + revoked
 @requires_models
-@pytest.mark.parametrize(("worst", "admitted"), [(0.40, False), (0.55, True)])
+# no cloud configured (hermetic client) = no cloud identity check: the OFFLINE re-enrolment bar applies (EAE-05,
+# enrol.reenrol_min_cosine_offline 0.60), so 0.55 (above the online allow bar) is refused too
+@pytest.mark.parametrize(("worst", "admitted"), [(0.40, False), (0.55, False), (0.65, True)])
 def test_new_look_must_reach_allow_min_cosine(client, admin_headers, thresholds, monkeypatch, worst, admitted,
                                              example_bundle):
     from edge import enroll as enroll_mod
@@ -507,8 +509,12 @@ def test_health_degraded_reasons(lite_settings, thresholds):
 
 @requires_models
 def test_health_ok_has_no_degraded_reasons(client):
+    """Models, PAD self-test, runtime and cache are healthy: only the configuration-driven reasons of the
+    hermetic test env remain (DEMO_MODE=1, legacy admin token on, a developer .env mode)."""
     h = client.get("/v1/health").json()
-    assert h["status"] == "ok" and h["degraded_reasons"] == []
+    config_only = {"demo_mode", "legacy_admin_token", "env_file_permissive"}
+    assert set(h["degraded_reasons"]) <= config_only
+    assert h["status"] == ("degraded" if h["degraded_reasons"] else "ok")
 
 
 @pytest.mark.parametrize(("status", "body", "expected"), [

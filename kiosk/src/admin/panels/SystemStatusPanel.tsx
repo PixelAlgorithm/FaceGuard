@@ -3,10 +3,11 @@
  * enforcement switches (policy_bars), cloud match, schedule bundle, last sync report, models / self-test /
  * depth probe and the health degraded_reasons. Read-only except the rate-limit reset.
  */
-import { getApi, type HealthResponse } from '../../api'
+import { getApi, type HealthResponse, type ModeResponse } from '../../api'
 import { refreshMode, useModeStatus } from '../../shared/modeStore'
 import { fmtTime } from '../format'
 import { usePoll } from '../usePoll'
+import { PERM } from '../../shared/auth/permissions'
 import { ActionButton, Card, KeyVal } from '../ui'
 
 type Obj = Record<string, unknown>
@@ -31,9 +32,11 @@ function bar(v: number | boolean | string | null): string {
   return String(v)
 }
 
-export function SystemStatusPanel({ token }: { token: string }) {
+/** `detail`: GET /v1/admin/mode/detail (store:read); without it only the public /v1/mode subset is shown. */
+export function SystemStatusPanel({ token, detail: modeDetail = null }: { token: string; detail?: ModeResponse | null }) {
   const api = getApi()
-  const { mode, reachable, error, updatedAt } = useModeStatus()
+  const { mode: publicMode, reachable, error, updatedAt } = useModeStatus()
+  const mode = modeDetail ?? publicMode
   const health = usePoll<HealthResponse>(() => api.getHealth(), 5000, true, 'status-health')
   const h = health.data
   const detail = h && isObj(h.detail) ? h.detail : {}
@@ -105,6 +108,7 @@ export function SystemStatusPanel({ token }: { token: string }) {
           <div className="mt-2">
             <ActionButton
               label="Reset rate limit"
+              perm={PERM.rateLimitReset}
               disabled={!token}
               run={async () => {
                 const r = await api.resetRateLimit(token)

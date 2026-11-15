@@ -1,6 +1,6 @@
 # API.md — REST Contracts (Edge + Cloud)
 
-API version: v1.4 (2026-11-15, admin-access contract: Control Panel, registration, revoke / re-admit)
+API version: v1.5 (2026-11-15, RBAC: staff accounts, roles and permissions, API keys; §0.1)
 
 Architecture context: `docs/ARCHITECTURE.md`. Decision rules / thresholds: `docs/DECISION_POLICY.md`,
 `config/thresholds.yaml`. Schedule bundle format: `config/schedule.example.json` (test fixture); the live demo
@@ -19,6 +19,41 @@ this file are dev measurements, labelled as such: the edge-only latency bench in
 `eval/results/latency_edge_1280_20261114T171323Z.md`), the venue `/v1/match` round trip (about 0.4–1.4 s, dev observation, no stored
 file) and the genuine-user moiré / M2 score ranges in §2.
 
+## Changes since v1.4 (v1.5, RBAC)
+
+The full contract is §0.1 (changelog line: §0.1.11). In short:
+
+- **Edge credentials**: individual staff sessions (`Authorization: Bearer fgs_...`, `POST /v1/auth/login`), edge
+  API keys for automation (`Bearer fgk_<key_id>.<secret>`) and per-route **permissions** (`edge/auth/rbac.py`
+  `ROUTE_PERMISSIONS`, §0.1.4). `X-Admin-Token` is legacy and works only with `AUTH_LEGACY_ADMIN_TOKEN=1`.
+- **No more token-free routes besides the public set** (§0.1.2): `GET /v1/events` needs `events:read` and `GET
+  /v1/metrics` needs `metrics:read` (they were "localhost, no token" in v1.2–v1.4).
+- **New edge routes**: `/v1/auth/*` (§0.1.5), `/v1/admin/staff*`, `/v1/admin/api-keys*`, `/v1/admin/roles`,
+  `/v1/admin/auth/audit` (§0.1.7), `GET /v1/admin/mode/detail`, `GET /v1/admin/alerts`, `GET /v1/admin/sync/last`
+  (§3.10, §3.11).
+- **`GET /v1/mode` is now the public badge subset**; the full runtime status moved to `GET /v1/admin/mode/detail`
+  (`store:read`, §3.10). `POST /v1/admin/mode` takes `{force, reason?, max_minutes?}` and a forced OFFLINE
+  auto-reverts (§3.10).
+- **Staff override codes** (§3.18.4) are minted only for a signed-in staff member (own `staff_id`, ≤ 4 codes;
+  `codes:rotate_any` for others); new codes are 10 digits; the cloud binds a `staff_id` to one kiosk.
+- **Actor**: the edge derives the audit actor from the principal (`staff:<staff_id>` | `key:<key_id>` |
+  `legacy:admin_token`); a client `actor` field is accepted and ignored.
+- **Cloud**: admin routes take `Authorization: Bearer fgk_...` keys with per-route permissions (§0.1.9, §4.9);
+  admin-credential failures are `403` with a reason; the bundle `ETag` is `"v<bundle_version>-<issued_at epoch>"`
+  (§4.2); the bundle carries a signed `consumed_code_ids` list; a signature over the bare path of a request with a
+  query is accepted only with `CLOUD_ACCEPT_BARE_PATH_SIG=1` (§0).
+- **CORS / Host**: methods include `PATCH`; request headers `Content-Type`, `Authorization`, `X-FG-Activity`
+  (+ `X-Admin-Token` only with the legacy flag); exposed `X-Latency-Ms`, `Retry-After`; `Host` allow-list (§0).
+- **Health**: new `degraded_reasons` `demo_mode`, `env_file_permissive`, `legacy_admin_token`, `auth_unavailable`,
+  `auth_bruteforce` (§3.9). New protocol errors `AUTH_UNAVAILABLE` / `AUTH_BUSY` (503, §0).
+- **Policy / edge hardening**: new reason code `FALLBACK_LOCKED` (STEP_UP, `next_action.retry_after_s`; not a
+  factor failure) and a stricter `MATCH_AMBIGUOUS` frame-consistency rule (§2); new edge alerts
+  `ALERT_FALLBACK_LOCKOUT`, `ALERT_FALLBACK_STATE_RESET`, `ALERT_OFFLINE_ENROLMENT` (§3.11); the detail view's
+  `forced_reason` is only `DEMO` / `operator` (free text in `GET /v1/admin/sync/last` `forced`, §3.10/§3.11);
+  per-route body caps (`413`), 16 SSE streams (`429`) and `CLOUD_API_URL` must be https unless loopback or
+  `DEMO_MODE=1` (§0); the depth upload reply no longer carries `checks` (§3.17); new enrolment / erasure reasons
+  and the offline enrolment audit queue (§3.15, §3.18.6).
+
 ## Changes since v1.3 (v1.4, admin-access contract)
 
 v1.4 is the single canonical contract for the Control Panel / registration routes on all three sides (kiosk ↔
@@ -30,10 +65,11 @@ kiosk test suites load that file and validate it against their models / parsers.
 kiosk code implement this list except where an item is marked **(code pending)**; the verifier gate is still
 pending, and the live cloud runs older code until the lead redeploys with the operator's OK.
 
-- **New edge routes** (§3.18, all `X-Admin-Token`): `GET /v1/admin/access/users`, `PUT
+- **New edge routes** (§3.18, all `X-Admin-Token` in v1.4; v1.5: per-route permissions `access:read`,
+  `access:edit`, `access:revoke`, `codes:rotate`, `bundle:refresh`, §0.1.4): `GET /v1/admin/access/users`, `PUT
   /v1/admin/access/users/{user_id}`, `POST /v1/admin/access/users/{user_id}/revoke`, `POST
   /v1/admin/access/codes/rotate`, `POST /v1/admin/bundle/refresh`. **New cloud routes** (§4.9a, kiosk HMAC +
-  `X-Admin-Token`): `GET /v1/admin/users`, `PUT /v1/admin/users/{user_id}/access`, `POST /v1/admin/codes/rotate`,
+  `X-Admin-Token`; v1.5: Bearer cloud API key, legacy token only with the cloud flag, §0.1.9): `GET /v1/admin/users`, `PUT /v1/admin/users/{user_id}/access`, `POST /v1/admin/codes/rotate`,
   `GET /v1/admin/audit`; `POST /v1/admin/revocations` gains `actor`, `force`, `409 ALREADY_REVOKED` and refuses
   `reason: "ERASED"`.
 - **Registration (R-A)**: `/register` and the admin enrol card first `PUT` the access entry `{display, role,
@@ -118,7 +154,8 @@ agreed contract, and the current behaviour is stated next to it.
 - **New response fields**: `scores.signals` (per-signal status, §1). `GET /v1/mode` adds the `policy_bars` keys
   `moire_unsure`, `device_unsure`, `flash_enforce`, `moire_enforce`, `m2_rgb_enforce`, `rekognition`,
   `rekognition_timeout_ms`, `rekognition_probe_deadline_ms`, and a
-  `cloud_match` block `{enabled, recent, misses, last_miss_at, last_ok_at, degraded}` (§3.10).
+  `cloud_match` block `{enabled, recent, misses, last_miss_at, last_ok_at, degraded}` (§3.10). (v1.5: these keys
+  are in `GET /v1/admin/mode/detail`; the public `GET /v1/mode` keeps only `cloud_match.degraded`.)
 - **Health and OTP**: `GET /v1/health` adds `degraded_reasons[]` (§3.9) and `depth_probe` can read `rejected_token`
   (wrong `X-Depth-Token`). Edge handling of cloud `POST /v1/otp/verify`: `401` / `429` / `5xx` / timeout = cloud
   unavailable (EMAIL_OTP dropped, not counted); any other 4xx = `verified: false` (counted) (§3.4, §4.6).
@@ -143,7 +180,7 @@ agreed contract, and the current behaviour is stated next to it.
   optional `email` on cloud enrolment (§4.8) and append-mode re-enrolment.
 - **Closed code-pending items**: oversized frame / depth parts now return `413 PAYLOAD_TOO_LARGE`; the edge skips
   the cloud match when `match.rekognition.enabled` is false (no call, no miss) and when the next attempt would be
-  OFFLINE anyway; `/v1/metrics` `sync.last_sync_at` reads `GET /v1/mode` `last_sync.at`.
+  OFFLINE anyway; `/v1/metrics` `sync.last_sync_at` reads `GET /v1/mode` `last_sync.at` (v1.5: `GET /v1/admin/mode/detail`).
 - **S3 audit frames are not implemented.** No attempt frame is uploaded for audit (§4).
 - **Override codes**: the documented `OVR-001`…`OVR-003` (`config/schedule.example.json`,
   `SURPRISE_CHALLENGES.md` §SC2.4) are **test fixtures only**. `scripts/sign_bundle.py` drops them and mints fresh
@@ -173,7 +210,8 @@ agreed contract, and the current behaviour is stated next to it.
 - **EMAIL_OTP cloud-verify error** (DECISION_POLICY R11): the edge re-issues the same STEP_UP without `EMAIL_OTP`
   (HTTP 200, nothing counted). v1.1 described this case as a counted `FALLBACK_FAILED`.
 - **Candidate**: `candidate.role` was added (bundle role, for the kiosk / operator UI).
-- **Admin routes**: `POST /v1/admin/mode` now returns the full `GET /v1/mode` body. Admin runtime errors map to
+- **Admin routes**: `POST /v1/admin/mode` now returns the full `GET /v1/mode` body (v1.5: the full body is
+  `GET /v1/admin/mode/detail`; `GET /v1/mode` is the public subset, §3.10). Admin runtime errors map to
   `503` / `403` / `422` instead of 500.
 - **Mode**: `ModeResponse.reason` now lists exactly the values the code emits (§3.10). The heartbeat timeout is
   2000 ms (`connectivity.heartbeat_timeout_ms`).
@@ -191,7 +229,8 @@ agreed contract, and the current behaviour is stated next to it.
   detect cross-kiosk TOTP replay (`ALERT_TOTP_REPLAY`, Y07).
 - **Staff override codes**: `valid_until = expires_at + 24 h` (`fallback.staff_override.valid_after_expiry_h`,
   R7). The v1.1 open decision is closed.
-- **Localhost routes**: `/v1/events` and `/v1/metrics` are localhost-only and need no admin token.
+- **Localhost routes**: `/v1/events` and `/v1/metrics` are localhost-only and need no admin token. (v1.5: now
+  `events:read` / `metrics:read`, §0.1.4.)
 - **Cloud**: the `/v1/health` fields are those of the implemented service. `MatchResponse.source` adds `fake`.
   Cloud admin routes are listed in §4.9. Sync conflicts are acknowledged as `duplicates` (§4.4).
 - **AWS**: runs in the Workshop Studio sandbox, us-east-1 only (role `WSParticipantRole`). The IAM probe allowed
@@ -212,7 +251,7 @@ agreed contract, and the current behaviour is stated next to it.
   `retry_after_s`, `hint`. Challenge actions are UPPER_CASE (`SMILE|OPEN_MOUTH|PUFF_CHEEKS` +
   `BLINK|TURN_LEFT|TURN_RIGHT`; since v1.3 `PUFF_CHEEKS` is wire-only and never issued). Fallback methods are `TOTP|CARD|EMAIL_OTP|STAFF_OVERRIDE`.
 - **Every policy outcome returns HTTP 200** with a DecisionResponse, including DENY `RATE_LIMITED` and DENY `SYSTEM_ERROR`.
-- **Reason-code table** (§2) replaced by the closed list of DECISION_POLICY §6 (39 codes, including `RANDOM_CHALLENGE`, added in v1.1).
+- **Reason-code table** (§2) replaced by the closed list of DECISION_POLICY §6 (39 codes, including `RANDOM_CHALLENGE`, added in v1.1; v1.5: 40 codes with `FALLBACK_LOCKED`).
   `MATCH_LOW` is UNSURE (step-up), not DENY. Recaptures exhausted → manual review (`STAFF_OVERRIDE`) in
   low/medium zones. Removed the "max 2 step-ups" rule; the real limits are listed in §2.
 - **Online schedule** is evaluated on the edge from the newest cloud-signed bundle. There is no per-attempt
@@ -242,15 +281,15 @@ agreed contract, and the current behaviour is stated next to it.
 
 | Item | Rule |
 |---|---|
-| Base URLs | Edge `http://127.0.0.1:8000`: localhost bind; CORS allows only `http://localhost:5173` and `http://127.0.0.1:5173` (methods GET/POST/PUT/DELETE, request headers `Content-Type` and `X-Admin-Token`, exposes `X-Latency-Ms`). When `EDGE_LAN_PORT` is set (demo: 8001), a second listener on `0.0.0.0:EDGE_LAN_PORT` serves **only** `GET /v1/depth/pending` and `POST /v1/depth/frames` for the DepthProbe iPhone app (§3.17). If that port is busy, the kiosk API still starts and `/v1/health` `detail.lan_listener` reports `bind_failed: …`. Cloud `https://<cloud-host>` in **AWS us-east-1** (sandbox constraint; production ap-south-1). There is no separate depth bridge. |
+| Base URLs | Edge `http://127.0.0.1:8000`: localhost bind. CORS allows only the origins in `EDGE_CORS_ORIGINS` (exact `scheme://host[:port]` list; default `http://localhost:5173` and `http://127.0.0.1:5173`); methods GET/POST/PUT/PATCH/DELETE/OPTIONS; request headers `Content-Type`, `Authorization`, `X-FG-Activity` (+ `X-Admin-Token` only while `AUTH_LEGACY_ADMIN_TOKEN=1`); exposes `X-Latency-Ms` and `Retry-After`; no credentials mode. A non-GET request with a foreign `Origin` gets `403 FORBIDDEN` reason `ORIGIN_NOT_ALLOWED`. The main app answers only `Host` `127.0.0.1`, `localhost`, `[::1]` (+ `EDGE_EXTRA_ALLOWED_HOSTS`: exact host names, a wildcard is a startup `ConfigError`); any other `Host` gets a plain-text `400` from `TrustedHostMiddleware` (DNS-rebinding guard). Request bodies are capped per route **before** any parsing (`edge/http_guards.py` `ROUTE_BODY_MAX`): `POST /v1/attempt/{id}/frames` 12 MB, `.../probe` 3 MB, `.../challenge` 7 MB, `POST /v1/enroll` 12 MB, `POST /v1/depth/frames` 30 MB, every other route 64 KB; over the cap (declared `Content-Length` or counted while streaming) → `413 PAYLOAD_TOO_LARGE` with `max_bytes`; a non-numeric `Content-Length` → `400 VALIDATION_ERROR`. `GET /v1/events` allows at most 16 live streams (`429 RATE_LIMITED`, §3.7). `/docs`, `/redoc` and `/openapi.json` exist only with `DEMO_MODE=1` (§0.1.4). Outbound: `CLOUD_API_URL` must be `https://` unless its host is loopback or `DEMO_MODE=1`, else the edge does not start (`ConfigError`, `edge/config.py` `validate_cloud_url`); `CLOUD_TLS_CA_FILE` (optional) pins the cloud certificate to that PEM, and a missing or unreadable file is also a startup `ConfigError` (`cloud_tls_verify`). When `EDGE_LAN_PORT` is set (demo: 8001), a second listener on `0.0.0.0:EDGE_LAN_PORT` serves **only** `GET /v1/depth/pending` and `POST /v1/depth/frames` for the DepthProbe iPhone app (§3.17). If that port is busy, the kiosk API still starts and `/v1/health` `detail.lan_listener` reports `bind_failed: …`. Cloud `https://<cloud-host>` in **AWS us-east-1** (sandbox constraint; production ap-south-1). There is no separate depth bridge. |
 | Versioning | All paths prefixed `/v1` |
 | Content type | `application/json` unless stated; `multipart/form-data` for frames, challenge, enrolment and depth |
 | Time | Request/response timestamps are UTC ISO-8601 (`2026-11-14T04:35:12.345Z`). Client timing fields are epoch ms; the kiosk uses `performance.timeOrigin + performance.now()`. |
 | Local time | Schedules are evaluated in `Asia/Kolkata`; local times are `"HH:MM"`. The edge clock is the demo clock when one is active (§3.14). |
 | Scores | PAD, flash, moiré, device, mask and cosine scores are floats 0–1. Rekognition similarity is reported raw, 0–100 (`scores.rekognition`). |
 | Latency | Header `X-Latency-Ms` (server wall time) on **every** response: edge 1 dp, cloud integer ms. Decisions also carry `latency_ms{total, liveness, match, schedule, policy}` (ints, server-side), plus the additive keys in §1. The user-visible time comes from §3.8. |
-| Edge auth | Localhost bind + CORS. Admin routes require `X-Admin-Token` (= `ADMIN_TOKEN`, constant-time compare); a missing or wrong token gives `401 UNAUTHORIZED`. Admin routes: every `/v1/admin/*` route, `POST /v1/enroll` and `DELETE /v1/enroll/{user_id}`. `GET /v1/events` and `GET /v1/metrics` are localhost-only (127.0.0.1 bind; not on the LAN listener) and need **no** token. The DepthProbe routes use `X-Depth-Token` (§3.17). |
-| Cloud auth | `X-Kiosk-Id`, `X-Timestamp` (epoch s) and `X-Signature`, plus `X-Api-Key`. `X-Signature` = hex HMAC-SHA256(`KIOSK_HMAC_KEY` as UTF-8, `METHOD\nPATH\nX-Timestamp\nhex(sha256(body))`). `PATH` includes `?query` when a query string is present; the server also accepts the bare path. Skew of ±60 s is allowed. Non-GET requests are single-use within the window (replay cache), so retries must be re-signed; `/v1/sync` (idempotent) and `/v1/schedule/check` (read-only) are exempt (`cloud/app/middleware.py` `REPLAY_EXEMPT`). Only `GET /v1/health` is public. Every cloud response carries `X-Server-Time` (epoch s). Cloud admin routes (§4.9) also need `X-Admin-Token`; a missing or wrong token gives `403 FORBIDDEN`. |
+| Edge auth | v1.5 RBAC (§0.1). Only the routes in §0.1.2 are public. Every other route needs a principal with the permission listed in §0.1.4: a staff session (`Authorization: Bearer fgs_...` from `POST /v1/auth/login`) or an edge API key (`Authorization: Bearer fgk_<key_id>.<secret>`). No / bad credential → `401 UNAUTHORIZED`; missing permission → `403 FORBIDDEN` reason `MISSING_PERMISSION` (+ `required[]`); staff store missing / unreadable → `503 AUTH_UNAVAILABLE`. `GET /v1/events` (`events:read`) and `GET /v1/metrics` (`metrics:read`) are no longer token-free. **Legacy**: `X-Admin-Token` (= `ADMIN_TOKEN`, constant-time compare) is accepted only with `AUTH_LEGACY_ADMIN_TOKEN=1` and only without an `Authorization` header (principal `legacy:admin_token`, audited, health `legacy_admin_token`). The DepthProbe routes use `X-Depth-Token` only (§3.17). |
+| Cloud auth | `X-Kiosk-Id`, `X-Timestamp` (epoch s) and `X-Signature`, plus `X-Api-Key`. `X-Signature` = hex HMAC-SHA256(`KIOSK_HMAC_KEY` as UTF-8, `METHOD\nPATH\nX-Timestamp\nhex(sha256(body))`). `PATH` is the raw path and includes `?query` when a query string is present; a signature over the bare path of a request that has a query is accepted only with `CLOUD_ACCEPT_BARE_PATH_SIG=1` (transition flag, default off). Skew of ±60 s is allowed. Non-GET requests are single-use within the window (replay cache), so retries must be re-signed; `/v1/sync` (idempotent) and `/v1/schedule/check` (read-only) are exempt (`cloud/app/middleware.py` `REPLAY_EXEMPT`). Only `GET /v1/health` is public. Every cloud response carries `X-Server-Time` (epoch s). Cloud admin routes (§4.9) also need an admin credential (§0.1.9): `Authorization: Bearer fgk_<key_id>.<secret>` (a key from `CLOUD_API_KEYS_JSON`, with the route's permission) or, legacy, `X-Admin-Token` only with the cloud's `AUTH_LEGACY_ADMIN_TOKEN=1`. Every admin-credential failure is `403 FORBIDDEN` with a reason (`ADMIN_KEY_INVALID`, `ADMIN_KEY_EXPIRED`, `MISSING_PERMISSION`, `KIOSK_NOT_BOUND`, `LEGACY_DISABLED`). |
 | Idempotency | Mutating cloud calls accept an `Idempotency-Key` header. `/v1/sync` uses a per-item `idempotency_key` (= `attempt_id`). |
 | Canonical JSON | Wherever a hash, HMAC or signature covers JSON: `json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")` |
 
@@ -302,23 +341,405 @@ Protocol error codes (`edge/errors.py` `STATUS`, `cloud/app/errors.py` `STATUS_B
 | Code | HTTP | Meaning |
 |---|---|---|
 | `VALIDATION_ERROR` | 422 | malformed request (also: undecodable JPEG, too few frames, enrolment frames rejected, `challenge_id` mismatch) |
-| `UNAUTHORIZED` | 401 | bad or missing auth (edge `X-Admin-Token` / `X-Depth-Token`; cloud HMAC headers) |
-| `FORBIDDEN` | 403 | e.g. `kiosk_id` not served by this edge, `/v1/admin/clock` without `DEMO_MODE=1`, wrong or reused `depth_nonce`, **attempt nonce that does not match the attempt** (the internal `NONCE_INVALID` surfaces as 403 `FORBIDDEN`), cloud admin token missing |
+| `UNAUTHORIZED` | 401 | no, malformed, unknown, revoked or expired credential, or a failed sign-in (edge: staff session / API key / legacy `X-Admin-Token`, reasons in §0.1.8; `X-Depth-Token`; cloud: kiosk HMAC headers). The cloud never uses 401 for an admin credential. |
+| `FORBIDDEN` | 403 | authenticated but not allowed: missing permission and the other §0.1.8 reasons (`MISSING_PERMISSION`, `PASSWORD_CHANGE_REQUIRED`, `MFA_ENROLMENT_REQUIRED`, `NO_STAFF_IDENTITY`, `STAFF_ID_NOT_OWN`, `NOT_DEMO_MODE`, `ORIGIN_NOT_ALLOWED`, ...); cloud admin credential refused (`ADMIN_KEY_INVALID`, ..., §0.1.9); also `kiosk_id` not served by this edge, wrong or reused `depth_nonce`, **attempt nonce that does not match the attempt** (the internal `NONCE_INVALID` surfaces as 403 `FORBIDDEN`) |
 | `NOT_FOUND` | 404 | unknown non-attempt resource: `DELETE /v1/enroll/{user_id}` for a user not enrolled here (cloud not configured), unknown route, cloud unknown kiosk or zone |
 | `ATTEMPT_NOT_FOUND` | 404 | unknown attempt |
 | `ATTEMPT_CLOSED` | 409 | attempt already terminal (ALLOW, DENY, or superseded by a recapture) |
 | `INVALID_STATE` | 409 | e.g. fallback while no SECOND_FACTOR step is pending; rendered beacon before a decision; face already enrolled under another `user_id`; template cache unavailable for `/v1/admin/users` |
 | `NONCE_EXPIRED` | 410 | nonce past its TTL |
 | `NONCE_REUSED` | 409 | nonce already used |
-| `PAYLOAD_TOO_LARGE` | 413 | body or part over the size limit. Cloud: request body > `MAX_BODY_BYTES` (6 MB). Edge: frame or probe part > 2 MB, depth part > 8 MB (`edge/app.py` `MAX_FRAME_BYTES` / `MAX_DEPTH_BYTES`). |
-| `RATE_LIMITED` | 429 | **cloud-side request throttling only** |
+| `PAYLOAD_TOO_LARGE` | 413 | body or part over the size limit. Cloud: request body > `MAX_BODY_BYTES` (6 MB). Edge: whole body over the route cap (§0 Base URLs, `edge/http_guards.py` `ROUTE_BODY_MAX`, adds `max_bytes`); frame or probe part > 2 MB, depth part > 8 MB (`edge/app.py` `MAX_FRAME_BYTES` / `MAX_DEPTH_BYTES`); `POST /v1/enroll` reason `CLOUD_BODY_CAP` (§3.15). |
+| `RATE_LIMITED` | 429 | throttling, with `retry_after_s` and a `Retry-After` header. Edge (v1.5): sign-in delay and global sign-in cap, KDF pool busy (`retry_after_s: 1`), too many live SSE streams (`retry_after_s: 30`); a cloud 429 forwarded by an admin proxy. Cloud: request throttling. |
 | `CLOUD_UNAVAILABLE` | 503 | cloud unreachable or the AWS service is denied |
+| `AUTH_UNAVAILABLE` | 503 | edge (v1.5): no auth service, or the staff store is `MISSING` / `UNAVAILABLE` (§0.1.6); the legacy token does not bypass it |
+| `AUTH_BUSY` | 503 | edge (v1.5): the staff-store lock was not acquired within 5 s (`retry_after_s: 1`) |
 | `UPSTREAM_THROTTLED` | 503 | Rekognition throttling |
 | `MODELS_UNAVAILABLE` | 503 | edge: face detector / ArcFace not loaded, PAD self-test not passed, or template cache unavailable. Used by `POST /v1/enroll`. Attempts never return it: a missing model gives DENY `SYSTEM_ERROR`. |
 | `INTERNAL` | 500 | internal error (cloud catch-all; never used for an edge decision) |
 
 The 429 `RATE_LIMITED` protocol error is unrelated to the `RATE_LIMITED` **decision reason code**. The kiosk
 lockout is a DENY DecisionResponse (HTTP 200), described in §2.
+
+---
+
+## 0.1 Authentication and roles (v1.5, RBAC)
+
+Source of truth: the code. Permissions, roles and the route table live in `edge/auth/rbac.py` (`RBAC_VERSION =
+2`); the HTTP contract in `edge/auth/routes.py` and `edge/auth/deps.py`; the wiring in `edge/app.py`; the cloud
+side in `cloud/app/rbac.py`. The tables below were printed from `edge/auth/rbac.py` by a script, not typed by hand.
+Two kinds of "role" exist and are never mixed: **system roles** (this section: who may operate the kiosk system)
+and **entrant roles** (`student`, `faculty`, `staff`, `contractor`, `visitor` in the signed SC1 bundle: who may
+enter a zone).
+
+RBAC protects the HTTP surface only. The edge OS account, its `.env` and `EDGE_DATA_DIR` are fully trusted, and
+a stolen kiosk laptop means a stolen `edge_proxy` key (trust boundary: `docs/ARCHITECTURE.md` §2.1).
+
+### 0.1.1 Principals and credentials
+
+| Principal | Credential on the wire | Verified by | Notes |
+|---|---|---|---|
+| Staff session | `Authorization: Bearer fgs_<token>` from `POST /v1/auth/login` | edge | Password (+ TOTP). The edge keeps only `sha256(token)`, **in memory**: an edge restart signs everyone out. |
+| Edge API key | `Authorization: Bearer fgk_<key_id>.<secret>` (`key_id` = `[a-z0-9]{8}`) | edge | Automation (eval, bench). 1–3 roles, never `admin`; expiry 1–90 days (default 30); shown once; the store keeps `key_id` + `sha256(secret)`. Effective permissions = the roles' union minus the key-forbidden set (§0.1.3). |
+| Legacy shared token | `X-Admin-Token: <ADMIN_TOKEN>` | edge | **Off by default.** Accepted only with `AUTH_LEGACY_ADMIN_TOKEN=1` (startup error if `ADMIN_TOKEN` is then empty) and only when no `Authorization` header is sent. Principal `legacy:admin_token` = every edge permission except `staff:manage` and `codes:rotate_any`. Every use is audited (`auth.legacy_token`), logged as deprecated, and `/v1/health` reports `degraded_reasons: ["legacy_admin_token"]`. The CORS allow-list carries `X-Admin-Token` only while the flag is on. |
+| Console operator | local access to `EDGE_DATA_DIR` + `.env` (`python -m edge.auth ...`) | OS | Full admin rights by construction (it can read the keys); audited as actor `{kind: "cli", id: "cli:<os user>"}`. |
+| Kiosk device (edge → cloud) | `X-Kiosk-Id`, `X-Timestamp`, `X-Signature` (kiosk HMAC) + `X-Api-Key` | cloud | Unchanged (§0 "Cloud auth"). Cloud admin routes additionally need a cloud admin credential (§0.1.9). |
+| Depth device | `X-Depth-Token` | edge | `/v1/depth/*` only (§3.17). The LAN listener serves nothing else; `/v1/auth/*` is a 404 there. |
+
+Credentials are read only from headers, never from a query string, and never logged. A malformed `Authorization`
+header (not `Bearer <one value>`) is a 401, not a fall-through to the legacy header. Responses that carry a
+secret (login, MFA enrolment, API-key creation, staff override codes, enrolment TOTP) send `Cache-Control:
+no-store` + `Pragma: no-cache`; every `/v1/auth/*`, `/v1/admin/staff*`, `/v1/admin/api-keys*`, `/v1/admin/roles`
+and `/v1/admin/auth/audit` response is `no-store`.
+
+### 0.1.2 Public routes (no staff credential, ever)
+
+`rbac.PUBLIC_ROUTES`: the entrant flow, health, the badge and the sign-in itself.
+
+| Method | Path |
+|---|---|
+| GET | `/v1/health` |
+| GET | `/v1/mode` (badge subset only; the full status is `GET /v1/admin/mode/detail`, §3.10) |
+| GET | `/v1/auth/status` |
+| POST | `/v1/auth/login` |
+| POST | `/v1/session/start` |
+| GET | `/v1/attempt/{attempt_id}` |
+| POST | `/v1/attempt/{attempt_id}/frames` · `/probe` · `/rendered` · `/challenge` · `/fallback` · `/otp/send` |
+
+`rbac.DEPTH_DEVICE_ROUTES` (`X-Depth-Token` only): `GET /v1/depth/pending`, `POST /v1/depth/frames`.
+
+### 0.1.3 Roles and permissions
+
+Edge roles (`rbac.EDGE_ROLES`). A staff account holds 1–3 roles; its permissions are their union. "legacy" =
+the `X-Admin-Token` principal; "API key" = may an API key ever hold it (`rbac.KEY_FORBIDDEN_PERMISSIONS`).
+
+| Permission | admin | security_officer | enroller | auditor | evaluator | legacy token | API key |
+|---|---|---|---|---|---|---|---|
+| `events:read` | yes | yes |  | yes | yes | yes | yes |
+| `metrics:read` | yes | yes |  | yes | yes | yes | yes |
+| `store:read` | yes | yes |  | yes | yes | yes | yes |
+| `attempt:signals` | yes | yes |  |  | yes | yes | yes |
+| `mode:switch` | yes | yes |  |  | yes | yes | yes |
+| `sync:run` | yes | yes |  |  |  | yes | yes |
+| `ratelimit:reset` | yes | yes |  |  | yes | yes | yes |
+| `eval:admin` | yes |  |  |  | yes | yes | yes |
+| `demo:clock` (`DEMO_MODE=1` only) | yes |  |  |  |  | yes | no |
+| `challenge:control` (`DEMO_MODE=1` only) | yes |  |  |  | yes | yes | yes |
+| `enrol:read` | yes | yes | yes | yes |  | yes | yes |
+| `enrol:write` | yes |  | yes |  |  | yes | yes |
+| `enrol:erase` | yes |  | yes |  |  | yes | no |
+| `access:read` | yes | yes | yes | yes |  | yes | yes |
+| `access:edit` | yes |  |  |  |  | yes | no |
+| `access:revoke` | yes | yes |  |  |  | yes | no |
+| `codes:rotate` | yes | yes |  |  |  | yes | no |
+| `codes:rotate_any` | yes |  |  |  |  |  | no |
+| `bundle:refresh` | yes | yes | yes |  |  | yes | yes |
+| `staff:manage` | yes |  |  |  |  |  | no |
+| `audit:read` | yes | yes |  | yes |  | yes | yes |
+
+- `demo:clock` and `challenge:control` are removed from **every** principal (and from `/v1/auth/me`) while
+  `DEMO_MODE=0`; the two routes then answer `403 FORBIDDEN` reason `NOT_DEMO_MODE` to any signed-in caller.
+- The role `admin` is refused for API keys. A key's effective permissions are `permissions_for(roles) −
+  KEY_FORBIDDEN_PERMISSIONS` (`staff:manage`, `codes:rotate`, `codes:rotate_any`, `access:edit`,
+  `access:revoke`, `enrol:erase`, `demo:clock`).
+- `codes:rotate` additionally needs a **staff session** (§3.18.4): an API key gets `403` reason
+  `MISSING_PERMISSION` (keys can never hold `codes:rotate`); the legacy token, which does list the permission,
+  gets `403` reason `NO_STAFF_IDENTITY`.
+- An enroller has no `access:edit`: `/register` tells the user to ask an admin to add a person who is not yet in
+  the schedule.
+- `GET /v1/admin/roles` returns this catalog at runtime (`{roles[{name, description, permissions, key_allowed}],
+  permissions, key_forbidden_permissions, max_roles_per_account, rbac_version}`); the kiosk UI never hard-codes it.
+
+Cloud roles (`rbac.CLOUD_ROLES`, enforced by the cloud, §0.1.9):
+
+| Role | Permissions |
+|---|---|
+| admin | `access:edit`, `access:read`, `alerts:read`, `audit:read`, `codes:rotate`, `contact:edit`, `decisions:read`, `metrics:read`, `revocations:write`, `schedule:read`, `schedule:write`, `stats:read` (+ `outbox:read` only while `EMAIL_BACKEND=fake`) |
+| edge_proxy | `access:edit`, `access:read`, `codes:rotate`, `revocations:write`, `schedule:read` |
+| auditor | `access:read`, `alerts:read`, `audit:read`, `decisions:read`, `metrics:read`, `schedule:read`, `stats:read` |
+
+### 0.1.4 Edge route → permission table
+
+`rbac.ROUTE_PERMISSIONS` (a route needs **all** listed permissions; "any principal" = any authenticated
+principal, including one that still has to change its password or enrol MFA where noted in §0.1.6). Every
+privileged route in `edge/app.py` takes its dependency from this table (`deps.for_route`).
+
+| Method | Path | Permission(s) |
+|---|---|---|
+| POST | `/v1/admin/access/codes/rotate` | `codes:rotate` (own `staff_id`; another staff id needs `codes:rotate_any`) |
+| GET | `/v1/admin/access/users` | `access:read` |
+| PUT | `/v1/admin/access/users/{user_id}` | `access:edit` |
+| POST | `/v1/admin/access/users/{user_id}/revoke` | `access:revoke` |
+| GET | `/v1/admin/alerts` | `audit:read` |
+| GET | `/v1/admin/api-keys` | `staff:manage` |
+| POST | `/v1/admin/api-keys` | `staff:manage` |
+| DELETE | `/v1/admin/api-keys/{key_id}` | `staff:manage` |
+| GET | `/v1/admin/attempt/{attempt_id}/signals` | `attempt:signals` |
+| GET | `/v1/admin/auth/audit` | `audit:read` |
+| POST | `/v1/admin/bundle/refresh` | `bundle:refresh` |
+| POST | `/v1/admin/clock` | `demo:clock` |
+| DELETE | `/v1/admin/eval/context` | `eval:admin` |
+| POST | `/v1/admin/eval/context` | `eval:admin` |
+| POST | `/v1/admin/mode` | `mode:switch` |
+| GET | `/v1/admin/mode/detail` | `store:read` |
+| POST | `/v1/admin/random-challenge` | `challenge:control` |
+| POST | `/v1/admin/rate-limit/reset` | `ratelimit:reset` |
+| GET | `/v1/admin/roles` | any principal |
+| GET | `/v1/admin/staff` | `staff:manage` |
+| POST | `/v1/admin/staff` | `staff:manage` |
+| DELETE | `/v1/admin/staff/{staff_id}` | `staff:manage` |
+| GET | `/v1/admin/staff/{staff_id}` | `staff:manage` |
+| PATCH | `/v1/admin/staff/{staff_id}` | `staff:manage` |
+| POST | `/v1/admin/staff/{staff_id}/mfa/reset` | `staff:manage` |
+| POST | `/v1/admin/staff/{staff_id}/password` | `staff:manage` |
+| POST | `/v1/admin/staff/{staff_id}/unlock` | `staff:manage` |
+| GET | `/v1/admin/store` | `store:read` |
+| POST | `/v1/admin/sync` | `sync:run` |
+| GET | `/v1/admin/sync/last` | `audit:read` |
+| GET | `/v1/admin/users` | `enrol:read` |
+| POST | `/v1/auth/activity` | any principal |
+| POST | `/v1/auth/logout` | any principal |
+| GET | `/v1/auth/me` | any principal |
+| POST | `/v1/auth/mfa/confirm` | any principal (staff session only, else 403 `NO_STAFF_IDENTITY`) |
+| POST | `/v1/auth/mfa/enroll` | any principal (staff session only, else 403 `NO_STAFF_IDENTITY`) |
+| POST | `/v1/auth/password` | any principal (staff session only, else 403 `NO_STAFF_IDENTITY`) |
+| POST | `/v1/enroll` | `enrol:write` |
+| DELETE | `/v1/enroll/{user_id}` | `enrol:erase` |
+| GET | `/v1/events` | `events:read` |
+| GET | `/v1/metrics` | `metrics:read` |
+
+Order of checks on a privileged route: `Host` allow-list (`TrustedHostMiddleware`: `127.0.0.1`, `localhost`,
+`[::1]` + `EDGE_EXTRA_ALLOWED_HOSTS`; else plain-text 400) → body-size cap (`edge/http_guards.py`
+`BodyLimitMiddleware`, per-route `ROUTE_BODY_MAX`, 64 KB default, `413 PAYLOAD_TOO_LARGE`) → foreign `Origin` on a non-GET request (`403 FORBIDDEN`
+reason `ORIGIN_NOT_ALLOWED`; allow-list = `EDGE_CORS_ORIGINS`) → credential (401) → pending action (403) →
+permission (403). CORS (`edge/app.py`): methods include `PATCH`; request headers `Content-Type`,
+`Authorization`, `X-FG-Activity` (+ `X-Admin-Token` only with the legacy flag); exposed `X-Latency-Ms`,
+`Retry-After`. `/docs` and `/openapi.json` are served only with `DEMO_MODE=1`.
+
+### 0.1.5 Sign-in, session and staff self-service routes
+
+Error envelope = §0 (`{"error": {code, message, attempt_id: null, reason?, ...}}`). Reasons are in §0.1.8.
+
+**`GET /v1/auth/status`** (public) → 200 `{store: "OK" | "EMPTY" | "MISSING" | "UNAVAILABLE", accounts_exist,
+legacy_token_enabled, mfa_required_roles[]}`. Never lists usernames. `EMPTY` = no staff store and no audit log
+yet: the login screen shows the bootstrap command (README "First admin").
+
+**`POST /v1/auth/login`** (public). Body (unknown fields → 422), exactly one of:
+
+```json
+{"username": "guard01", "password": "<password>", "totp_code": "123456"}
+{"mfa_ticket": "<opaque ticket from a 401 MFA_REQUIRED>", "totp_code": "123456"}
+```
+
+`totp_code` is optional in the first form (`^\d{6}$`). 200, `no-store`:
+
+```json
+{"token": "fgs_...", "token_type": "Bearer", "expires_at": "2026-11-15T20:30:00Z", "idle_timeout_s": 1800,
+ "principal": {"kind": "staff", "id": "s_guard01", "staff_id": "s_guard01", "actor_id": "staff:s_guard01",
+               "username": "guard01", "display_name": "Guard 01", "roles": ["security_officer"],
+               "permissions": ["audit:read", "events:read", "..."], "must_change_password": false,
+               "mfa_enrolment_required": false, "mfa_enabled": true}}
+```
+
+Behaviour, in this order (`edge/auth/login.py`):
+1. **Global cap**: more than `AUTH_LOGIN_GLOBAL_MAX` (60) attempts in `AUTH_LOGIN_GLOBAL_WINDOW_MIN` (5) minutes,
+   all usernames together → `429 RATE_LIMITED`.
+2. **Per-username progressive delay** (checked before any password hashing): from the
+   `AUTH_LOCKOUT_THRESHOLD`-th (5th) consecutive failure on, the next attempt must wait 2^(n−5) s (1 s, 2 s,
+   4 s, ...), capped at `AUTH_LOCKOUT_MIN` (15) minutes → `429 RATE_LIMITED` with `retry_after_s` and a
+   `Retry-After` header. Unknown usernames are tracked exactly like real ones (no existence leak). This is a soft
+   delay, never a hard lock: during it only a correct password **plus** a valid TOTP on an MFA account gets
+   through. Counters are flushed to the store at most once a minute and re-seeded after a restart; a stored wait
+   longer than the cap is ignored. A **separate per-account TOTP delay** (same threshold and cap, keyed by
+   `staff_id`) counts wrong authenticator codes; a TOTP code cannot bypass it, so a known password does not give
+   unlimited second-factor guesses. Unknown usernames are not written to the audit log.
+3. **KDF admission**: scrypt runs on a dedicated 2-thread pool (`auth-kdf`), never the decision pool. If both
+   threads are busy → `429 RATE_LIMITED` `retry_after_s: 1`.
+4. Unknown username (a dummy scrypt runs) or wrong password → `401 UNAUTHORIZED` reason `INVALID_CREDENTIALS`
+   (indistinguishable). `ACCOUNT_DISABLED` is returned only after a correct password.
+5. MFA account without `totp_code` → `401` reason `MFA_REQUIRED` with `error.mfa_ticket` (opaque, single use,
+   2 min): re-post `{mfa_ticket, totp_code}` (no second password hash). A wrong or replayed code → `401`
+   `MFA_INVALID`; an expired or used ticket → `401` `MFA_INVALID`.
+
+**`POST /v1/auth/logout`** → 204 (ends this session). **`POST /v1/auth/activity`** → 204 (refreshes the idle
+timer; the kiosk sends it at most once per 60 s on user input). **`GET /v1/auth/me`** → 200 `{principal,
+session: {session_id, expires_at, idle_timeout_s} | null}` (`session` is null for an API key or the legacy
+token).
+
+**`POST /v1/auth/password`** `{current_password, new_password}` → 204. Ends every **other** session of the
+account; clears `must_change_password`. New passwords: 12–128 characters (NFKC), at least 5 different
+characters, must not contain the username, not on a small deny list; equal to the current one → 422
+`PASSWORD_POLICY`. A wrong `current_password` → 403 `REAUTH_REQUIRED` (and counts as a failed sign-in).
+
+**`POST /v1/auth/mfa/enroll`** `{current_password}` (required: 422 without it, 403 `REAUTH_REQUIRED` when wrong) → 200, `no-store`, `{secret, otpauth_uri}`
+(shown once; the kiosk shows them as text for manual entry). Already enabled → 409 `MFA_ALREADY_ENABLED`.
+**`POST /v1/auth/mfa/confirm`** `{totp_code}` → 204 (the pending secret becomes active); a wrong code → 422
+`MFA_INVALID`, nothing pending → 409 `MFA_NOT_PENDING`. TOTP = RFC 6238, 6 digits, 30 s, ±1 step,
+replay-protected (the last accepted step is stored), always against real UTC (never the demo clock).
+
+### 0.1.6 Sessions, MFA enforcement, store states
+
+- **Sessions** (`edge/auth/sessions.py`): idle timeout `AUTH_SESSION_IDLE_MIN` (30 min), absolute lifetime
+  `AUTH_SESSION_MAX_HOURS` (12 h), at most `AUTH_MAX_SESSIONS_PER_USER` (5) per account (oldest evicted). Timers
+  use a monotonic clock, never the demo clock. **Only** non-GET requests, requests with `X-FG-Activity: 1`, and
+  `POST /v1/auth/activity` refresh the idle timer; GET polls and the SSE stream never extend a session. An
+  expired / revoked session → `401` reason `SESSION_EXPIRED`.
+- **Revocation in every process**: each account has a `session_epoch`, bumped on disable, role change, password
+  reset by an admin, MFA reset and deletion (a self-service password change revokes the other sessions and keeps
+  the current one). The edge re-stats `staff.fernet` at most once per second and reloads it when the file
+  changed (so a CLI change takes effect without a restart); a session from an older epoch → 401.
+- **SSE**: `GET /v1/events` re-checks the principal before every event and at every heartbeat (≤ 15 s). When the
+  session expires, is revoked or loses `events:read`, the edge sends `event: auth` with data
+  `{"reason":"SESSION_ENDED"}` and closes the stream. At most a bounded number of streams run at once (429
+  `RATE_LIMITED` `retry_after_s: 30` beyond it).
+- **Pending actions**: a staff principal with `must_change_password` gets `403` reason `PASSWORD_CHANGE_REQUIRED`,
+  and one that holds a role listed in `AUTH_MFA_REQUIRED_ROLES` (unset or empty = `admin,security_officer`; only
+  the word `none` disables it) without MFA gets `403` reason `MFA_ENROLMENT_REQUIRED` (password change first), on every route
+  except `/v1/auth/me`, `/logout`, `/activity`, `/password` and `/v1/auth/mfa/*`.
+- **Staff store** (`<EDGE_DATA_DIR>/staff.fernet`, Fernet under HKDF-SHA256(`EDGE_DATA_KEY`, "faceguard
+  staff-store v1"), or `STAFF_STORE_KEY` when set): every mutation (edge or CLI) takes a file lock (5 s timeout →
+  `503 AUTH_BUSY` / CLI exit 75), re-reads, applies, writes atomically and bumps a generation counter, then writes the
+  HMAC'd sidecar `staff.marker` (`{generation, mac}`), so a rollback is detected across restarts and in CLI
+  processes. States: `OK`; `EMPTY` (no store, no marker, no store history in the audit log: bootstrap); `MISSING`
+  (no store but the marker or the audit log shows one existed; `create-user --recreate-store` overrides);
+  `UNAVAILABLE` (wrong key, corrupt file, invalid marker, or a generation lower than the marker's or one already
+  seen). Not detectable: restoring an older `staff.fernet` together with its own older marker, or deleting the
+  marker. With `MISSING` or `UNAVAILABLE` every authenticated route
+  answers `503 AUTH_UNAVAILABLE`, the legacy token does **not** bypass it, the file is never wiped, and
+  `/v1/health` reports `auth_unavailable`. 20 or more failed sign-ins within 10 min add `auth_bruteforce`.
+- **Audit log** (`<EDGE_DATA_DIR>/audit.jsonl`, 0600, rotated at `AUTH_AUDIT_MAX_BYTES` keeping
+  `AUTH_AUDIT_KEEP` files): one JSON line per sign-in, logout, staff / key / MFA change, legacy-token use and
+  aggregated permission denial (one line per actor, route, reason and minute, with `count`). Lines are chained
+  with HMAC-SHA256 (`prev_mac`, `mac`) under HKDF(`EDGE_DATA_KEY`, "faceguard audit-chain v1"); the first line of
+  a rotated file carries the previous file's last `mac`. Requests without any credential are only counted. No
+  passwords, tokens, codes or images are written (secret-looking values are redacted).
+
+### 0.1.7 Staff and API-key administration (`staff:manage`)
+
+Every mutation below needs `confirm_password` (the caller's own password) in the body: wrong or missing → `403`
+reason `REAUTH_REQUIRED`. Bodies reject unknown fields. Usernames match `^[a-z][a-z0-9_]{1,30}$`, are immutable,
+and these are reserved: `admin`, `root`, `administrator`, `sa`, `test`, `demo`, `system`, `kiosk` (422
+`RESERVED_USERNAME`). `staff_id = "s_" + username`.
+
+| Route | Body | Response |
+|---|---|---|
+| `GET /v1/admin/staff` | — | 200 `{items[Staff]}` |
+| `POST /v1/admin/staff` | `{username, display_name (1–80), roles[1..3], temporary_password, confirm_password}` | 201 `{item: Staff}` (`must_change_password: true`) |
+| `GET /v1/admin/staff/{staff_id}` | — | 200 `{item: Staff}` |
+| `PATCH /v1/admin/staff/{staff_id}` | `{display_name?, roles?, status?: "active" \| "disabled", confirm_password}` | 200 `{item: Staff}` |
+| `DELETE /v1/admin/staff/{staff_id}` | `{confirm_password}` | 204 |
+| `POST /v1/admin/staff/{staff_id}/password` | `{temporary_password, confirm_password}` | 204 (sets `must_change_password`, ends its sessions, clears its sign-in delay) |
+| `POST /v1/admin/staff/{staff_id}/unlock` | `{confirm_password}` | 204 (clears the sign-in delay) |
+| `POST /v1/admin/staff/{staff_id}/mfa/reset` | `{confirm_password}` | 204 (removes TOTP, ends its sessions) |
+| `GET /v1/admin/api-keys` | — | 200 `{items[ApiKey]}` |
+| `POST /v1/admin/api-keys` | `{name (1–64), roles[1..3], expires_days (1–90, default 30), confirm_password}` | 201, `no-store`, `{key: "fgk_<key_id>.<secret>", item: ApiKey}` (the key is shown once) |
+| `DELETE /v1/admin/api-keys/{key_id}` | `{confirm_password}` | 204 (revoking twice is a no-op) |
+| `GET /v1/admin/auth/audit?limit=1..500&before_seq=` (`audit:read`) | — | 200 `{as_of, count, items[], next_before_seq}` (newest first; `next_before_seq` null = no more) |
+
+`Staff` = `{staff_id, username, display_name, roles[], status, locked, locked_until, failed_logins, mfa_enabled,
+must_change_password, created_at, updated_at, password_changed_at, last_login_at}` (never a hash or secret).
+`ApiKey` = `{key_id, name, roles[], permissions[], status: "active" | "expired" | "revoked", created_at,
+created_by, expires_at, last_used_at, revoked_at}`. Audit item = `{ts_utc, seq, prev_mac, mac, actor{kind, id,
+username}, action, target, outcome: "ok" | "denied" | "error", client_ip, detail{}, count?}`.
+
+Privilege rules (`edge/auth/staff_ops.py`):
+- Nobody changes their own roles or status, deletes their own account or resets their own password through the
+  admin route → `403 SELF_MODIFICATION`.
+- An actor may grant only roles (or create keys) whose permissions are a subset of its own → `403 ROLE_CEILING`
+  (`beyond[]`).
+- The last active admin cannot be disabled, demoted or deleted → `403 LAST_ADMIN` (checked inside the store lock).
+- Disabling or deleting an account ends its sessions and revokes the API keys it created.
+- API keys never reach these routes (`staff:manage` is key-forbidden); the legacy token lacks `staff:manage`.
+
+### 0.1.8 Error reasons (auth)
+
+| HTTP · code | `error.reason` |
+|---|---|
+| 401 `UNAUTHORIZED` | `CREDENTIAL_INVALID` (no / malformed / unknown / revoked / expired credential), `SESSION_EXPIRED`, `INVALID_CREDENTIALS`, `MFA_REQUIRED` (+ `mfa_ticket`), `MFA_INVALID`, `ACCOUNT_DISABLED` |
+| 403 `FORBIDDEN` | `MISSING_PERMISSION` (+ `required[]`), `PASSWORD_CHANGE_REQUIRED`, `MFA_ENROLMENT_REQUIRED`, `REAUTH_REQUIRED`, `STAFF_ID_NOT_OWN`, `NO_STAFF_IDENTITY`, `SELF_MODIFICATION`, `LAST_ADMIN`, `ROLE_CEILING` (+ `beyond[]`), `NOT_DEMO_MODE`, `ORIGIN_NOT_ALLOWED` |
+| 404 `NOT_FOUND` | unknown staff account / API key |
+| 409 `INVALID_STATE` | `USERNAME_TAKEN`, `MFA_ALREADY_ENABLED`, `MFA_NOT_PENDING` |
+| 422 `VALIDATION_ERROR` | `INVALID_USERNAME`, `RESERVED_USERNAME`, `INVALID_DISPLAY_NAME`, `INVALID_NAME`, `INVALID_ROLES`, `PASSWORD_POLICY` (+ `problems[]`), `EMPTY_UPDATE`, `INVALID_STATUS`, `INVALID_EXPIRY`, `MFA_INVALID`; body-shape errors carry `details[]` and no reason |
+| 429 `RATE_LIMITED` | no reason; `retry_after_s` + `Retry-After` header (sign-in delay, global cap, KDF busy, SSE capacity) |
+| 503 `AUTH_UNAVAILABLE` · `AUTH_BUSY` | staff store missing / unreadable / no auth service · store lock busy (`retry_after_s: 1`) |
+
+### 0.1.9 Cloud admin credential model
+
+`/v1/admin/*` on the cloud needs the kiosk HMAC (`401` when it fails) **plus** an admin principal
+(`cloud/app/rbac.py`, `cloud/app/routers/deps.py`):
+- **`Authorization: Bearer fgk_<key_id>.<secret>`**, looked up in `CLOUD_API_KEYS_JSON` (`[{key_id, sha256 of
+  the secret part, roles, name, kiosk_ids?, expires_at?}]`, parsed at startup; a malformed list stops the cloud).
+  Keys are minted with `cloud/.venv/bin/python -m cloud.tools.apikey --name ... --roles ... [--kiosk-id ...]`,
+  which prints the key once plus the JSON entry. If an `Authorization` header is present it alone decides.
+- **`X-Admin-Token`** (legacy): accepted only with the cloud's `AUTH_LEGACY_ADMIN_TOKEN=1`, compared with
+  `CLOUD_ADMIN_TOKEN` (or `ADMIN_TOKEN`); principal = role `admin`.
+- Every admin-credential failure is **`403 FORBIDDEN`** (never 401) with reason `ADMIN_KEY_INVALID`,
+  `ADMIN_KEY_EXPIRED`, `MISSING_PERMISSION` (+ `required[]`), `KIOSK_NOT_BOUND` or `LEGACY_DISABLED`, counted
+  in the `AdminAuthFailures` metric.
+- **`edge_proxy` binding**: an `edge_proxy` key must list exactly one `kiosk_id` (startup `ConfigError`
+  otherwise), and that kiosk must be the HMAC-authenticated caller (`KIOSK_NOT_BOUND`). Any key with `kiosk_ids`
+  is bound the same way.
+- **Actor**: for an `edge_proxy` key the cloud records the actor the edge asserts in the HMAC-signed body (or in
+  the signed `?actor=` query of `DELETE /v1/enroll/{user_id}`), which must match
+  `^(staff:s_[0-9a-z_]{2,32}|key:[a-z0-9]{8}|legacy:admin_token)$` (`422 VALIDATION_ERROR` reason
+  `ACTOR_INVALID` otherwise), with `actor_assurance: "edge_asserted"` and `via: "key:<key_id>"`. Other keys are
+  recorded as `key:<key_id>` (`authenticated`; a client `actor` is ignored); the legacy token as
+  `legacy:admin_token`. Asserted actors are never used for authorisation. Device-scoped routes (`POST` /
+  `DELETE /v1/enroll`) need only the kiosk HMAC and record the asserted actor.
+- **Edge outbound credential** (`edge/cloud_client.py`): `CLOUD_EDGE_PROXY_KEY` set → `Authorization: Bearer
+  <key>`; else `CLOUD_ADMIN_TOKEN` set → `X-Admin-Token` (legacy); it never falls back to the edge's inbound
+  `ADMIN_TOKEN`. The edge always derives the actor from its own principal (`staff:<staff_id>` | `key:<key_id>` |
+  `legacy:admin_token`) and ignores any client `actor`. A cloud `403` reaches the kiosk as `403 FORBIDDEN` with
+  the cloud's reason unchanged (`cloud_status: 403`).
+- Cloud route → permission (`cloud/app/rbac.py` `ROUTE_PERMISSIONS`): `GET /v1/admin/schedule` `schedule:read`
+  (override-code `hash` / `salt` redacted unless the caller also has `schedule:write`); `PUT /v1/admin/schedule`,
+  `PUT /v1/admin/schedule/{kiosk_id}` `schedule:write`; `POST /v1/admin/revocations` `revocations:write`; `GET
+  /v1/admin/users` `access:read`; `PUT /v1/admin/users/{user_id}/access` `access:edit`; `POST
+  /v1/admin/codes/rotate` `codes:rotate`; `GET /v1/admin/audit` `audit:read`; `GET /v1/admin/alerts`
+  `alerts:read`; `GET /v1/admin/decisions` `decisions:read`; `GET /v1/admin/stats` `stats:read`; `GET
+  /v1/admin/metrics` `metrics:read`; `PUT /v1/admin/users/{user_id}/contact` `contact:edit`; `GET
+  /v1/admin/fake/outbox` `outbox:read`.
+
+- **Cloud startup requirements** (`cloud/app/config.py`): per-kiosk HMAC keys in `KIOSK_KEYS_JSON`
+  (`{kiosk_id: key}`) unless `ALLOW_SHARED_KIOSK_KEY=1` with `KIOSK_HMAC_KEY`; `OTP_PEPPER` unless
+  `STORE_BACKEND=memory`; `CLOUD_ADMIN_TOKEN` or `ADMIN_TOKEN` only when `AUTH_LEGACY_ADMIN_TOKEN=1`; a malformed
+  `CLOUD_API_KEYS_JSON` stops the cloud. `CLOUD_ACCEPT_BARE_PATH_SIG=1` (default off) is a transition flag that
+  also accepts a signature over the path without `?query`.
+- **Known limits (follow-ups)**: (1) the kiosk HMAC covers `METHOD`, `PATH`, `X-Timestamp` and the body hash,
+  **not** the `Authorization` header, so a captured signed request could be replayed with a different bearer
+  inside the 60 s skew window: any signed GET, or a non-GET intercepted before it reaches the cloud (the replay
+  cache, keyed by `kiosk_id:signature`, makes a delivered non-GET single-use; `/v1/sync` and `/v1/schedule/check`
+  are exempt); fix = a signature v2 that
+  covers the auth headers. (2) `edge_proxy` keys hold `access:edit` unscoped by zone; only the edge stops
+  non-admins from using it (on the edge only `admin` holds `access:edit`), so a stolen kiosk key can edit any
+  user's access.
+
+### 0.1.10 Kiosk client behaviour (`kiosk/src/shared/auth/`, `kiosk/vite.config.ts`)
+
+- Staff sign in only on the path routes `/admin` (any signed-in account; panels gated by permission),
+  `/operator` (`events:read`) and `/register` (`enrol:write`); the old hash routes (`#/admin`) are gone. The
+  public kiosk `/` never holds a staff credential: on load it removes `hid.session` and the old `hid.adminToken`
+  and calls `POST /v1/auth/logout` if a session token was there.
+- The session token lives in memory and in `sessionStorage` `hid.session` only on the staff routes. A 401 on a
+  request that sent the session token clears it and shows the sign-in ("Session expired, sign in again"). The
+  client also signs out after 10 minutes without input (on top of the edge's 30-minute idle timeout).
+- `?mock=1` and the other debug URL flags work only in a dev-server build or a build with `VITE_ALLOW_MOCK=1`.
+- A Content-Security-Policy `<meta>` is injected by the Vite plugin: `connect-src 'self'` + the `VITE_EDGE_URL`
+  origin + `VITE_CSP_CONNECT_SRC`; `script-src 'self' 'wasm-unsafe-eval'` (MediaPipe WebAssembly).
+- Contract file: `docs/contracts/admin_access.examples.json` carries `permission` per route (`permission_any_of`
+  on codes rotate), the auth schemes `edge_session`, `edge_api_key`, `edge_legacy_admin` (and the activity
+  header), and a top-level `auth_routes` block with examples for `/v1/auth/*`. Its examples still send
+  `X-Admin-Token` because the test suites run with `AUTH_LEGACY_ADMIN_TOKEN=1`.
+
+### 0.1.11 Changelog
+
+- **v1.5 (2026-11-15, RBAC)**: individual staff accounts (`/v1/auth/*`), roles and permissions on every
+  privileged edge route; `GET /v1/events` and `GET /v1/metrics` now need `events:read` / `metrics:read`; edge API
+  keys for automation (`FG_EVAL_API_KEY`, `FG_OPS_API_KEY`); `X-Admin-Token` is legacy, off by default
+  (`AUTH_LEGACY_ADMIN_TOKEN=1`); new `GET /v1/admin/mode/detail` (`store:read`), `GET /v1/admin/alerts`, `GET
+  /v1/admin/sync/last`; `GET /v1/mode` is the public badge subset; `POST /v1/admin/mode` takes `reason?`,
+  `max_minutes?` and a forced OFFLINE auto-reverts; cloud admin routes take Bearer API keys with per-route
+  permissions and `edge_proxy` kiosk binding; staff override codes need a staff session (own `staff_id`).
 
 ---
 
@@ -350,7 +771,8 @@ DEFORMATION_ACTIONS = frozenset({"SMILE", "OPEN_MOUTH", "PUFF_CHEEKS"})
 SECONDARY_ACTIONS = frozenset({"BLINK", "TURN_LEFT", "TURN_RIGHT"})
 Hint = Literal["move_closer", "more_light", "hold_still", "one_person", "face_camera"]
 
-# Closed list = DECISION_POLICY.md section 6 (required + added; RANDOM_CHALLENGE added in v1.1). Section 2 below.
+# Closed list = edge/policy/codes.py CODE_ORDER (40 codes; RANDOM_CHALLENGE added in v1.1, FALLBACK_LOCKED in v1.5).
+# Section 2 below.
 ReasonCode = Literal[
     "RATE_LIMITED", "SYSTEM_ERROR",
     "MULTIPLE_FACES", "QUALITY_LOW_LIGHT", "QUALITY_BLUR", "QUALITY_POSE", "QUALITY_DEPTH_INVALID",
@@ -364,7 +786,7 @@ ReasonCode = Literal[
     "SCHEDULE_ZONE_NOT_PERMITTED", "SCHEDULE_HOLIDAY", "SCHEDULE_REVOKED", "SCHEDULE_HIGH_RISK_ZONE",
     "SCHEDULE_EXPIRED_CACHE", "SCHEDULE_BUNDLE_INVALID",
     "OFFLINE_MODE", "OFFLINE_HIGH_RISK_ZONE", "OFFLINE_FALLBACK_REQUIRED",
-    "CHALLENGE_FAILED", "FALLBACK_OK", "FALLBACK_FAILED",
+    "CHALLENGE_FAILED", "FALLBACK_OK", "FALLBACK_FAILED", "FALLBACK_LOCKED",   # FALLBACK_LOCKED: v1.5
     "ACCESS_OK",
 ]
 
@@ -396,7 +818,7 @@ class NextAction(_Out):
     methods: list[FallbackMethod] | None = None            # non-null iff SECOND_FACTOR in steps
     challenge: ChallengeSpec | None = None                 # non-null iff type == CHALLENGE
     attempts_left: int | None = None    # further failures tolerated for the pending step: first issue 1, after one failure 0 (= last try)
-    retry_after_s: int | None = None    # only for DENY RATE_LIMITED
+    retry_after_s: int | None = None    # DENY RATE_LIMITED, and (v1.5) STEP_UP FALLBACK_LOCKED: seconds until the lock ends
     hint: Hint | None = None            # only for RECAPTURE
 
     @model_validator(mode="after")
@@ -679,10 +1101,11 @@ This DENY therefore rests on passive PAD + the device detector + moiré. On BIO_
 
 ## 2. Canonical reason codes
 
-This is the closed list of `DECISION_POLICY.md` §6 (39 codes; `RANDOM_CHALLENGE` was added in v1.1). No other codes may
-appear in `reason_codes` or `resolved_codes`. "Typical decision" is indicative: DECISION_POLICY §3–§9 decide
-when each code fires. `reason_codes` are in stage order: pre-check, quality, injection, liveness hard, mask,
-liveness unsure, identity, schedule, mode, step-up, final. Tests compare sets.
+This is the closed list of `edge/policy/codes.py` `CODE_ORDER`, shared with `DECISION_POLICY.md` §6 (40 codes;
+`RANDOM_CHALLENGE` was added in v1.1, `FALLBACK_LOCKED` in v1.5). No other codes may appear in `reason_codes` or
+`resolved_codes` (`order_codes` raises on an unknown code, which gives `SYSTEM_ERROR`). "Typical decision" is indicative: DECISION_POLICY §3–§9 decide
+when each code fires. `reason_codes` are in `CODE_ORDER` order: `SYSTEM_ERROR` first, then pre-check, quality, injection, liveness hard,
+mask, liveness unsure, identity, schedule, mode, step-up, final. Tests compare sets.
 
 **Quality outcome (applies to all five quality codes).** While `recapture_count < quality.max_recaptures` (2):
 STEP_UP / RECAPTURE with a `hint`. When recaptures are exhausted:
@@ -719,23 +1142,24 @@ STEP_UP / RECAPTURE with a `hint`. When recaptures are exhausted:
 | `LIVENESS_UNSURE` | liveness | STEP_UP (CHALLENGE; offline also SECOND_FACTOR) | Any liveness signal in its UNSURE band. Includes: PAD UNSURE (R11), device box 0.25–0.40 overlapping the face (R10), an unknown camera label only when `injection.unknown_label_is_unsure` is true (currently false: an unknown non-virtual label is PASS), D0 0.40–0.60, flash WEAK when enforced and the ambient exception does not apply, and **flash NOT_AVAILABLE because `flash_enabled=false`** (accessibility path, R3/D5: never auto-ALLOW without the flash check, even while the flash is advisory). | "Please follow the on-screen check" |
 | `RANDOM_CHALLENGE` | liveness | STEP_UP (CHALLENGE) | **On** (restored 2026-11-14 at the operator's request): `challenge.random_rate` is **0.15 online / 0.30 offline** (`offline.overrides.challenge.random_rate`). A BIO_PASS that would be ALLOW is converted with that probability as a rigid-mask defence (D6): one draw per would-be ALLOW, never on STEP_UP or DENY. The challenge is one of SMILE / OPEN_MOUTH plus one of BLINK / TURN_LEFT / TURN_RIGHT. Demo control via `POST /v1/admin/random-challenge` (§3.14a: `FORCE_NEXT`, `FORCE`, `OFF`, `AUTO`). On pass the result is ALLOW `[ACCESS_OK]`, `resolved_codes: ["RANDOM_CHALLENGE"]`. | "Quick extra check" |
 | `MATCH_LOW` | identity (`stage: match`) | STEP_UP (SECOND_FACTOR) | Low-confidence band (UNSURE, **not** a failure): local cosine in [0.30, allow), or Rekognition 80–99 | "Please verify your identity" |
-| `MATCH_AMBIGUOUS` | identity | STEP_UP (SECOND_FACTOR) | Margin top1 − top2 too small, Rekognition runner-up ≥ 80, local/Rekognition disagreement (local top-1 is a different user with cosine ≥ `identity.cross_check_conflict_min_cosine` 0.50, R9), no usable local cross-check online, or identity switch between first and last frame | "Please verify your identity" |
+| `MATCH_AMBIGUOUS` | identity | STEP_UP (SECOND_FACTOR) | Margin top1 − top2 too small, Rekognition runner-up ≥ 80, local/Rekognition disagreement (local top-1 is a different user with cosine ≥ `identity.cross_check_conflict_min_cosine` 0.50, R9), no usable local cross-check online, or an **inconsistent frame set** (online and offline, while `match.local.require_same_identity_first_last_frame` is true): the last matched frame's top-1 differs from the first one's, or (v1.5, verify M01) **any** embedded frame's top-1 is a different enrolled user at local cosine ≥ `match.local.deny_below_cosine` (0.30), e.g. a victim photo shown inside a live burst (`edge/policy/identity.py` `local_summary`) | "Please verify your identity" |
 | `NOT_ENROLLED` | identity | DENY (CONTACT_DESK) | The **only** match FAIL: local top-1 < 0.30, or Rekognition < 80 / no match, or (offline / Rekognition disabled) the template cache is unusable (> 72 h). Online with Rekognition, a missing local cross-check gives `MATCH_AMBIGUOUS` instead. | "Not enrolled, please contact the desk" |
 | `SCHEDULE_OUTSIDE_WINDOW` | schedule | DENY (NONE); with BIO_UNSURE, DENY (CONTACT_DESK) | No window covers t0, beyond grace | "Outside your access hours" |
 | `SCHEDULE_GRACE_WINDOW` | schedule | STEP_UP (SECOND_FACTOR) with BIO_PASS; with BIO_UNSURE, DENY (CONTACT_DESK) | Within `grace_minutes` (15) of a window edge (0 for high-risk zones) | "Extra check needed (outside hours)" |
 | `SCHEDULE_NO_ENTITLEMENT` | schedule | DENY (CONTACT_DESK) | Unknown in the bundle, validity range or visitor pass not covering t0 | "No access entitlement" |
 | `SCHEDULE_ZONE_NOT_PERMITTED` | schedule | DENY (CONTACT_DESK) | Role or user not permitted in this zone | "Zone not permitted" |
-| `SCHEDULE_HOLIDAY` | schedule | DENY (NONE) | Holiday or closure for this zone, and the role is not exempt | "Campus closed today" |
-| `SCHEDULE_REVOKED` | schedule | DENY (CONTACT_DESK) | User revoked (bundle or revocation feed). Time-aware: applies when `revoked_at` ≤ t0. Checked first (precedence over every other schedule result). Revoked users' templates are purged at the next refresh, so offline they come out `NOT_ENROLLED` (R16). The code currently excludes them from the gallery search instead, which has the same offline result **(code pending:** actual purge). | "Access revoked" |
+| `SCHEDULE_HOLIDAY` | schedule | DENY (NONE) | Holiday or closure for this zone, and the role is not exempt. v1.5 (F02): also inside the after-midnight part of a window whose start day is a holiday | "Campus closed today" |
+| `SCHEDULE_REVOKED` | schedule | DENY (CONTACT_DESK) | User revoked (bundle or revocation feed). Time-aware: applies when `revoked_at` ≤ t0 (live edge decisions: ≤ t0 + `cache.clock_rollback_tolerance_s`, 300 s, so an edge clock behind the cloud cannot ignore a held revocation, F03; the cloud re-evaluation stays strict). With a rolled-back clock any held revocation still denies, together with `SCHEDULE_BUNDLE_INVALID` (F04). Checked first (precedence over every other schedule result). Revoked users' templates are purged at the next refresh, so offline they come out `NOT_ENROLLED` (R16). The code currently excludes them from the gallery search instead, which has the same offline result **(code pending:** actual purge). | "Access revoked" |
 | `SCHEDULE_HIGH_RISK_ZONE` | schedule | STEP_UP (SECOND_FACTOR, `online_high_risk` methods) | Online high-risk zone needs a step-up even IN_WINDOW, when `schedule.high_risk_requires_stepup_online` is true (default; R8) | "Second factor required for this zone" |
 | `SCHEDULE_EXPIRED_CACHE` | mode | STEP_UP (SECOND_FACTOR `[STAFF_OVERRIDE]`) for BIO_PASS IN_WINDOW/GRACE and BIO_UNSURE IN_WINDOW (E1/E3); added to the DENY for deny-type results and for BIO_UNSURE + GRACE (E2/E4, CONTACT_DESK) | Offline and bundle past `min(expires_at, issued_at + 12 h)`. Stale data may deny, never allow (P5). | "Offline: staff verification needed" |
-| `SCHEDULE_BUNDLE_INVALID` | mode | **No last valid bundle** (none ever verified): DENY (CONTACT_DESK), `zone: "UNKNOWN"`, `schedule_result: null` (R6). **LVB present but clock rolled back** (now < LVB `issued_at` − 300 s, offline): STEP_UP (SECOND_FACTOR `cache_untrusted` = `[STAFF_OVERRIDE]`, preceded by CHALLENGE if liveness was unsure). | A received bundle that fails verification is rejected with an alert and **never** replaces the LVB. A bundle file tampered on disk while running is rejected the same way, and the in-memory LVB stays in force. Override codes and kiosk zone/risk always come from the LVB. | "Please contact the desk" / "Offline: staff verification needed" |
+| `SCHEDULE_BUNDLE_INVALID` | mode | **No last valid bundle** (none ever verified): DENY (CONTACT_DESK), `zone: "UNKNOWN"`, `schedule_result: null` (R6). **LVB present but clock rolled back** (now < LVB `issued_at` − 300 s, offline): STEP_UP (SECOND_FACTOR `cache_untrusted` = `[STAFF_OVERRIDE]`, preceded by CHALLENGE if liveness was unsure); v1.5 (F04, I4): if the edge holds a revocation for the user, DENY (CONTACT_DESK) with `SCHEDULE_REVOKED`. | A received bundle that fails verification is rejected with an alert and **never** replaces the LVB. A bundle file tampered on disk while running is rejected the same way, and the in-memory LVB stays in force. Override codes and kiosk zone/risk always come from the LVB. | "Please contact the desk" / "Offline: staff verification needed" |
 | `OFFLINE_MODE` | mode | (informational) | Present **iff** `mode == "OFFLINE"`, on every decision | "Offline mode" badge |
 | `OFFLINE_HIGH_RISK_ZONE` | mode | STEP_UP (SECOND_FACTOR, `offline_high_risk` = `[TOTP, STAFF_OVERRIDE]`; `[STAFF_OVERRIDE]` when the bundle is EXPIRED, E1) | Offline in a high-risk zone (or above `auto_allow_max_risk`) | "Offline: second factor required" |
 | `OFFLINE_FALLBACK_REQUIRED` | mode | STEP_UP (SECOND_FACTOR) | Added whenever an offline step-up includes a SECOND_FACTOR step | "Offline: enter code / tap card" |
 | `CHALLENGE_FAILED` | step-up (`stage: challenge`) | DENY (NONE) after a hard fail, a 2nd soft fail or session expiry; STEP_UP (CHALLENGE, new nonce, `attempts_left: 0`) after the first soft fail | Wrong / early / absent response, track lost, identity switch | "Check failed" |
 | `FALLBACK_OK` | step-up (`stage: fallback`) | ALLOW (OPEN_DOOR), with `ACCESS_OK` | Second factor or staff override verified | "Verified" |
-| `FALLBACK_FAILED` | step-up (`stage: fallback`) | STEP_UP (SECOND_FACTOR, `attempts_left: 0`) on the first failure; DENY (NONE) when exhausted or the session expired | Wrong, replayed or expired code, method not in `methods`, card of another user | "Verification failed" |
+| `FALLBACK_FAILED` | step-up (`stage: fallback`) | STEP_UP (SECOND_FACTOR, `attempts_left: 0`) on the first failure; DENY (NONE) when exhausted or the session expired | Wrong, replayed or expired code, method not in `methods`, card of another user; v1.5: an override code listed in the bundle's `consumed_code_ids` or outside its signed scope (`zones`, `kiosk_ids`). A locked method is `FALLBACK_LOCKED` instead (not counted) | "Verification failed" |
+| `FALLBACK_LOCKED` (v1.5) | step-up (`stage: fallback`) | STEP_UP (SECOND_FACTOR, same `methods`, `attempts_left` unchanged), `next_action.retry_after_s` = seconds until the lock ends (≥ 1) | The submitted method is locked by its failure limit (`fallback.*` in `config/thresholds.yaml`; locks persisted in `fallback_state.sqlite`, a restart does not reset them): TOTP or CARD for this candidate user (5 consecutive failures → 300 s), STAFF_OVERRIDE for a named `staff_id` known to the bundle (3 consecutive → 300 s) or the device backstop (any 10 override failures within 300 s → every override locked 300 s). The code is not checked while locked. **Not a factor failure**: it does not use up an attempt, so the person can pick another offered method (`edge/policy/stepup.py`, KF-03). Never in a rate-limit count (it is a STEP_UP). | edge `display_message`: the normal SECOND_FACTOR text; the kiosk shows its own lock text with the wait (`kiosk/src/kiosk/fallbackState.ts` `lockedText`) |
 | `ACCESS_OK` | final | ALLOW (OPEN_DOOR) | Every ALLOW carries it (P9) | "Access granted" |
 
 **Rate-limit rules (`RATE_LIMITED`, D3)**
@@ -752,9 +1176,9 @@ STEP_UP / RECAPTURE with a `hint`. When recaptures are exhausted:
   (`CHALLENGE_FAILED`, `FALLBACK_FAILED`), `max_failures` 5, `window_s` 180 and `lockout_s` 5.
   `rate_limit.enabled` is true by default; an eval or demo profile may disable it.
 - **Clock**: the limiter runs on the monotonic clock, so the demo clock does not affect it.
-- **On lockout**: the policy runtime records `ALERT_RATE_LIMIT_LOCKOUT` in its in-memory event log. That log is
-  not exposed on any HTTP route yet (`/v1/events` carries only `decision` and `rendered`).
-  `POST /v1/admin/rate-limit/reset` clears the counter. `GET /v1/mode` `rate_limit` shows
+- **On lockout**: the policy runtime records `ALERT_RATE_LIMIT_LOCKOUT` in its in-memory event log, which
+  `GET /v1/admin/alerts` (`audit:read`, v1.5, §3.11) lists; `/v1/events` carries only `decision` and `rendered`.
+  `POST /v1/admin/rate-limit/reset` clears the counter. `GET /v1/admin/mode/detail` `rate_limit` shows
   `{enabled, locked, retry_after_s}`.
 - **Re-lock**: the counted events stay in the sliding window after a lockout ends. While ≥ `max_failures` (5)
   counted DENYs remain within `window_s` (180 s), every further counted DENY starts a new 5 s lockout.
@@ -781,7 +1205,7 @@ Decisions are always made on the edge (local-first). The cloud only supplies a R
 
 | Situation | Mode of the attempt | Identity rule |
 |---|---|---|
-| Online, `match.rekognition.enabled: true`, `/v1/match` OK | ONLINE | Rekognition is authoritative (DECISION_POLICY §3.5). The local ArcFace matcher can only tighten: a cross-check conflict, a missing local cross-check or a first/last-frame identity switch gives `MATCH_AMBIGUOUS`. |
+| Online, `match.rekognition.enabled: true`, `/v1/match` OK | ONLINE | Rekognition is authoritative (DECISION_POLICY §3.5). The local ArcFace matcher can only tighten: a cross-check conflict, a missing local cross-check or an inconsistent frame set (first/last-frame switch, or any frame whose top-1 is another enrolled user at ≥ 0.30) gives `MATCH_AMBIGUOUS`. |
 | Online, Rekognition enabled, `/v1/match` error / timeout (> `rekognition_timeout` 700 ms; with the early probe, > `rekognition_probe_deadline` 1500 ms from probe start, §3.1a) / non-200 | **OFFLINE** for this attempt (P7). The failure also counts as a heartbeat miss. | Local matcher, offline bars. Every other threshold is re-applied with the offline values on the same raw scores. |
 | Online, `match.rekognition.enabled: false` | ONLINE (online liveness bars, online schedule) | Local matcher with the **offline (stricter) identity bars**. No cloud miss is recorded. |
 | Offline / SYNCING | OFFLINE | Local matcher, offline bars |
@@ -803,8 +1227,11 @@ measured) is the fix.
 - `stepup.max_attempts_per_step` = 2. Two second-factor tries, then DENY `FALLBACK_FAILED`.
 - Step-up session TTL `stepup.session_ttl_s` = `challenge.session_ttl_s` = 120 s. Expiry gives DENY with the
   pending step's failure code (R10).
-- Staff-override brute force: 3 wrong codes lock `STAFF_OVERRIDE` on the kiosk for 300 s
-  (`fallback.staff_override`).
+- Second-factor brute force (`fallback.*`, persisted, real UTC clock): per named `staff_id` 3 consecutive wrong
+  override codes → that staff id locked 300 s; device backstop: any 10 override failures (unknown or missing staff
+  ids count only here) within 300 s → every override locked 300 s; TOTP and CARD: 5 consecutive failures per
+  candidate user → 300 s. A submission to a locked method gives STEP_UP `FALLBACK_LOCKED` (above) and raises
+  `ALERT_FALLBACK_LOCKOUT` when the lock starts (§3.11).
 - **DENY is terminal**, and ALLOW is terminal. Any later step-up or fallback POST returns `409 ATTEMPT_CLOSED`.
   A schedule DENY can never be fixed by a fallback (P8).
 - `reason_codes` is never empty. `OFFLINE_MODE` is present iff `mode == "OFFLINE"`. Schedule codes appear only
@@ -838,7 +1265,7 @@ class ClientInfo(_In):
 
 
 class SessionStartRequest(_In):
-    kiosk_id: str                         # must equal the edge's KIOSK_ID (DEMO_MODE=1: any kiosk in bundle scope)
+    kiosk_id: str                         # must be a kiosk this edge serves (edge/app.py allowed_kiosks): its KIOSK_ID; DEMO_MODE=0: any other kiosk -> 403 FORBIDDEN "kiosk_id not served by this edge"; DEMO_MODE=1: also a kiosk the verified bundle covers AND the policy runtime evaluates (runtime.kiosk_id = KIOSK_ID), any other -> 409 INVALID_STATE "kiosk switch to <id> refused: not covered by the verified schedule bundle" (or "...: the policy runtime evaluates attempts only for <KIOSK_ID>") (edge/app.py _kiosk_refusal)
     claimed_user_id: str | None = None    # card/QR tapped first -> 1:1 match
     client: ClientInfo = Field(default_factory=ClientInfo)
     flash_enabled: bool = True            # False = accessibility non-flash path -> LIVENESS_UNSURE -> CHALLENGE (R3)
@@ -912,7 +1339,7 @@ Rules:
 **State**: implemented (`edge/app.py` `attempt_probe` / `_probe_window`, `edge/attempts.py` `start_probe` /
 `bind_probe` / `_probe_cloud`, response model `edge/schemas.py` `ProbeResponse`, YAML key
 `latency_budget_ms.rekognition_probe_deadline`, kiosk `submitProbe`). Live since the edge restart with policy
-2026-11-14.3 (`GET /v1/mode` `policy_bars.rekognition_probe_deadline_ms` = 1500). Its latency effect has **not been
+2026-11-14.3 (`GET /v1/admin/mode/detail` `policy_bars.rekognition_probe_deadline_ms` = 1500). Its latency effect has **not been
 measured** yet. Without a probe the cloud match starts only after the frames arrive (§3.2).
 
 Why: the cloud `/v1/match` round trip from the venue is about 0.4–1.4 s (dev observation). Started only after the
@@ -1204,7 +1631,8 @@ class FallbackRequest(BaseModel):
     method: Literal["TOTP", "CARD", "EMAIL_OTP", "STAFF_OVERRIDE"]   # aliases accepted: totp, card, email_otp, otp, staff, staff_code
     code: str | None = None       # TOTP 6 digits | EMAIL_OTP 6 digits | STAFF_OVERRIDE 8 digits
     card_id: str | None = None    # CARD: simulated HID card / mobile credential ID (hashed on arrival, never stored)
-    staff_id: str | None = None   # STAFF_OVERRIDE: s_xxx, recorded with the decision
+    staff_id: str | None = None   # STAFF_OVERRIDE: s_xxx, recorded with the decision. v1.5: any string up to 128 chars
+                                  # (edge/schemas.py SHORT_TEXT_MAX); a mistyped id is a normal wrong code, never a 422
     otp_id: str | None = None     # EMAIL_OTP: from POST /v1/attempt/{id}/otp/send
 ```
 
@@ -1213,7 +1641,7 @@ class FallbackRequest(BaseModel):
 | `TOTP` | `code` | yes | yes | RFC 6238, SHA1, 6 digits, 30 s, ±1 step (`fallback.totp`). Verified against **real wall time**, never the demo clock, because authenticator apps use real time (R18). Per-user secret provisioned at enrolment and stored encrypted on the edge (never in the bundle). Replay-protected (last accepted step per user, device-wide). The accepted step is recorded as `fallback.totp_step` so the cloud can detect cross-kiosk replay. Must verify for the **candidate**. |
 | `CARD` | `card_id` | yes | yes (not high-risk) | HMAC-SHA256(`CARD_ID_PEPPER`, card_id).hex() == `users[candidate].fallback.card_id_hash`, **and** the hash is not revoked: a bundle `revocations[]` item with `type: CARD` and `target_id` = the hash, or a CARD item of the revocation feed (§4.3), makes the card fail (deny-only, immediate). |
 | `EMAIL_OTP` | `otp_id`, `code` | yes | **no** | Edge → Cloud `POST /v1/otp/verify` (§4.6) |
-| `STAFF_OVERRIDE` | `staff_id`, `code` | yes (not high-risk) | yes | `staff_id` is required: a submission without it counts as a wrong code (`FALLBACK_FAILED`, counted towards the 3-failure lock). One-time 8-digit code: PBKDF2-HMAC-SHA256(code, per-code salt, 100 000 iterations) == an unused, unexpired `override_codes.codes[].hash` with matching `staff_id`. Codes always come from the **last valid bundle**. Each code is valid until `valid_until` = bundle `expires_at` + 24 h (`fallback.staff_override.valid_after_expiry_h`, R7), so it still works on an EXPIRED cache. Consumed locally, recorded with `staff_id` and `code_id`. 3 wrong codes lock the method for 300 s. Verifies the staff member, not the person (manual review). |
+| `STAFF_OVERRIDE` | `staff_id`, `code` | yes (not high-risk) | yes | `staff_id` is required: a submission without it, or with an id the bundle does not know (any string ≤ 128 chars is accepted, never a 422), counts as a wrong code (`FALLBACK_FAILED`) toward the device backstop only (10 in 300 s → 300 s); a known `staff_id` also has its own 3-failure lock (v1.5, DECISION_POLICY §7.2). One-time code, 10 digits (legacy 8 still accepted): PBKDF2-HMAC-SHA256(code, per-code salt, 100 000 iterations) == an unused, unexpired `override_codes.codes[].hash` with matching `staff_id`. Codes always come from the **last valid bundle**. Each code is valid until `valid_until` = bundle `expires_at` + 24 h (`fallback.staff_override.valid_after_expiry_h`, R7), so it still works on an EXPIRED cache. Consumed locally, recorded with `staff_id` and `code_id`; also rejected when listed in the bundle's `consumed_code_ids` or outside its signed scope. A locked method answers STEP_UP `FALLBACK_LOCKED` (§2). Verifies the staff member, not the person (manual review). |
 
 Rules:
 
@@ -1308,15 +1736,33 @@ Returns the latest DecisionResponse of the attempt, for kiosk reload and debuggi
 
 ### 3.7 `GET /v1/events` → `text/event-stream`
 
-Server-Sent Events, used by the admin dashboard and `eval/capture.py`. Localhost-only (127.0.0.1 bind), no
-admin token (C9). Two event types:
+Server-Sent Events, used by the operator dashboard (`/operator`) and `eval/capture.py`. Main listener only (not on
+the LAN listener). **Auth (v1.5)**: `events:read` (§0.1.4), sent as `Authorization: Bearer fgs_...` (staff session)
+or `Bearer fgk_...` (API key, e.g. `FG_EVAL_API_KEY`); legacy `X-Admin-Token` only with `AUTH_LEGACY_ADMIN_TOKEN=1`.
+Until v1.4 this route needed no token (C9). Two event types:
 
 - **`decision`**: emitted for every DecisionResponse returned by `frames`, `challenge` or `fallback`. Its data is
   the DecisionResponse JSON plus an `eval` key (the attempt's eval tags from §3.13, or `null`).
 - **`rendered`**: emitted for the first rendered beacon of an attempt (§3.8). Data:
   `{attempt_id, client_latency_ms, face_lock_at_ms, rendered_at_ms, decision, eval}`.
 
-A `: ping` comment line is sent every 15 s.
+The stream starts with a `: connected` comment; a `: ping` comment line is sent every 15 s of silence.
+
+- **Re-check (v1.5, `edge/events.py`)**: the edge re-checks the principal (`events:read` still held, session not
+  expired / revoked / logged out, key not revoked) **before every event and at every heartbeat** (≤ 15 s). When the
+  check fails the edge sends one final frame and closes the stream:
+
+  ```text
+  event: auth
+  data: {"reason":"SESSION_ENDED"}
+  ```
+
+  Clients must not reconnect with the same credential after `event: auth` (the kiosk shows the sign-in screen).
+  The SSE stream never extends a session's idle timer (§0.1.6), so an operator view with no user input ends after
+  `AUTH_SESSION_IDLE_MIN`.
+- **Capacity**: at most 16 live streams per edge (`edge/events.py` `DEFAULT_MAX_SUBSCRIBERS`); beyond that the route
+  answers `429 RATE_LIMITED` with `retry_after_s: 30` and `Retry-After: 30`.
+- A slow consumer loses its oldest queued events (queue of 100 per stream), never the stream.
 
 ```text
 event: decision
@@ -1376,7 +1822,7 @@ Errors:
 ### 3.9 `GET /v1/health`
 
 ```json
-{"status": "ok", "degraded_reasons": [], "version": "0.1.0",
+{"status": "degraded", "degraded_reasons": ["demo_mode"], "version": "0.1.0",
  "models_loaded": {"minifasnet_v2": true, "minifasnet_v1se": true, "face_detector": true,
                    "device_detector": true, "arcface": true},
  "self_test": {"minifasnet_real_index": 1, "input_scale": "0-255 BGR", "passed": true},
@@ -1391,7 +1837,13 @@ Errors:
 - `status` is `degraded` exactly when `degraded_reasons` is non-empty (`edge/app.py` `health_problems`). The
   reasons are: `policy_runtime_fail_secure`; `model_missing:<name>` for `face_detector`, `minifasnet_v2`,
   `minifasnet_v1se`, `coco_detector` (reported as `device_detector` in `models_loaded`) or `arcface`;
-  `pad_self_test_failed` or `pad_self_test_not_run`; `template_cache_unavailable`. `detail.policy_runtime` is `real`, or `fail_secure` when the policy runtime could not start
+  `pad_self_test_failed` or `pad_self_test_not_run`; `template_cache_unavailable`; and (v1.5) `demo_mode`
+  (`DEMO_MODE=1`: demo clock, random-challenge control and `/docs` are on; never on a production kiosk),
+  `env_file_permissive` (the repo `.env` is group- or world-accessible, mode & 0o077), `legacy_admin_token`
+  (`AUTH_LEGACY_ADMIN_TOKEN=1`), `auth_unavailable` (no auth service, or the staff store is `MISSING` /
+  `UNAVAILABLE`, §0.1.6) and `auth_bruteforce` (≥ 20 failed sign-ins in the last 10 min, all usernames together;
+  `edge/auth/login.py`). The auth reasons come from `edge/app.py` `auth_problems`. `/v1/health` is public and
+  never names users or accounts. `detail.policy_runtime` is `real`, or `fail_secure` when the policy runtime could not start
   (every attempt is then DENY `SYSTEM_ERROR`). The `detail` block is diagnostic and its inner keys may grow.
 - `self_test` checks the MiniFASNet "real" output index and the input scale on a real face image at startup
   (CLAUDE.md §6). Enrolment is refused unless `self_test.passed` is true.
@@ -1405,10 +1857,31 @@ Errors:
 - Measured at startup on the dev laptop (self-test, not an eval result): MiniFASNet output index 1 = real, input
   raw 0–255 BGR.
 
-### 3.10 `GET /v1/mode` and `POST /v1/admin/mode`
+### 3.10 `GET /v1/mode`, `GET /v1/admin/mode/detail` and `POST /v1/admin/mode`
 
-The canonical connectivity state. The kiosk badge polls it every **2 s**. Owner: policy-engine
-(`edge/offline/connectivity.py`).
+The canonical connectivity state. Owner: policy-engine (`edge/offline/connectivity.py`, `edge/policy/runtime.py`
+`mode_status`); HTTP shapes: `edge/app.py` `mode_detail` / `public_mode`.
+
+**`GET /v1/mode` (public, v1.5: badge subset).** The public kiosk badge polls it every **2 s** without a credential,
+so it carries only `edge/app.py` `PUBLIC_MODE_KEYS` plus four reduced blocks, and nothing that names users, sync
+reports, thresholds or lockout state:
+
+| Key | Value |
+|---|---|
+| `mode`, `state`, `reason`, `forced`, `forced_until`, `kiosk_id`, `sync_queue_depth` | as in the detail model below |
+| `demo_clock` | the `DemoClock` below (`DEMO_MODE=1` only), else `null` |
+| `template_cache` | `{count}` only, or `null` |
+| `cache_state` | the installed bundle's `cache_state` (`FRESH` / `EXPIRED` / `INVALID`), or `null` |
+| `cloud_match` | `{degraded}` only (a boolean), or `null` |
+
+```json
+{"mode": "OFFLINE", "state": "OFFLINE", "reason": "forced", "forced": true,
+ "forced_until": "2026-11-14T05:38:11Z", "kiosk_id": "KIOSK_LIB_01", "sync_queue_depth": 3, "demo_clock": null,
+ "template_cache": {"count": 6}, "cache_state": "FRESH", "cloud_match": {"degraded": true}}
+```
+
+**`GET /v1/admin/mode/detail` (`store:read`, new in v1.5)** returns the full runtime status below (until v1.4 this
+was the `GET /v1/mode` body). The Control Panel, `/operator` and `eval/capture.py` read it.
 
 ```python
 from datetime import datetime
@@ -1424,7 +1897,8 @@ class BundleStatus(BaseModel):
     signature_valid: bool | None        # true iff a last valid bundle (LVB) is installed
     cache_state: Literal["FRESH", "EXPIRED", "INVALID"] | None   # INVALID when there is no LVB
     refresh_age_s: int | None = None    # seconds since the cloud last confirmed the bundle (200 or 304)
-    rejected: list[dict[str, Any]] = []  # last 5 BUNDLE_REJECTED alerts (bad signature, older version, ...)
+    rejected: list[dict[str, Any]] = []  # last 5 bundle-store alerts as {type, at} only (e.g. BUNDLE_REJECTED);
+                                        # reason / path / version: GET /v1/admin/sync/last `bundle_alerts`
 
 
 class TemplateCacheStatus(BaseModel):
@@ -1459,12 +1933,18 @@ ModeReason = Literal[
 ]
 
 
-class ModeResponse(BaseModel):
+class ModeResponse(BaseModel):                      # GET /v1/admin/mode/detail (v1.5); GET /v1/mode until v1.4
     model_config = ConfigDict(extra="allow")          # diagnostic keys below
     mode: Literal["ONLINE", "OFFLINE"]                # the mode the NEXT attempt would use
     state: Literal["ONLINE", "OFFLINE", "SYNCING"]   # SYNCING: offline rules still apply (R13)
     since: datetime
-    forced: bool                                      # admin force active
+    forced: bool                                      # admin force (or FORCE_OFFLINE=1) active
+    forced_until: datetime | None                     # v1.5: real-UTC auto-revert time of a forced OFFLINE;
+                                                      # null = not forced, or forced without deadline (see below)
+    forced_reason: Literal["DEMO", "operator"] | None # v1.5: "DEMO" when the force was sent with reason "DEMO", else
+                                                      # "operator"; null when not forced. The free-text reason is only
+                                                      # in GET /v1/admin/sync/last `forced.reason` and the
+                                                      # FORCED_MODE_CHANGED event (runtime_views.py `_public_reason`)
     last_cloud_ok_at: datetime | None
     reason: ModeReason | None                         # null = ONLINE, SYNCING, or OFFLINE awaiting heartbeats
     schedule_bundle: BundleStatus
@@ -1473,7 +1953,11 @@ class ModeResponse(BaseModel):
     sync_queue_depth: int
     demo_clock: DemoClock | None                      # null unless DEMO_MODE=1 (v1.4: present, active=false, with no offset)
     # additive diagnostics (dashboard): kiosk_id, zone, policy_version,
-    # rate_limit {enabled, locked, retry_after_s}, last_sync {at, report}, server_flags[],
+    # rate_limit {enabled, locked, retry_after_s},
+    # last_sync {at, report}: report = counts only (accepted, duplicates, rejected, queue_depth, ok, error, bundle,
+    #   sent, clock_drift_s, revocations_state_lost, flags = a count, cloud_erasures_pending); the full report and
+    #   the server flags are GET /v1/admin/sync/last (§3.11),
+    # server_flags_count, revocations_state_lost (bool),
     # random_challenge ("AUTO" | "FORCE" | "FORCE_NEXT" | "OFF"; in memory, AUTO after an edge restart),
     # policy_bars {pad_pass, flash_pass_r, match_allow, match_margin, random_rate, ambient_exception,
     #   moire_unsure, device_unsure, flash_enforce, moire_enforce, m2_rgb_enforce, rekognition,
@@ -1483,6 +1967,7 @@ class ModeResponse(BaseModel):
 
 ```json
 {"mode": "OFFLINE", "state": "OFFLINE", "since": "2026-11-14T04:38:11Z", "forced": true,
+ "forced_until": "2026-11-14T05:38:11Z", "forced_reason": "operator",
  "last_cloud_ok_at": "2026-11-14T04:38:05Z", "reason": "forced",
  "schedule_bundle": {"version": 42, "issued_at": "2026-11-14T02:00:00Z", "expires_at": "2026-11-14T14:00:00Z",
                      "signature_valid": true, "cache_state": "FRESH", "refresh_age_s": 380, "rejected": []},
@@ -1510,8 +1995,24 @@ class ModeResponse(BaseModel):
   The kiosk can use it to explain an `OFFLINE_MODE` decision under an ONLINE badge.
 - **`random_challenge`** is held in memory; an edge restart resets it to `AUTO` (§3.14a).
 
-- **`POST /v1/admin/mode`** (`X-Admin-Token`), body `{"force": "OFFLINE"}` or `{"force": "AUTO"}`. Returns the
-  same body as `GET /v1/mode`.
+- **`POST /v1/admin/mode`** (`mode:switch`; until v1.4 `X-Admin-Token`). Body (`edge/schemas.py`
+  `AdminModeRequest`, unknown fields → 422):
+
+  ```json
+  {"force": "OFFLINE", "reason": "network test", "max_minutes": 60}
+  ```
+
+  `force` is `OFFLINE` or `AUTO`; `reason` optional, ≤ 200 characters (`edge/schemas.py`
+  `FORCED_REASON_MAX_CHARS`), logged with the actor (edge log) and carried verbatim in the `FORCED_MODE_CHANGED`
+  event and `GET /v1/admin/sync/last` `forced.reason` (the detail view's `forced_reason` is only `DEMO` /
+  `operator`); `max_minutes` optional, integer 1–240. Returns the `GET /v1/admin/mode/detail`
+  body. Bad values → `422 VALIDATION_ERROR`.
+  - **A forced OFFLINE auto-reverts** to AUTO at `forced_until` (`edge/policy/runtime_ops.py` `forced_state`):
+    `max_minutes`, or `connectivity.forced_offline_default_min` (60) when it is omitted; the cap is
+    `connectivity.forced_offline_max_min` (240). The expiry uses real UTC, never the demo clock, and raises
+    `FORCED_MODE_EXPIRED`. Exceptions with **no deadline** (`forced_until: null`): `DEMO_MODE=1` + `reason: "DEMO"`
+    + no `max_minutes`; and the env flag `FORCE_OFFLINE=1` (forced from startup, unlimited). `{"force": "AUTO"}`
+    clears the force at once.
   - **The forced switch is immediate**: it applies to the next attempt.
   - Heartbeats keep running underneath a forced OFFLINE. `AUTO` goes straight to SYNCING if the last
     `connectivity.successes_to_online` (3) heartbeats succeeded; otherwise it stays OFFLINE until they do.
@@ -1519,14 +2020,15 @@ class ModeResponse(BaseModel):
     acknowledged and the bundle refreshed, then ONLINE. Any miss while SYNCING goes back to OFFLINE.
 - **Heartbeat**: `GET {CLOUD_API_URL}/v1/health` (`connectivity.health_path`), every
   `connectivity.heartbeat_interval_s` (5 s), timeout `connectivity.heartbeat_timeout_ms` (**2000 ms**). On
-  success (not forced), the revocation feed is pulled too.
+  every successful heartbeat the deny-only revocation feed is pulled too, **also while forced OFFLINE**
+  (`edge/policy/runtime_background.py` `heartbeat`; each new revocation raises `REVOCATION_APPLIED`).
 - **Natural detection time**: `misses_to_offline` (3) consecutive misses at a 5 s interval. With a hanging
   cloud, the worst case is about 5 + 5 + 5 s + one 2 s probe timeout = **≤ ~17 s**. It is faster when the
   connection is refused. A failed cloud call inside an attempt also counts as a miss, and independently makes
   **that attempt** OFFLINE at once (P7).
 - **Startup**: the state starts OFFLINE with `reason: null` and needs 3 successful heartbeats (≥ ~10 s) plus a
   sync before it reaches ONLINE.
-- **Kiosk badge**: polls `GET /v1/mode` every `connectivity.status_poll_ms` (2000 ms).
+- **Kiosk badge**: polls the public `GET /v1/mode` every `connectivity.status_poll_ms` (2000 ms).
 - `GET /v1/mode` reports the mode the **next attempt** would use (DECISION_POLICY §8.1). Connectivity ONLINE
   with an online-unusable bundle reports `mode: OFFLINE`, `state: OFFLINE`, `reason: bundle_stale` (R5):
   - MO2: the bundle refresh age exceeds `schedule.online_max_bundle_age_min` (30 min).
@@ -1534,9 +2036,9 @@ class ModeResponse(BaseModel):
 
   The code emits `bundle_stale` for both.
 
-### 3.11 `GET /v1/admin/store` and `POST /v1/admin/sync`
+### 3.11 `GET /v1/admin/store`, `POST /v1/admin/sync`, `GET /v1/admin/sync/last`, `GET /v1/admin/alerts`
 
-`GET /v1/admin/store` (`X-Admin-Token`) is the SC2d demo view of what is stored locally. `records` holds the
+`GET /v1/admin/store` (`store:read`; until v1.4 `X-Admin-Token`) is the SC2d demo view of what is stored locally. `records` holds the
 decrypted minimal records, **exactly** the `docs/SURPRISE_CHALLENGES.md` §SC2.5 field list
 (`edge/offline/store.py` `RECORD_FIELDS`).
 
@@ -1582,7 +2084,7 @@ decrypted minimal records, **exactly** the `docs/SURPRISE_CHALLENGES.md` §SC2.5
   `offline_store.max_retention_hours` (24 h), leaving a tombstone `{count, first_seq, last_seq, chain_head}`.
 - **Templates**: the face template cache is a separate Fernet-encrypted file (`templates.fernet`).
 
-`POST /v1/admin/sync` (`X-Admin-Token`) runs one sync cycle immediately (SC2.6): revocations first, then queue
+`POST /v1/admin/sync` (`sync:run`; until v1.4 `X-Admin-Token`) runs one sync cycle immediately (SC2.6): revocations first, then queue
 replay in batches to Cloud `/v1/sync` (§4.4), then a bundle refresh. It returns counts summed over all batches
 sent, the flags list, and the full sync `report` (diagnostic):
 
@@ -1598,13 +2100,64 @@ sent, the flags list, and the full sync `report` (diagnostic):
 the LVB (R6). The route returns `503 CLOUD_UNAVAILABLE` when the cloud is not configured, when the kiosk is
 forced OFFLINE, or when the sync fails.
 
+**`GET /v1/admin/sync/last`** (`audit:read`, new in v1.5) returns the full report of the last sync and the server
+flags (pseudonymous user / attempt ids), which the mode detail view carries only as counts (`report` counts,
+`server_flags_count`), plus the force state with its free-text reason and the bundle-store alerts
+(`edge/policy/runtime_views.py` `sync_detail`):
+
+```json
+{"last_sync": {"at": "2026-11-14T06:58:40Z",
+               "report": {"accepted": 3, "duplicates": 0, "rejected": 0, "flags": [], "queue_depth": 0, "ok": true,
+                          "error": null, "bundle": "not_modified", "sent": 3, "revoked_users": [],
+                          "rejected_items": []}},
+ "server_flags": [{"attempt_id": "att_01JDA3W1B3D5F7H9K1M3P5R7T9", "type": "POST_HOC_REVOKED"}],
+ "forced": {"forced": true, "until": "2026-11-14T05:38:11Z", "reason": "network test"},
+ "bundle_alerts": []}
+```
+
+`last_sync.at` / `report` are null before the first sync; `server_flags` holds at most the last 100 flags;
+`bundle_alerts` holds at most the last 20 bundle-store alerts (`{type, at, reason?, path?, version?}`, e.g.
+`BUNDLE_REJECTED`, `BUNDLE_BACKUP_LOADED`). A runtime without `sync_detail` returns only `last_sync` and
+`server_flags` (`edge/app.py` `admin_sync_last`).
+
+**`GET /v1/admin/alerts?limit=1..200`** (`audit:read`, new in v1.5; default 50) returns the newest policy alerts
+(`ALERT_*`) and security events (`REVOCATION_APPLIED`, `USER_ERASED_LOCAL`, `USER_REINSTATED_LOCAL`,
+`CLOUD_ERASURE_QUEUED`, `CLOUD_ERASURE_DONE`, `FORCED_MODE_CHANGED`, `FORCED_MODE_EXPIRED`, `LEGACY_LOG_MIGRATED`,
+`BUNDLE_INSTALLED`, `FALLBACK_STATE_RESEEDED`; `edge/policy/runtime_ops.py` `SECURITY_EVENTS`), oldest first, from
+the in-memory event log (an edge restart clears it):
+
+```json
+{"items": [{"id": 41, "type": "FORCED_MODE_CHANGED", "at": "2026-11-14T04:38:11Z", "force": "OFFLINE",
+            "until": "2026-11-14T05:38:11Z", "reason": "network test"}],
+ "count": 1}
+```
+
+Edge `ALERT_*` types (`edge/policy/runtime.py`, `runtime_erasure.py`; extra keys after `id`, `type`, `at`):
+
+| Type | When | Extra keys |
+|---|---|---|
+| `ALERT_RATE_LIMIT_LOCKOUT` | a counted DENY starts a kiosk lockout (§2) | `kiosk_id`, `attempt_id` |
+| `ALERT_FALLBACK_LOCKOUT` (v1.5) | a second-factor lock starts (§2 `FALLBACK_LOCKED`) | `lock` (`TOTP_USER`, `CARD_USER`, `STAFF_OVERRIDE_STAFF`, `STAFF_OVERRIDE_DEVICE`), `subject` (the user id, the `staff_id`, or null for the device lock), `kiosk_id` |
+| `ALERT_FALLBACK_STATE_RESET` (v1.5) | at startup `fallback_state.sqlite` has a new epoch while the decision log knows another one (file deleted or replaced); consumed override codes and accepted TOTP steps are re-seeded from the decision log (tighten-only). The same re-seed with an unchanged epoch is the non-alert `FALLBACK_STATE_RESEEDED`. | `codes`, `totp_steps` (counts re-seeded) |
+| `ALERT_LOG_EVIDENCE_REBASED` | the decision log's deletion evidence had to be re-baselined (upgrade or tampering) | `kiosk_id` |
+| `ALERT_STATE_FILE_QUARANTINED` | a corrupt offline state file was quarantined (`*.corrupt-<ts>`) | `file` (`pending_erasures`, `pending_enrolments`, `credentials`) |
+| `ALERT_LEGACY_LOG_MIGRATION` | the legacy decision-log migration failed (success = `LEGACY_LOG_MIGRATED`) | the migration report |
+| `ALERT_ORPHANED_QUEUE` | a per-kiosk log of another `KIOSK_ID` on this device still holds data | `kiosk_id`, `queued`, `tombstones`, `error` |
+| `ALERT_LOCAL_ERASURE_FAILED` | the local template purge for an ERASED user (bundle or feed) failed; raised once, retried every tick | `user_id` |
+| `ALERT_OFFLINE_ENROLMENT` (v1.5) | an enrolment was made while OFFLINE and queued for the cloud audit (§3.15) | `user_id`, `actor` |
+
+Items carry pseudonymous ids only (never names, codes or images). A runtime without the log (fail-secure runtime)
+returns `{"items": [], "count": 0}`. Bundle-store alerts (`BUNDLE_REJECTED`, ...) are not in this log; they are in
+`GET /v1/admin/sync/last` `bundle_alerts`. This is the edge's own log; the cloud's alert ledger is cloud
+`GET /v1/admin/alerts` (§4.9).
+
 ### 3.12 `POST /v1/admin/rate-limit/reset` → 204
 
-Requires `X-Admin-Token`. Clears this kiosk's attack-evidence failure counter and any active lockout (D3).
+Requires `ratelimit:reset` (until v1.4 `X-Admin-Token`). Clears this kiosk's attack-evidence failure counter and any active lockout (D3).
 
 ### 3.13 `POST /v1/admin/eval/context` → 200 · `DELETE /v1/admin/eval/context` → 204
 
-Requires `X-Admin-Token`. The context tags every attempt started **after** the call until it is cleared. Tags
+Requires `eval:admin` (both methods; until v1.4 `X-Admin-Token`). The context tags every attempt started **after** the call until it is cleared. Tags
 flow into `/v1/events` (`eval` key) and `/v1/metrics` `by_label`. This replaces the v1.0 `X-Eval-Label` header.
 
 ```python
@@ -1640,7 +2193,10 @@ team photos (`eval/captures/`, gitignored, deleted after the event). The edge ne
 
 ### 3.14 `POST /v1/admin/clock` (demo only)
 
-Requires `X-Admin-Token` and env `DEMO_MODE=1`; otherwise `403 FORBIDDEN`. The body must contain exactly one of
+Requires `demo:clock` (until v1.4 `X-Admin-Token`; admin role only, never an API key) and env `DEMO_MODE=1`.
+Without `DEMO_MODE=1` any signed-in caller gets `403 FORBIDDEN` reason `NOT_DEMO_MODE` (checked before the
+permission; with no credential the answer is `401`); with `DEMO_MODE=1` and no `demo:clock` → `403`
+`MISSING_PERMISSION`. The body must contain exactly one of
 the following (otherwise `422 VALIDATION_ERROR`):
 
 ```json
@@ -1706,7 +2262,8 @@ rotation) re-signs the bundle with `issued_at = now`, which moves `earliest_loca
 
 ### 3.14a `POST /v1/admin/random-challenge` (demo only)
 
-Requires `X-Admin-Token` and `DEMO_MODE=1`; otherwise `403 FORBIDDEN`. It controls the random liveness challenge
+Requires `challenge:control` (until v1.4 `X-Admin-Token`; roles admin and evaluator) and `DEMO_MODE=1`; without
+`DEMO_MODE=1` → `403 FORBIDDEN` reason `NOT_DEMO_MODE` (same order as §3.14). It controls the random liveness challenge
 (R4). The configured rate is 0.15 online / 0.30 offline. The scripted demo switches it `OFF` first (so no scripted
 ALLOW draws a challenge) and uses `FORCE_NEXT` for the step that shows it. The `/admin` UI has no control for it
 yet: use curl.
@@ -1731,16 +2288,20 @@ Response 200:
 - A forced draw fires whatever the configured rate is (`edge/policy/engine.py` stage 8b).
 - The mode is held **in memory**: an edge restart resets it to `AUTO`. After a `FORCE_NEXT` has been used the mode
   is `AUTO` again, so a scripted run re-sends `{"mode": "OFF"}` afterwards.
-- The current value is shown in `GET /v1/mode` `random_challenge`.
+- The current value is shown in `GET /v1/admin/mode/detail` `random_challenge` (v1.5; not in the public `GET /v1/mode`).
 - Only a would-be ALLOW is ever converted. Forcing never loosens a decision.
 - Any other value → `422 VALIDATION_ERROR`.
 - If the runtime has no random challenge (fail-secure runtime), the route returns `409 INVALID_STATE`.
 
-### 3.15 `POST /v1/enroll` (admin) → 201 · `DELETE /v1/enroll/{user_id}` (admin) · `GET /v1/admin/users` (admin)
+### 3.15 `POST /v1/enroll` (`enrol:write`) → 201 · `DELETE /v1/enroll/{user_id}` (`enrol:erase`) · `GET /v1/admin/users` (`enrol:read`)
 
-**Enrolment page**: `kiosk/public/enroll.html`, served by the kiosk dev server. It has a consent checkbox with
-the DPDP notice ("purpose and storage limitation"; deleted after the event), an admin-token field and an
-optional TOTP provisioning box. It captures 5 frames of slightly varied pose at up to 1280 px wide.
+Until v1.4 all three needed `X-Admin-Token` ("admin"); v1.5 permissions are in §0.1.4 (roles admin and enroller
+hold all three; `enrol:erase` is never available to an API key).
+
+**Enrolment page**: `/register` in the kiosk app (`kiosk/src/operator/RegisterApp.tsx`), behind the staff sign-in
+(`LoginGate`, needs `enrol:write`). It has a consent checkbox with the DPDP notice ("purpose and storage
+limitation"; deleted after the event) and an optional TOTP provisioning box, and captures 5 frames of slightly
+varied pose at up to 1280 px wide. The old static page `kiosk/public/enroll.html` only redirects to `/register`.
 
 `multipart/form-data`: `frame_0..frame_4` (`image/jpeg`, ≤ 2 MB each) + `meta`:
 
@@ -1808,7 +2369,8 @@ labelled "not active until the schedule marks this user TOTP-enrolled (re-enrol 
 
 1. ONLINE check. A person **not in the schedule** (status `NOT_IN_SCHEDULE`, or no row) needs ONLINE; offline the
    UI blocks with "New people can only be registered while the kiosk is ONLINE (the cloud signs the schedule)".
-2. `PUT /v1/admin/access/users/{user_id}` `{display, role, consent: true, actor: "register"}` (§3.18.2): creates
+2. `PUT /v1/admin/access/users/{user_id}` `{display, role, consent: true}` (§3.18.2; a client `actor` such as
+   `"register"` is still accepted but ignored since v1.5, the edge sends the signed-in principal's actor): creates
    the user (or applies a changed role) and installs the re-signed bundle in the same call. Proceed only when
    `bundle.applied` is true **and** `user.in_bundle` is true; if `applied` is false, call `POST
    /v1/admin/bundle/refresh` (up to 3 tries, 1 s apart), then stop with the warning. `in_bundle: false` means the
@@ -1833,6 +2395,19 @@ labelled "not active until the schedule marks this user TOTP-enrolled (re-enrol 
 | 422 | `VALIDATION_ERROR` | `FRAMES_REJECTED` | fewer than `quality.min_usable_frames` frames passed, or not one identity |
 | 422 | `VALIDATION_ERROR` | — | malformed meta (`details[]`), `card_id` without `CARD_ID_PEPPER` |
 | 503 | `MODELS_UNAVAILABLE` | — | detector / ArcFace / PAD self-test / template cache missing |
+| 503 | `MODELS_UNAVAILABLE` | `POLICY_RUNTIME_UNAVAILABLE` (v1.5) | the fail-secure runtime (or a runtime that cannot answer from the verified schedule) is active: enrolment refused, never fail-open |
+| 409 | `INVALID_STATE` | `ERASED_PENDING_READMIT` (v1.5) | an un-lifted `ERASE` revocation-feed entry exists and the installed bundle was not issued after that erasure (re-admit first, or refresh the bundle); checked again right before the write |
+| 503 | `CLOUD_UNAVAILABLE` | `CLOUD_ERROR` (v1.5) | ONLINE **re-enrolment**: the cloud identity check runs before the local append and the cloud is unreachable or answered 5xx; nothing changed |
+| 409 | `INVALID_STATE` | `CLOUD_REFUSED_REENROLMENT` (v1.5) | ONLINE re-enrolment: the cloud refused the new look (any other status); `cloud_status` and `cloud_reason` added; nothing changed |
+| 413 | `PAYLOAD_TOO_LARGE` | `CLOUD_BODY_CAP` (v1.5) | ONLINE: the accepted frames exceed the cloud enrol body (5 MB base64, `CLOUD_ENROL_MAX_B64_BYTES`) even as ≤ 640 px face crops; nothing stored |
+| 503 | `MODELS_UNAVAILABLE` | `LOCAL_WRITE_FAILED` (v1.5) | the encrypted template store write failed; nothing changed |
+| 503 | `MODELS_UNAVAILABLE` | `ERASURE_PENDING` (v1.5) | an earlier local erasure of this user is still failing (old templates must be gone first); nothing stored |
+
+Check order (`edge/enroll.py` `_preflight`, `enroll`): policy runtime → `USER_REVOKED` → `NO_BUNDLE` →
+`ERASED_IN_BUNDLE` → `ERASED_PENDING_READMIT` → `NOT_IN_SCHEDULE` → models / `CARD_ID_PEPPER` → frame analysis
+(`FRAMES_REJECTED`) → `CLOUD_BODY_CAP` (ONLINE) → under one per-edge lock: `FACE_ENROLLED_OTHER` → `LOOK_MISMATCH`
+→ (ONLINE re-enrolment) cloud check → `USER_REVOKED` / `ERASED_PENDING_READMIT` again → `ERASURE_PENDING` → write
+(`LOCAL_WRITE_FAILED`).
 
 - **Liveness first**: every frame must pass the edge quality gate and passive PAD (`P_live` ≥ `pad.pass_min`)
   with no device box near the face. Rejection reasons are `NO_FACE`, `FACE_COUNT`, `QUALITY_*`,
@@ -1843,8 +2418,12 @@ labelled "not active until the schedule marks this user TOTP-enrolled (re-enrol 
   - **Re-enrolment appends** (same `user_id`): the accepted frames are added as a new look, at most 24
     templates per user (`MAX_TEMPLATES_PER_USER`), the first 5 (the original enrolment) pinned and never evicted,
     the newest of the rest kept; `template_version` + 1 (`edge/ml/templates.py`). Every new frame must resemble the
-    original enrolment (the 5 pinned templates) at `match.local.allow_min_cosine`, else `409 INVALID_STATE` and
-    nothing changes, so a chain of re-enrolments cannot walk an account to a different face. To replace
+    original enrolment (the 5 pinned templates), else `409 INVALID_STATE` reason `LOOK_MISMATCH` and nothing
+    changes, so a chain of re-enrolments cannot walk an account to a different face. The bar
+    (`edge/enroll.py` `reenrol_bar`): ONLINE `match.local.allow_min_cosine` (0.50), and the cloud's identity check
+    runs **before** the local append (refusal: `CLOUD_ERROR` / `CLOUD_REFUSED_REENROLMENT`); OFFLINE (no cloud
+    check) the highest of the online bar, the offline allow bar (0.55) and `enrol.reenrol_min_cosine_offline`
+    (0.60). To replace
     a user's look, `DELETE /v1/enroll/{user_id}` first, then enrol (`edge/enroll.py`).
   - A missing detector / ArcFace / PAD self-test / template cache gives `503 MODELS_UNAVAILABLE`.
   - A `card_id` without `CARD_ID_PEPPER` gives `422`.
@@ -1853,7 +2432,7 @@ labelled "not active until the schedule marks this user TOTP-enrolled (re-enrol 
 - **Cloud indexing**: when the edge is ONLINE, it forwards the accepted frames + meta (with `card_id_hash` and
   no raw `card_id`) to Cloud `POST /v1/enroll` (§4.8), which indexes them in Rekognition. Only consenting team
   faces are indexed, and they are deleted at teardown.
-  - **E-mail**: `enroll.html` has an e-mail field (pre-filled only for `u_prj1`) and sends `email` only when it is
+  - **E-mail**: the enrolment form has an e-mail field (pre-filled only for `u_prj1`) and sends `email` only when it is
     filled. The **deployed** cloud enrol model still requires `email`, so an enrolment without one ends with
     `cloud_indexed: false` (cloud 422). The cloud code in the tree makes it optional (no e-mail = no EMAIL_OTP for
     that user); that change is live only after the lead redeploys.
@@ -1863,10 +2442,25 @@ labelled "not active until the schedule marks this user TOTP-enrolled (re-enrol 
     (`cloud/SANDBOX.md` §0).
   - With Rekognition authoritative online, an un-indexed user is `NOT_ENROLLED` online. Collection state at the
     time of writing: `u_prj1` and `u_tm03` are indexed, `u_tm02` is not (enrolled on the edge only).
+- **Offline enrolment (v1.5, SC2-D4)**: when the cloud is configured but the kiosk is OFFLINE, `cloud_state` is
+  `skipped_offline`, nothing is sent to the cloud, and the edge queues a **metadata-only** audit record
+  `{user_id, actor, at, template_count, model, kiosk_id}` (never images, crops or embeddings; a newer record for
+  the same user replaces the older one) in the encrypted `pending_enrolments.enc` (`edge/offline/erasures.py`
+  `PendingEnrolments`, `PolicyRuntime.queue_pending_enrolment`), raising `ALERT_OFFLINE_ENROLMENT` (§3.11).
+  After every successful sync cycle (background sync, `POST /v1/admin/sync` or a bundle refresh) the edge replays
+  the queue to Cloud `POST /v1/enroll/offline-record` (§4.8; `edge/enroll.py` `replay_offline_enrolments`, one
+  replay at a time): a 2xx (201 recorded, 200 duplicate) clears the record; 400 / 403 / 409 / 413 / 422, or a 404
+  with an `error.reason`, drops it with an error log; a 404 without a reason (route not deployed), 401, 429, 5xx
+  or a transport error keeps it for the next sync. If the runtime has no queue, the enrolment still succeeds and
+  `warnings[]` says the record could not be queued. The record only lets the cloud audit the offline enrolment
+  (`ALERT_OFFLINE_TEMPLATE_UNCONFIRMED`, §4.4); it does not index the face: re-enrol while ONLINE for that.
 - **TOTP**: the secret is provisioned by the policy runtime's encrypted credential store, never in the bundle.
 
 `DELETE /v1/enroll/{user_id}` (DPDP erasure; `user_id` must match `^u_[0-9a-z]{4}$`, else 422) removes the local
-template and the TOTP secret, and when the cloud is configured calls Cloud `DELETE /v1/enroll/{user_id}`.
+template and the TOTP secret, and when the cloud is configured calls Cloud `DELETE
+/v1/enroll/{user_id}?actor=<actor>` (v1.5: the edge-derived actor, `staff:<staff_id>` | `key:<key_id>` |
+`legacy:admin_token`, travels in the query string, which the kiosk HMAC signs with the path; a queued erasure
+keeps its actor for the replay).
 Response 200 (v1.4, every key always present):
 
 ```json
@@ -1874,13 +2468,14 @@ Response 200 (v1.4, every key always present):
  "bundle": {"previous_version": 49, "installed_version": 50, "changed": true, "result": "installed", "error": null}}
 ```
 
-- `cloud` is one of `deleted | queued | not_configured | failed`: `deleted` (cloud 200/204/404; the edge then
-  installs the re-signed bundle, `bundle`), `queued`, `not_configured` or `failed` (`bundle` null for the last
-  three).
+- `cloud` is one of `deleted | queued | not_configured | failed`: `deleted` (cloud 200/204, or a 404 whose body is
+  `error.code: NOT_FOUND` **with** an `error.reason` such as `NOT_ENROLLED`; the edge then installs the re-signed
+  bundle, `bundle`), `queued`, `not_configured` or `failed` (`bundle` null for the last three). A bare 404 (no
+  reason, e.g. a route not deployed) is a failure and is queued (`edge/app.py` `cloud_erasure_done`).
 - **`queued` (R-J, v1.4)**: OFFLINE, or the cloud call failed (transport, 5xx, another status). The local data is
-  erased at once; the pending cloud erasure (`user_id` + `queued_at` only) is persisted encrypted in
+  erased at once; the pending cloud erasure (`user_id`, `queued_at` and, v1.5, the `actor`) is persisted encrypted in
   `edge/offline` (`PolicyRuntime.queue_cloud_erasure`) and replayed at every sync until the cloud answers
-  200/204/404 (idempotent). `message` says so; `GET /v1/admin/access/users` lists them in
+  200/204, or 404 with an `error.reason` (idempotent; `edge/offline/sync.py` `_is_not_enrolled`). `message` says so; `GET /v1/admin/access/users` lists them in
   `pending_cloud_erasures[]`.
 - **`failed` (M1, v1.4)**: as `queued`, but the local erasure queue itself could not be written (e.g. a disk
   error, or a runtime without the queue). The local template and TOTP secret **are** erased (`local_removed`
@@ -1891,10 +2486,13 @@ Response 200 (v1.4, every key always present):
   `cloud_erasure_failed`.
 - A user that is neither enrolled locally nor erasable in the cloud (cloud not configured) gives `404 NOT_FOUND`
   reason `NOT_ENROLLED`.
+- A failed write of the template store gives `503 MODELS_UNAVAILABLE` reason `LOCAL_ERASE_FAILED` (v1.5) before
+  anything else changes (the user stays enrolled; retry). An unavailable template cache does not block the TOTP
+  and cloud erasure: `local_removed` is false and `message` says why.
 - The cloud erasure keeps the campus entitlement suspended by an ERASED revocation (§4.3 `ERASE`); re-admission is
   `PUT` access with `consent: true` (§3.18.2).
 
-`GET /v1/admin/users` (`X-Admin-Token`) lists the locally enrolled users (no templates, no secrets). `role` /
+`GET /v1/admin/users` (`enrol:read`; until v1.4 `X-Admin-Token`) lists the locally enrolled users (no templates, no secrets). `role` /
 `display_name` are the **installed bundle's** (what decisions use; null when not in the bundle); the label stored
 with the template is `template_role` / `template_display_name` (informational only):
 
@@ -1908,7 +2506,8 @@ with the template is `template_role` / `template_display_name` (informational on
 
 `409 INVALID_STATE` when the template cache is unavailable.
 
-`GET /v1/admin/attempt/{attempt_id}/signals` (`X-Admin-Token`) is the per-attempt debug view. It returns the
+`GET /v1/admin/attempt/{attempt_id}/signals` (`attempt:signals`; until v1.4 `X-Admin-Token`) is the per-attempt
+debug view. It returns the
 policy input (`signals`, i.e. the AttemptSignals model), raw per-frame values (`raw`: `p_live`, device, moiré,
 mask ring, flash fit incl. `r_frames` / `r_client`, match scores, cloud match, depth, and `probe`: the early-probe
 outcome, §3.1a) and the challenge evidence.
@@ -1936,12 +2535,14 @@ The dashboard feed. The official numbers are computed by `eval/` from the event 
  "sync": {"queue_depth": 0, "last_sync_at": "2026-11-14T06:58:40Z"}}
 ```
 
-Values are illustrative only. Localhost-only, no admin token (C9). `latency_ms` has one entry per server stage
+Values are illustrative only. Auth (v1.5): `metrics:read` (until v1.4 localhost-only with no token, C9).
+`latency_ms` has one entry per server stage
 seen (`total`, `liveness`, `match`, `schedule`, `policy`, `quality`, …) plus `client`.
 Every non-`bona_fide` `by_label` entry is scored as an attack (`accepted`, `apcer`, `apcer_upper_95`) and carries
 `attack_label_known`: true when the label is a known attack label (`print`, `screen_photo`, `video`, `mask_paper`,
 `mask_3d`, `injection`, `replay`, `screen`; `edge/metrics.py` `ATTACK_LABELS`), false for any other label.
-`sync.last_sync_at` is the `GET /v1/mode` `last_sync.at` value. The metrics are in memory: an edge restart starts a
+`sync.last_sync_at` is the `GET /v1/admin/mode/detail` `last_sync.at` value (v1.5; the public `GET /v1/mode` no
+longer carries `last_sync`). The metrics are in memory: an edge restart starts a
 new sample.
 
 **Latency evidence on file** (stored sources; not eval results): `eval/results/latency_edge_1280_20261114T171323Z.md`
@@ -2062,17 +2663,17 @@ class DepthFramesMeta(BaseModel):
 Response 200:
 
 ```json
-{"accepted": true, "attempt_id": "att_01JDA3K7Q9V2M4N6P8R0S2T4V6", "phase": "PASSIVE",
- "checks": {"d0_valid_ratio": 0.82, "d1_plane_rms_mm": 9.4, "d2_quad_rms_mm": 6.1, "d3_nose_relief_mm": 19.0,
-            "d4_ipd_mm": null, "m2_depth_step_mm": 1.2, "m3_template_rms_mm": null}}
+{"accepted": true, "attempt_id": "att_01JDA3K7Q9V2M4N6P8R0S2T4V6", "phase": "PASSIVE"}
 ```
 
+- v1.5: the reply no longer carries `checks` (DE-02): the measured D0–D4 / M-cue values stay server-side, so a
+  holder of the depth token gets no tuning oracle (`edge/app.py` `depth_frames`). Staff see them in `GET
+  /v1/admin/attempt/{id}/signals` (`attempt:signals`, §3.15) `raw.depth`.
 - The edge runs `depth.checks.compute_depth_checks` on the frames.
 - `accepted` means the frames were parsed and attached to the attempt.
 - Depth **counts** only if it arrived within `latency_budget_ms.depth_max_wait` after the RGB frames (PASSIVE),
   or after the challenge submission (CHALLENGE). Otherwise it is NOT_AVAILABLE with no effect, and
   `DecisionResponse.scores.depth` is `null`.
-- `checks` may also include the remaining `DepthSignal` fields (`available`, `absolute`, `d5_disagree`, `m1_*`).
 - Depth maps stay in RAM only and are dropped after 180 s; they are never stored. Calibration values for H4 are
   collected with `depth/calibrate.py`.
 - The H4 go/no-go is unchanged (`docs/IPHONE_SETUP.md`).
@@ -2084,11 +2685,19 @@ Errors:
 - `403 FORBIDDEN`: `depth_nonce` reused, mismatched, or never issued for this attempt + phase.
 - `409 INVALID_STATE`: depth disabled, or attempt closed.
 - `422 VALIDATION_ERROR`: missing `depth_nonce`, size or dtype mismatch, or no `depth_*` part.
-- `413 PAYLOAD_TOO_LARGE`: a part > 8 MB.
+- `413 PAYLOAD_TOO_LARGE`: a part > 8 MB, or the whole body > 30 MB (`edge/http_guards.py`, also on the LAN
+  listener).
 
 ### 3.18 Users & Access (Control Panel) admin routes (new in v1.4)
 
-All routes need `X-Admin-Token` (`401 UNAUTHORIZED` otherwise). They are the edge proxies of the cloud master
+Auth (v1.5, §0.1.4): `GET /v1/admin/access/users` `access:read`; `PUT /v1/admin/access/users/{user_id}`
+`access:edit`; `POST .../revoke` `access:revoke`; `POST /v1/admin/access/codes/rotate` `codes:rotate` (staff session
+only, §3.18.4); `POST /v1/admin/bundle/refresh` `bundle:refresh`. No / bad credential → `401`, missing permission →
+`403 MISSING_PERMISSION`. Until v1.4 every route needed `X-Admin-Token`; that works now only with
+`AUTH_LEGACY_ADMIN_TOKEN=1`. The edge calls the cloud with its own outbound credential (`CLOUD_EDGE_PROXY_KEY` as
+`Authorization: Bearer`, else legacy `CLOUD_ADMIN_TOKEN` as `X-Admin-Token`; never the inbound `ADMIN_TOKEN`) and
+sends the actor it derives from the caller's principal in the signed body; any client `actor` field is ignored
+(§0.1.9). They are the edge proxies of the cloud master
 schedule (§4.9a): the **signed schedule is the single source of truth** for a user's role, zones, hours, validity
 and revocation (cloud master → signed per-kiosk bundle → edge). The edge never assigns a role itself. Owners:
 edge-ml (`edge/access.py`, `edge/app.py`), cloud-aws (`cloud/app/routers/admin.py`,
@@ -2098,8 +2707,8 @@ edge-ml (`edge/access.py`, `edge/app.py`), cloud-aws (`cloud/app/routers/admin.p
 Edge implementation: `edge/access.py` + `edge/access_models.py` (models are the reference for the field limits);
 anything still open is marked **(code pending)** in place.
 
-**ONLINE requirement** (writes: §3.18.2–§3.18.4): the cloud is configured (`CLOUD_API_URL` and a cloud admin
-token) **and** the kiosk is not forced OFFLINE **and** `GET /v1/mode` reports `mode: ONLINE` or `reason:
+**ONLINE requirement** (writes: §3.18.2–§3.18.4): the cloud is configured (`CLOUD_API_URL` and an outbound cloud
+admin credential, `CLOUD_EDGE_PROXY_KEY` or `CLOUD_ADMIN_TOKEN`) **and** the kiosk is not forced OFFLINE **and** `GET /v1/mode` reports `mode: ONLINE` or `reason:
 bundle_stale` (connectivity is up but the bundle needs a refresh; a write is what fixes it). Otherwise `503
 CLOUD_UNAVAILABLE` reason `OFFLINE` / `NOT_CONFIGURED`, before any cloud call. Reads (§3.18.1) work offline from
 the installed bundle, read-only.
@@ -2216,7 +2825,9 @@ class AccessUsersResponse(BaseModel):
     source: Literal["cloud+bundle", "bundle"]   # "bundle" = the cloud list could not be loaded
     read_only: bool                             # true iff source == "bundle"
     read_only_code: Literal["OFFLINE", "NOT_CONFIGURED", "CLOUD_ERROR", "ENDPOINT_NOT_DEPLOYED",
-                            "CLOUD_ADMIN_TOKEN"] | None
+                            "CLOUD_ADMIN_TOKEN"] | None   # v1.5: a cloud 403 WITH a reason (ADMIN_KEY_INVALID,
+                                                          # MISSING_PERMISSION, ...) reads CLOUD_ERROR here; the
+                                                          # reason text is in read_only_reason
     read_only_reason: str | None                # human-readable
     mode: Literal["ONLINE", "OFFLINE"]
     kiosk_id: str
@@ -2237,7 +2848,8 @@ class AccessUsersResponse(BaseModel):
 ```
 
 Offline the list is still served (`source: "bundle"`, `read_only: true`), and the kiosk disables every write
-control with `read_only_reason`. Only `401` is an error for this route; a cloud failure degrades to read-only.
+control with `read_only_reason`. Only the edge's own auth errors (`401` / `403` / `503 AUTH_*`) are errors for this
+route; a cloud failure, including a cloud `403`, degrades to read-only.
 
 #### 3.18.2 `PUT /v1/admin/access/users/{user_id}` → 200 [`edge.access.users.put`]
 
@@ -2257,8 +2869,9 @@ class AccessUpdate(BaseModel):
                                                           # <=14 windows per zone
     valid_from: str | None = None     # ISO-8601 with offset; explicit null clears
     valid_until: str | None = None    # > valid_from; explicit null clears
-    actor: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.:@-]{1,64}$")   # audit ("register",
-                                      # "control-panel"); forwarded to the cloud
+    actor: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.:@-]{1,64}$")   # v1.5: accepted (pattern
+                                      # checked) but IGNORED: the edge replaces it with the principal's actor
+                                      # (staff:<staff_id> | key:<key_id> | legacy:admin_token) before the cloud call
 ```
 
 `consent` / `restore` (and rotate's `replace_existing`) are `StrictBool` on the edge and the cloud (L2): `"true"`,
@@ -2316,10 +2929,11 @@ visitor without a pass): the kiosk must not proceed to enrolment here. Response 
 
 #### 3.18.3 `POST /v1/admin/access/users/{user_id}/revoke` → 200 [`edge.access.users.revoke`]
 
-Body optional (`extra="forbid"`): `{"reason": "ADMIN", "actor": "control-panel"}`; `reason` matches
+Body optional (`extra="forbid"`): `{"reason": "ADMIN"}` (a client `actor` is accepted and ignored since v1.5);
+`reason` matches
 `^[A-Z][A-Z_]{1,31}$`, default `ADMIN`, and `ERASED` is refused (`422`: the DPDP erasure is `DELETE
 /v1/enroll/{user_id}`). The edge calls cloud `POST /v1/admin/revocations` `{type: "USER", target_id, reason,
-actor}` (never `force`), then pulls bundle + feed: decisions become `SCHEDULE_REVOKED` (DENY) online and offline
+actor}` (never `force`; `actor` = the caller's principal), then pulls bundle + feed: decisions become `SCHEDULE_REVOKED` (DENY) online and offline
 (the feed entry is kept in the encrypted overlay). Response:
 
 ```json
@@ -2344,16 +2958,31 @@ Errors: `404 NOT_FOUND` `UNKNOWN_USER`; `409 INVALID_STATE` `ALREADY_REVOKED`; O
 
 #### 3.18.4 `POST /v1/admin/access/codes/rotate` → 200, `Cache-Control: no-store` [`edge.access.codes.rotate`]
 
-Body (`extra="forbid"`): `{"staff_id": "s_guard01", "count": 4, "replace_existing": true, "actor":
-"control-panel"}`; `staff_id` `^s_[0-9a-z_]{2,32}$`; `count` 1–10, default **4**; `replace_existing` default
-true (drops this staff member's previous codes, including any in `edge/data/DEMO_CODES.txt`). All fields are
-forwarded to cloud `POST /v1/admin/codes/rotate`. Response (flat; the edge never nests the cloud body):
+Body (`extra="forbid"`): `{"staff_id": "s_guard01", "count": 4, "replace_existing": true}`; `staff_id`
+`^s_[0-9a-z_]{2,32}$`; `count` 1–10, default **4**; `replace_existing` default true (drops this staff member's
+previous codes, including any in `edge/data/DEMO_CODES.txt`); `actor` is accepted and ignored.
+
+**Identity rules (v1.5, `edge/app.py` `check_codes_rotate`)**, checked after the `codes:rotate` permission:
+
+| Caller | Result |
+|---|---|
+| API key | `403 FORBIDDEN` reason `MISSING_PERMISSION` (`codes:rotate` is key-forbidden) |
+| legacy `X-Admin-Token` (no staff identity) | `403 FORBIDDEN` reason `NO_STAFF_IDENTITY`, even though the legacy principal lists `codes:rotate` |
+| staff session with `codes:rotate_any` (role admin) | any valid `staff_id`, `count` 1–10 |
+| staff session with `codes:rotate` only (e.g. security_officer) | `staff_id` must equal the caller's own (`s_<username>`), else `403` reason `STAFF_ID_NOT_OWN`; `count` ≤ 4, else `422 VALIDATION_ERROR` |
+
+The edge forwards `{staff_id, count, replace_existing, actor}` to cloud `POST /v1/admin/codes/rotate`, with `actor`
+= `staff:<staff_id of the caller>`. Cloud rules (§4.9a): a `staff_id` is bound to the kiosk that first rotated it;
+another kiosk gets `409 INVALID_STATE` reason `STAFF_ID_TAKEN`; at most 10 active codes per `staff_id` (`422
+VALIDATION_ERROR` reason `TOO_MANY_ACTIVE_CODES`; rotate with `replace_existing: true`). Both are forwarded
+unchanged (§3.18.6). Response (flat; the edge never nests the cloud body):
 
 ```python
 class RotateCodesResult(BaseModel):
     staff_id: str
-    codes: list[dict]                 # [{code_id: "OVR-R1114125000-01" | null, code: "40718325"}]: plaintext, ONCE
-    code_length: int | None           # fallback.staff_override.code_length (8); null = cloud reply omitted it (R-K)
+    codes: list[dict]                 # [{code_id: "OVR-R1114125000-01" | null, code: "4071832590"}]: plaintext, ONCE
+    code_length: int | None           # fallback.staff_override.code_length (10 since v1.5; 8-digit codes in signed
+                                      # bundles stay accepted, legacy_code_lengths [8]); null = cloud omitted it (R-K)
     valid_until: str | None           # bundle expires_at + 24 h; null = cloud reply omitted it (R-K)
     one_time: Literal[True]
     dropped_code_ids: list[str]
@@ -2398,16 +3027,20 @@ Edge mapping of cloud admin calls (`edge/access.py` `cloud_admin`):
 |---|---|
 | transport error, timeout, `401`, `5xx`, unreadable body | `503 CLOUD_UNAVAILABLE` reason `CLOUD_ERROR` (+ `cloud_status` when there was one); counts as a connectivity miss only for transport errors / 5xx |
 | `404` **without** `error.reason`, or `405` | `503 CLOUD_UNAVAILABLE` reason `ENDPOINT_NOT_DEPLOYED` (the live cloud predates the route; redeploy) |
-| `403` | `403 FORBIDDEN` reason `CLOUD_ADMIN_TOKEN` (the cloud refused `X-Admin-Token`; not the edge's own token) |
+| `403` | `403 FORBIDDEN` with the **cloud's reason unchanged** (`ADMIN_KEY_INVALID`, `ADMIN_KEY_EXPIRED`, `MISSING_PERMISSION`, `KIOSK_NOT_BOUND`, `LEGACY_DISABLED`, §0.1.9) + `cloud_status: 403`; reason `CLOUD_ADMIN_TOKEN` only when the cloud sent none. It means the cloud refused the edge's **outbound** credential (`CLOUD_EDGE_PROXY_KEY` / `CLOUD_ADMIN_TOKEN`), not the caller's edge credential. (`edge/access.py` `cloud_admin`) |
 | other `4xx` | same status and `code`; `reason` forwarded verbatim; `cloud_status`, `cloud_code` added; `retry_after_s` from `Retry-After` |
 
 | `reason` | HTTP · `code` | Routes |
 |---|---|---|
 | `OFFLINE` | 503 · `CLOUD_UNAVAILABLE` | writes: forced OFFLINE or connectivity OFFLINE · refresh: forced OFFLINE only (L3) |
-| `NOT_CONFIGURED` | 503 · `CLOUD_UNAVAILABLE` | writes: no `CLOUD_API_URL` / cloud admin token · refresh: no `CLOUD_API_URL` |
+| `NOT_CONFIGURED` | 503 · `CLOUD_UNAVAILABLE` | writes: no `CLOUD_API_URL`, or neither `CLOUD_EDGE_PROXY_KEY` nor `CLOUD_ADMIN_TOKEN` · refresh: no `CLOUD_API_URL` |
 | `CLOUD_ERROR` | 503 · `CLOUD_UNAVAILABLE` | writes, refresh (incl. a refresh attempted while connectivity is OFFLINE that fails) |
 | `ENDPOINT_NOT_DEPLOYED` | 503 · `CLOUD_UNAVAILABLE` | writes |
-| `CLOUD_ADMIN_TOKEN` | 403 · `FORBIDDEN` | writes |
+| `CLOUD_ADMIN_TOKEN` | 403 · `FORBIDDEN` | writes: cloud 403 without a reason (older cloud build) |
+| `ADMIN_KEY_INVALID`, `ADMIN_KEY_EXPIRED`, `MISSING_PERMISSION`, `KIOSK_NOT_BOUND`, `LEGACY_DISABLED` | 403 · `FORBIDDEN` (`cloud_status: 403`) | writes: the cloud refused the outbound credential (v1.5, forwarded unchanged) |
+| `STAFF_ID_TAKEN` | 409 · `INVALID_STATE` | rotate (cloud: `staff_id` bound to another kiosk) |
+| `TOO_MANY_ACTIVE_CODES` | 422 · `VALIDATION_ERROR` | rotate (cloud: > 10 active codes for the `staff_id`) |
+| `NO_STAFF_IDENTITY`, `STAFF_ID_NOT_OWN` | 403 · `FORBIDDEN` | rotate (edge identity rules, §3.18.4) |
 | `UNKNOWN_ROLE` | 422 · `VALIDATION_ERROR` | PUT (edge pre-check + cloud) |
 | `UNKNOWN_ZONE` | 422 · `VALIDATION_ERROR` | PUT (cloud) |
 | `DISPLAY_REQUIRED`, `CONSENT_REQUIRED` | 422 · `VALIDATION_ERROR` | PUT (create) |
@@ -2419,8 +3052,13 @@ Edge mapping of cloud admin calls (`edge/access.py` `cloud_admin`):
 | `BUNDLE_REJECTED` | 409 · `INVALID_STATE` | refresh |
 | `NOT_IN_SCHEDULE`, `NO_BUNDLE`, `FACE_ENROLLED_OTHER`, `LOOK_MISMATCH` | 409 · `INVALID_STATE` | `POST /v1/enroll` |
 | `FRAMES_REJECTED` | 422 · `VALIDATION_ERROR` | `POST /v1/enroll` |
+| `ERASED_PENDING_READMIT`, `CLOUD_REFUSED_REENROLMENT` (v1.5) | 409 · `INVALID_STATE` | `POST /v1/enroll` (§3.15) |
+| `CLOUD_ERROR` | 503 · `CLOUD_UNAVAILABLE` | also `POST /v1/enroll` (ONLINE re-enrolment, cloud check unreachable / 5xx) |
+| `CLOUD_BODY_CAP` (v1.5) | 413 · `PAYLOAD_TOO_LARGE` | `POST /v1/enroll` |
+| `POLICY_RUNTIME_UNAVAILABLE`, `LOCAL_WRITE_FAILED`, `ERASURE_PENDING` (v1.5) | 503 · `MODELS_UNAVAILABLE` | `POST /v1/enroll` |
+| `LOCAL_ERASE_FAILED` (v1.5) | 503 · `MODELS_UNAVAILABLE` | `DELETE /v1/enroll/{user_id}` |
 | `NOT_ENROLLED` | 404 · `NOT_FOUND` | `DELETE /v1/enroll/{user_id}` |
-| `NOT_DEMO_MODE` | 403 · `FORBIDDEN` | `POST /v1/admin/clock` |
+| `NOT_DEMO_MODE` | 403 · `FORBIDDEN` | `POST /v1/admin/clock`, `POST /v1/admin/random-challenge` |
 | `CODES_UNAVAILABLE` | 503 · `CLOUD_UNAVAILABLE` | cloud rotate only (the edge reports it as `CLOUD_ERROR`) |
 
 Request-model `422`s carry `details[]` and no `reason`. The kiosk maps `reason` (not `message`) to its hints:
@@ -2523,12 +3161,19 @@ and entitled users:
 - **Top-level keys**: `format_version`, `bundle_version`, `issued_at`, `expires_at`, `issuer`, `timezone`,
   `scope`, `revocations_version`
 - **Data keys**: `zones`, `kiosks`, `roles`, `exceptions`, `holidays`, `visitor_passes`, `users`, `revocations`,
-  `override_codes`, `card_id_hash_scheme`
+  `override_codes`, `card_id_hash_scheme`, and (v1.5, only when non-empty) `consumed_code_ids`: the ids of staff
+  override codes the cloud has seen used at any kiosk (a `STAFF_OVERRIDE` ALLOW with `code_id` arriving in
+  `/v1/sync`). The cloud removes the code from the master, republishes, and lists the id until the code's original
+  `valid_until`. It is covered by the signature; the edge rejects any `code_id` in it, also from an older cached
+  copy (`edge/policy/fallback.py` `consumed_code_ids`).
 - **`signature`**
 
 **Signature**: `{"alg": "HMAC-SHA256", "key_id": "demo-k1", "value": "<hex>", "canonicalization": "..."}`.
 It is computed over the canonical JSON of the bundle **without** the `signature` key, with
-`SCHEDULE_BUNDLE_HMAC_KEY` (hackathon). The production roadmap is **Ed25519**, so the kiosk holds only a
+`SCHEDULE_BUNDLE_HMAC_KEY` (hackathon). **`key_id` is pinned** (v1.5): the edge accepts a bundle only when
+`signature.key_id` equals its `SCHEDULE_BUNDLE_KEY_ID` (default `demo-k1`, the cloud's default too;
+`edge/offline/bundle.py` `verify_bundle(..., key_id)`). This makes key rotation possible; it does not make the
+symmetric key safe on a stolen kiosk. The production roadmap is **Ed25519**, so the kiosk holds only a
 public key and a stolen kiosk cannot forge bundles. KMS/ECDSA is not used.
 
 ```python
@@ -2560,10 +3205,24 @@ def verify_bundle(bundle: dict, key: bytes) -> bool:
 
 Rules:
 
-- **Caching**: `ETag` = `"<bundle_version>"` (also `X-Bundle-Version`). `If-None-Match` with that version gives
-  `304`. A 304 counts as the cloud confirming the bundle: it resets the online freshness timer (`refresh_age_s`,
-  D2). It does not extend offline validity. A kiosk may only fetch its own bundle (`403 FORBIDDEN`); an unknown
-  kiosk gives `404 NOT_FOUND`.
+- **Caching (v1.5, `cloud/app/routers/core.py` `schedule_bundle`, `services/schedule_service.py`
+  `signed_bundle` / `bundle_etag`)**: `ETag` = `"v<bundle_version>-<issued_at epoch>"` (e.g. `"v51-1794630600"`);
+  the version is also in `X-Bundle-Version`; a 200 carries `Cache-Control: no-store`. `If-None-Match` gives `304`
+  **only when the full ETag matches** (weak `W/` prefixes are stripped); an old-style `"<bundle_version>"` ETag
+  (v1.4) never matches and gets a fresh 200.
+  - **Re-issue**: the cloud reuses the stamps (`issued_at`, `expires_at`) of its last issue for that kiosk while it
+    is the same `bundle_version` and younger than ttl/2 (ttl = `expires_at − issued_at`, 12 h), so the ETag is stable
+    and polls get 304; after ttl/2 it issues a fresh copy (`issued_at = now`, new ETag, 200), so an online kiosk
+    never ages towards expiry on 304s. An operator-uploaded bundle (`PUT /v1/admin/schedule/{kiosk_id}`) is served
+    verbatim, keeps its own `issued_at`, and its ETag is built from that `issued_at`.
+  - **Edge side** (`edge/offline/sync.py`): the edge stores the full ETag it last received for the installed bundle
+    and sends it verbatim (without one it sends the derived new form). When the installed bundle's effective expiry
+    is within max(`bundle_max_staleness_hours`/2, 2 × `bundle_refresh_interval_min`) (6 h with the shipped values)
+    it fetches **unconditionally** (no `If-None-Match`); an admin refresh (`POST /v1/admin/bundle/refresh`) is
+    always unconditional.
+  - A 304 counts as the cloud confirming the bundle: it resets the online freshness timer (`refresh_age_s`, D2).
+    It does not extend offline validity. A kiosk may only fetch its own bundle (`403 FORBIDDEN`); an unknown kiosk
+    gives `404 NOT_FOUND`.
 - **Acceptance** (R6, `edge/offline/bundle.py`): the edge rejects a bundle with an invalid signature, a
   `kiosk_id` outside `scope.kiosk_ids`, a `bundle_version` lower than the current one, or the same version with
   an older `issued_at`. An equal version with a newer `issued_at` (re-sign) is accepted.
@@ -2617,6 +3276,10 @@ them within one heartbeat. On reconnect the edge applies revocations **before** 
 - `SCHEDULE_REVOKED` takes precedence over every other schedule result (R16).
 - Offline, revoked users are not matchable (`NOT_ENROLLED`, §2).
 - A 404 (feed not deployed) is ignored; the bundle's own `revocations` still apply.
+- **Watermark** (v1.5, `cloud/app/services/schedule_service.py` `revocations_since`): `revocation_seq` is the
+  highest seq up to which **every** event is visible, not the raw counter. A seq allocated by a publish whose
+  event is not written yet stops the watermark for up to `FEED_GAP_GRACE_S` (120 s); an older gap is a burnt seq
+  (failed publish) and is stepped over. So an edge that keeps `max(seq)` never skips an in-flight revocation.
 
 ### 4.4 `POST /v1/sync`
 
@@ -2635,7 +3298,9 @@ from pydantic import BaseModel, ConfigDict, Field
 class FallbackUsed(BaseModel):
     method: Literal["TOTP", "CARD", "EMAIL_OTP", "STAFF_OVERRIDE"]
     staff_id: str | None = None         # STAFF_OVERRIDE only
-    code_id: str | None = None          # OVR-NNN; never the code / TOTP value
+    code_id: str | None = None          # OVR-NNN; never the code / TOTP value. v1.5 (SC2 D8): a synced
+                                        # STAFF_OVERRIDE ALLOW with a code_id retires that code fleet-wide (bundle
+                                        # consumed_code_ids, §4.2; cloud services/sync_service.py)
     totp_step: int | None = None        # TOTP only: accepted RFC 6238 time step (non-secret) -> cross-kiosk replay check (Y07)
 
 
@@ -2725,21 +3390,26 @@ Response 200:
 
 `?verbose=true` (dashboard/debug) adds `batch_id`, `kiosk_id`, `conflicts[]`, `alerts[]`, `acks[]` (per item:
 `ACCEPTED|DUPLICATE|CONFLICT|REJECTED` + `verdict`) and per-item rejection `detail`. Batch-level errors:
-`403 FORBIDDEN` (batch `kiosk_id` ≠ `X-Kiosk-Id`, unknown kiosk) and `422 VALIDATION_ERROR` (no `items[]`,
-> 50 items, body not a JSON object).
+`400 VALIDATION_ERROR` (body is not JSON, or nested too deeply), `403 FORBIDDEN` (batch `kiosk_id` ≠
+`X-Kiosk-Id`, unknown kiosk) and `422 VALIDATION_ERROR` (no `items[]`, > 50 items, body not a JSON object).
 
 **Server behaviour**
 
 - **Storage**: DynamoDB conditional put (`STORE_BACKEND=dynamodb`); `memory` for local tests. Decisions expire
   after `DECISIONS_TTL_DAYS` (7).
 - **Duplicates**: same `attempt_id` with the same content → `duplicates` (not an error).
+- **Reconcile retries** (v1.5, `cloud/app/services/sync_service.py`): a decision whose reconcile failed is
+  rolled back and reconciled again on the kiosk's resend; a `PENDING` claim older than 60 s
+  (`PENDING_TAKEOVER_S`) is taken over by the next delivery. A failed override-code consumption is kept in
+  `consume_pending` and retried on every later sync.
 - **Conflicts**: same `attempt_id` with different content → also acknowledged in `duplicates`, so the edge
   purges it. The server keeps both versions and raises `ALERT_SYNC_CONFLICT`; `verbose` lists it in `conflicts`.
 - **Item checks**: every item `hmac` must verify (`SYNC_REQUIRE_ITEM_HMAC`, default on), else `HMAC_INVALID`.
   Items over 8 KB, long strings or long numeric arrays are rejected (`VALIDATION_ERROR`): images and embeddings
   can never enter the ledger.
 - **Integrity**: the server verifies `record_hash`, chain continuity and `chain_head_hmac`. A break raises
-  `ALERT_LOG_TAMPER`, and the records are still ingested.
+  `ALERT_LOG_TAMPER`, and the records are still ingested. A `seq` gap not covered by a tombstone raises
+  `ALERT_CHAIN_GAP` (high); an unhashed record from a kiosk that chains its records raises `ALERT_LOG_TAMPER`.
 - **Re-evaluation**: every offline ALLOW is re-evaluated against the authoritative schedule and revocations at
   `ts_utc` (skew-corrected). The resulting flags map to SC2.6 alerts:
 
@@ -2748,10 +3418,18 @@ Response 200:
   | `POST_HOC_REVOKED` | `ALERT_REVOKED_USER_ADMITTED` |
   | `SCHEDULE_CHANGED` | `ALERT_SCHEDULE_MISMATCH` |
   | `RECORDS_PURGED_UNSYNCED` (tombstone) | `ALERT_RECORDS_PURGED_UNSYNCED` |
+  | `OFFLINE_TEMPLATE_UNCONFIRMED` (v1.5) | `ALERT_OFFLINE_TEMPLATE_UNCONFIRMED` (medium): the user was enrolled offline (`POST /v1/enroll/offline-record`) and no cloud enrolment has indexed a face yet |
+
+- **Verdicts** (v1.5): an offline `STAFF_OVERRIDE` ALLOW without `user_id` (DECISION_POLICY §4 A3, a guard
+  vouched for someone with no usable face) gets verdict `MANUAL_REVIEW`, not a schedule mismatch. Other
+  verdicts: `CONFIRMED`, `DISCREPANCY`, `NOT_EVALUATED` (re-evaluation unavailable, `ALERT_REEVALUATION_UNAVAILABLE`).
 
 - **Alerts without a flag**: `ALERT_TOTP_REPLAY` (same user + `totp_step` accepted on two attempts),
   `ALERT_OVERRIDE_USED` / `ALERT_OVERRIDE_REUSE`, `ALERT_OFFLINE_POLICY_VIOLATION` (offline auto-ALLOW in a
-  high-risk zone), `ALERT_TARGETED_SPOOF`, `ALERT_SPOOF_BURST` (≥ 3 offline SPOOF/INJECTION DENYs in 10 min),
+  high-risk zone; v1.5 also an override code used under another `staff_id`, or a code bound to another kiosk,
+  both with verdict `DISCREPANCY`, or an unknown override `code_id`, reason "unknown override code", which is
+  not published as consumed; codes a rotation dropped stay known (master-only `retired_codes`) until their
+  `valid_until`), `ALERT_TARGETED_SPOOF`, `ALERT_SPOOF_BURST` (≥ 3 offline SPOOF/INJECTION DENYs in 10 min),
   `ALERT_CLOCK_SKEW`. They are visible via `verbose` and `GET /v1/admin/alerts`.
 - **Online mode** uses the same endpoint: while ONLINE, the edge sync loop pushes whenever the queue is
   non-empty.
@@ -2783,6 +3461,11 @@ Response 201:
 - In the SES sandbox, the recipient must be verified.
 - If SES is denied or fails → `503 CLOUD_UNAVAILABLE`, and the kiosk offers the other methods.
 - The edge calls this only through `POST /v1/attempt/{id}/otp/send` (§3.5).
+
+Errors (v1.5, `cloud/app/services/otp_service.py`): `429 RATE_LIMITED` reason `OTP_SEND_CAP` when the user
+already received `fallback.email_otp.max_sends_per_user` (5) codes within `send_window_s` (3600 s), across
+attempts and kiosks; `503 CLOUD_UNAVAILABLE` reason `EMAIL_UNAVAILABLE` when the mail could not be sent (the
+stored code is invalidated; the kiosk offers TOTP / staff code / card).
 
 ### 4.6 `POST /v1/otp/verify`
 
@@ -2843,7 +3526,8 @@ Response 201:
 |---|---|
 | `GET /v1/health` (public, no auth) | Cached health snapshot; see the example below. Per-service values come from a background probe (`ok`, `error`, `creds_expired`, `timeout`, `unknown`, …). `status` is `degraded` when Rekognition or the store is failing. Used by the edge connectivity monitor (timeout `connectivity.heartbeat_timeout_ms` = 2000 ms; any HTTP 200 counts as a heartbeat success). `/health` is an alias. |
 | `POST /v1/enroll` | `multipart/form-data` (`meta` + `frame_N`) or JSON with `images_b64[]` (≤ 10). Meta: `user_id`, `display_name`, `email` (**required in the deployed build**; optional in the tree code: without it EMAIL_OTP is unavailable for the user), `groups[]`, `role` (optional, `^[a-z_]{1,32}$`: echoed as `requested_role`, **never applied**), `consent: true`, `consent_version`, `card_id` / `card_id_hash`, `provision_totp` (cloud default false), `totp_enrolled` (optional bool, wins over `provision_totp`: the cloud only records `fallback.totp_enrolled` in the schedule, it never mints a seed), optional `liveness_session_id` (must be a verified Face Liveness session, else 403). Runs `IndexFaces` ×N → `CreateUser` → `AssociateFaces`. Re-enrolment: the deployed build replaces the user's faces; the tree code **appends** (≤ 24 faces per user, first 5 pinned, frames that do not match the enrolled user → `409 INVALID_STATE`, existing faces kept). Returns 201 `{user_id, rekognition_user_id, face_ids[], faces_indexed, frames_rejected, template_version, local_cache_updated, schedule_entitlement, bundle_version, totp_seed_persisted, destination_masked, totp_provisioning_uri, schedule_role, requested_role, role_applied, readmitted}` (`cloud/app/schemas.py` `EnrollResponse`): `schedule_role` = the signed schedule's role (null = not in the schedule yet), `requested_role` = meta `role` echoed, `role_applied` = true only when the schedule role already equals `requested_role` (enrolment never changes a role), `readmitted` = this consented enrolment lifted an ERASED suspension (feed `READMIT` reason `READMIT`, §4.3); `totp_provisioning_uri` is always null (the edge owns TOTP secrets). Templates stay on the edge. Rekognition unavailable → `503 CLOUD_UNAVAILABLE` (edge sets `cloud_indexed: false`). |
-| `DELETE /v1/enroll/{user_id}` | Erasure (DPDP): Rekognition `DeleteUser` + `DeleteFaces`, deletes records, emits an `ERASE` feed event (§4.3; the schedule entry stays, suspended by an ERASED revocation). Idempotent. Returns `{user_id, erased, rekognition_user_deleted, faces_deleted, revocation_seq, bundle_version}`. |
+| `DELETE /v1/enroll/{user_id}?actor=<actor>` | Erasure (DPDP): Rekognition `DeleteUser` + `DeleteFaces`, deletes records, emits an `ERASE` feed event (§4.3; the schedule entry stays, suspended by an ERASED revocation). A repeat (no enrolment row left) → `404 NOT_FOUND` reason `NOT_ENROLLED`, which the edge counts as done; faces that could not be deleted → `503 CLOUD_UNAVAILABLE` reason `ERASE_INCOMPLETE` (nothing else changed; retry). Device-scoped (kiosk HMAC only). v1.5: optional `actor` (≤ 64 characters, must match `^(staff:s_[0-9a-z_]{2,32}\|key:[a-z0-9]{8}\|legacy:admin_token)$`, else `422` reason `ACTOR_INVALID`) is part of the signed path and is recorded in the `ERASE` audit entry with `actor_assurance: "edge_asserted"`. Returns `{user_id, erased, rekognition_user_deleted, faces_deleted, revocation_seq, bundle_version}`. |
+| `POST /v1/enroll/offline-record` (v1.5) | The edge enrolled a face while the cloud was unreachable (SC2-D4). Body `{user_id, kiosk_id (= X-Kiosk-Id, else 403), at (ISO-8601 with timezone), template_count (1–64), model, actor?}` (`extra="forbid"`, never an image). Idempotent: 201 recorded, 200 duplicate. Audited as `OFFLINE_ENROLMENT` with the asserted actor (`edge_asserted`). Until a cloud enrolment indexes a face, the user's synced offline ALLOWs carry `OFFLINE_TEMPLATE_UNCONFIRMED` (§4.4). Device-scoped (kiosk HMAC only). |
 | `POST /v1/schedule/check` | Authoritative single-user SC1 check `{user_id, zone?, t0?}` → `{user_id, zone, result, bundle_version, revocations_version, evaluated_at, evaluator}`, using the same evaluator as the edge. **Diagnostic only: the edge never calls it** (R5: no per-attempt cloud schedule call). |
 
 Cloud health example:
@@ -2854,31 +3538,52 @@ Cloud health example:
  "server_time": "2026-11-14T05:10:00Z", "checked_at": "2026-11-14T05:09:55Z"}
 ```
 
-### 4.9 Cloud admin endpoints (kiosk HMAC + `X-Admin-Token`)
+### 4.9 Cloud admin endpoints (kiosk HMAC + cloud admin credential)
 
-These are used by the operator dashboard and the demo script, never by the edge decision path. A missing or
-wrong `X-Admin-Token` gives `403 FORBIDDEN`.
+These are used by the operator dashboard, `cloud/tools` and the edge proxies of §3.18, never by the edge decision
+path. **Auth (v1.5, §0.1.9)**: the kiosk HMAC (`401` when it fails) **plus** `Authorization: Bearer
+fgk_<key_id>.<secret>` (a key in `CLOUD_API_KEYS_JSON` whose roles hold the route's permission, column below) or,
+legacy, `X-Admin-Token` (= `CLOUD_ADMIN_TOKEN`) only with the cloud's `AUTH_LEGACY_ADMIN_TOKEN=1` (principal = role
+`admin`). Until v1.4 the shared `X-Admin-Token` was the only admin credential. Every admin-credential failure is
+`403 FORBIDDEN` with reason `ADMIN_KEY_INVALID` | `ADMIN_KEY_EXPIRED` | `MISSING_PERMISSION` (+ `required[]`) |
+`KIOSK_NOT_BOUND` | `LEGACY_DISABLED`. Roles: `admin`, `edge_proxy` (the edge's own key, bound to its kiosk),
+`auditor` (§0.1.3).
 
-| Endpoint | Purpose |
-|---|---|
-| `GET /v1/admin/schedule` | Current authoritative schedule document `{version, published_at, doc}` |
-| `PUT /v1/admin/schedule` | Replace the schedule document → `{bundle_version}`; invalid → `422` |
-| `PUT /v1/admin/schedule/{kiosk_id}` | **(in the code, not deployed until the redeploy)** Upload an operator-signed bundle (`scripts/sign_bundle.py` output, as-is). Verified: HMAC-SHA256 with the bundle key (else 403), kiosk in `kiosks{}` and `scope.kiosk_ids` (403), `bundle_version` strictly greater than the stored one (409; an identical re-upload → 200 unchanged), not expired and no publicly documented override codes (422). Then served verbatim by `GET /v1/schedule/{kiosk_id}` with ETag `"<bundle_version>"`. This is how v46+ with fresh codes replaces v45. |
-| `POST /v1/admin/revocations` | `{type: USER\|CARD, target_id, reason, revoked_at?, force?, actor?}` → 201. Demo step "revoke Priya during the outage". v1.4 details in §4.9a. |
-| `GET /v1/admin/users` · `PUT /v1/admin/users/{user_id}/access` · `POST /v1/admin/codes/rotate` · `GET /v1/admin/audit` | Control Panel access administration (v1.4, §4.9a). **(in the code, not deployed until the redeploy)** |
-| `GET /v1/admin/alerts?since=&limit=` | SC2.6 alerts (`ALERT_*`) |
-| `GET /v1/admin/decisions?kiosk_id=&limit=` | Synced decision ledger, with server verdicts |
-| `GET /v1/admin/stats` | Aggregates over the synced decision ledger (synthetic test traffic excluded unless `?include_synthetic=true`) |
-| `GET /v1/admin/metrics` | Request/decision metrics (in-memory sink only) |
-| `PUT /v1/admin/users/{user_id}/contact` | Contact-only user record `{display_name, email, consent: true, consent_version}` (no biometrics), for an OTP smoke test before enrolment |
-| `GET /v1/admin/fake/outbox` | Last 20 e-mails (only with `EMAIL_BACKEND=fake`; else `404 NOT_FOUND`) |
+| Endpoint | Permission | Purpose |
+|---|---|---|
+| `GET /v1/admin/schedule` | `schedule:read` | Current authoritative schedule document `{version, published_at, doc, codes_redacted}`; override-code `hash` / `salt` are redacted (`codes_redacted: true`) unless the caller also has `schedule:write` |
+| `PUT /v1/admin/schedule` | `schedule:write` | Replace the schedule document → `{bundle_version}`; invalid → `422` |
+| `PUT /v1/admin/schedule/{kiosk_id}` | `schedule:write` | **(in the code, not deployed until the redeploy)** Upload an operator-signed bundle (`scripts/sign_bundle.py` output, as-is). Verified: HMAC-SHA256 with the bundle key (else 403), kiosk in `kiosks{}` and `scope.kiosk_ids` (403), `bundle_version` strictly greater than the stored one (409; an identical re-upload → 200 unchanged), not expired, no publicly documented override codes (422) and no code the cloud already consumed (`422 VALIDATION_ERROR` reason `CODE_CONSUMED`). Then served verbatim by `GET /v1/schedule/{kiosk_id}` with the §4.2 ETag `"v<bundle_version>-<issued_at epoch>"` (v1.4: `"<bundle_version>"`). This is how v46+ with fresh codes replaces v45. |
+| `POST /v1/admin/revocations` | `revocations:write` | `{type: USER\|CARD, target_id, reason, revoked_at?, force?, actor?}` → 201. Demo step "revoke Priya during the outage". v1.4 details in §4.9a. |
+| `GET /v1/admin/users` · `PUT /v1/admin/users/{user_id}/access` · `POST /v1/admin/codes/rotate` · `GET /v1/admin/audit` | `access:read` · `access:edit` · `codes:rotate` · `audit:read` | Control Panel access administration (v1.4, §4.9a). **(in the code, not deployed until the redeploy)** |
+| `GET /v1/admin/alerts?since=&limit=` | `alerts:read` | SC2.6 alerts (`ALERT_*`) |
+| `GET /v1/admin/decisions?kiosk_id=&limit=` | `decisions:read` | Synced decision ledger, with server verdicts |
+| `GET /v1/admin/stats` | `stats:read` | Aggregates over the synced decision ledger (synthetic test traffic excluded unless `?include_synthetic=true`) |
+| `GET /v1/admin/metrics` | `metrics:read` | Request/decision metrics (in-memory sink only) |
+| `PUT /v1/admin/users/{user_id}/contact` | `contact:edit` (admin only; not `edge_proxy`) | Contact-only user record `{display_name, email, consent: true, consent_version}` (no biometrics), for an OTP smoke test before enrolment; audited with the actor |
+| `GET /v1/admin/fake/outbox` | `outbox:read` (admin, only while `EMAIL_BACKEND=fake`) | Last 20 e-mails (only with `EMAIL_BACKEND=fake`; else `404 NOT_FOUND`) |
 
 `PUT /v1/admin/users/{user_id}/contact`: `display_name` is 1–80 characters (R-H, v1.4; was 64); `consent_version` 1–40 characters (R-N, round 2; the code had 32).
 
+**`request_id`** (v1.5): optional top-level field `^[A-Za-z0-9_-]{8,64}$` on `POST /v1/admin/revocations`, `PUT
+/v1/admin/users/{user_id}/access`, `POST /v1/admin/codes/rotate`, `PUT /v1/admin/users/{user_id}/contact`, `PUT
+/v1/admin/schedule` (stripped before storing), `POST /v1/enroll`, `POST /v1/enroll/offline-record`, and
+`?request_id=` on `DELETE /v1/enroll/{user_id}`; not on `PUT /v1/admin/schedule/{kiosk_id}` (the bundle is stored
+as uploaded). It only makes otherwise identical signed requests distinct (replay cache) and is copied into the
+audit entry. The edge sends a fresh one on every edge → cloud write: in the body for `POST` / `PUT` (admin writes, enrol,
+offline-record), in the signed query for `DELETE /v1/enroll/{user_id}` (`edge/cloud_client.py` `new_request_id`).
+
 ### 4.9a Cloud access administration (v1.4; called by the edge proxies of §3.18)
 
-Auth: kiosk HMAC (`401`) + `X-Admin-Token` = `CLOUD_ADMIN_TOKEN` (`403 FORBIDDEN`). The cloud records the calling
-`kiosk_id` and the forwarded `actor` in every audit entry. Domain errors carry `error.reason` (§3.18.6); a `404`
+Auth (v1.5): kiosk HMAC (`401`) + a cloud admin credential with the route's permission (§4.9 table, §0.1.9; `403
+FORBIDDEN` with a reason otherwise). The edge proxies use the `edge_proxy` key (`CLOUD_EDGE_PROXY_KEY`, bound to
+exactly one `kiosk_id`, which must be the HMAC kiosk, else `KIOSK_NOT_BOUND`); until v1.4 (and now only with the
+cloud's `AUTH_LEGACY_ADMIN_TOKEN=1`) it was `X-Admin-Token` = `CLOUD_ADMIN_TOKEN`. **Actor rules**: for an
+`edge_proxy` key the cloud records the `actor` the edge asserts in the signed body, which must match
+`^(staff:s_[0-9a-z_]{2,32}|key:[a-z0-9]{8}|legacy:admin_token)$` (`422` reason `ACTOR_INVALID`), with
+`actor_assurance: "edge_asserted"` and `via: "key:<key_id>"`; for any other key the actor is `key:<key_id>` (a
+client value is ignored); for the legacy token `legacy:admin_token`. Asserted actors are never used for
+authorisation. The cloud records the calling `kiosk_id` and the actor in every audit entry. Domain errors carry `error.reason` (§3.18.6); a `404`
 for an unknown user carries `reason: "UNKNOWN_USER"` so the edge can tell it from a missing route. Field limits
 are §3.18's (R-H): `user_id ^u_[0-9a-z]{4}$` on these routes, `staff_id ^s_[0-9a-z_]{2,32}$`, `display` 1–80,
 written times 00:00–23:59 with end > start. Examples: routes `cloud.*` in
@@ -2904,7 +3609,11 @@ written times 00:00–23:59 with end > start. Examples: routes `cloud.*` in
   `DELETE /v1/enroll` creates an erasure); unknown user without `force` → `404` `UNKNOWN_USER`; a user that
   already holds a non-ERASED USER revocation → `409` `ALREADY_REVOKED` (no new seq).
 - **`POST /v1/admin/codes/rotate`** → 201, `Cache-Control: no-store`. Body `{staff_id, count (1–10, default 4),
-  replace_existing (default true), actor?}`. Response `{staff_id, bundle_version, codes[{code_id, code}],
+  replace_existing (default true), actor?}`. v1.5 (SC2 D8): the first kiosk to rotate a `staff_id` owns it (master
+  staff registry); a rotation from another kiosk → `409 INVALID_STATE` reason `STAFF_ID_TAKEN`, and that staff
+  member's codes reach only the owner kiosk's bundle; at most 10 active codes per `staff_id` → else `422
+  VALIDATION_ERROR` reason `TOO_MANY_ACTIVE_CODES`. New codes have `fallback.staff_override.code_length` (10)
+  digits. Response `{staff_id, bundle_version, codes[{code_id, code}],
   dropped_code_ids[], code_length, valid_until, one_time: true, warning}`. Plaintext exists only in this response
   (PBKDF2 hashes in the master; never logged). Documented fixture codes are dropped on every publish. `503
   CLOUD_UNAVAILABLE` reason `CODES_UNAVAILABLE` when the documented-code list is missing from the build (fail
@@ -2916,45 +3625,60 @@ written times 00:00–23:59 with end > start. Examples: routes `cloud.*` in
 
 ## 5. Endpoint summary
 
+Auth column (v1.5): a permission = the edge route needs a principal holding it (§0.1.4: staff session `Bearer
+fgs_...`, edge API key `Bearer fgk_...`, or legacy `X-Admin-Token` only with `AUTH_LEGACY_ADMIN_TOKEN=1`); "public"
+= no credential; "any principal" = any authenticated principal; cloud admin permissions are checked on a cloud API
+key (§0.1.9). Until v1.4 the edge column read "admin" (`X-Admin-Token`) or "localhost" (no token).
+
 | Service | Method & path | Purpose | Auth | Offline |
 |---|---|---|---|---|
-| Edge | `POST /v1/session/start` | attempt_id, nonce, flash sequence (+ PASSIVE depth job) | — | ✔ |
-| Edge | `POST /v1/attempt/{id}/probe` | early cloud probe: face-lock frame, starts the Rekognition match (202) | — | ✔ (`cloud: skipped`) |
-| Edge | `POST /v1/attempt/{id}/frames` | main decision (DecisionResponse) | — | ✔ |
-| Edge | `POST /v1/attempt/{id}/challenge` | step-up challenge result | — | ✔ |
-| Edge | `POST /v1/attempt/{id}/fallback` | TOTP / CARD / EMAIL_OTP / STAFF_OVERRIDE | — | ✔ (no EMAIL_OTP) |
-| Edge | `POST /v1/attempt/{id}/otp/send` | send email OTP via cloud | — | ✘ (503) |
-| Edge | `POST /v1/attempt/{id}/rendered` | client face-lock → rendered beacon | — | ✔ |
-| Edge | `GET /v1/attempt/{id}` | latest DecisionResponse | — | ✔ |
-| Edge | `GET /v1/events` | SSE: `decision` + `rendered` events | localhost | ✔ |
-| Edge | `GET /v1/health` | models, PAD self-test, DepthProbe status | — | ✔ |
-| Edge | `GET /v1/mode` | connectivity, bundle, cache, queue, demo clock | — | ✔ |
-| Edge | `POST /v1/admin/mode` | force OFFLINE / AUTO (immediate) | admin | ✔ |
-| Edge | `GET /v1/admin/store` · `POST /v1/admin/sync` | SC2 store view · sync now | admin | ✔ · ✘ (503) |
-| Edge | `GET /v1/admin/users` | enrolled-user list (no templates) | admin | ✔ |
-| Edge | `GET /v1/admin/access/users` | Users & Access table: cloud master + bundle + local enrolment (§3.18.1) | admin | ✔ (read-only, bundle) |
-| Edge | `PUT /v1/admin/access/users/{user_id}` | create / edit / re-admit / restore a schedule entry (§3.18.2) | admin | ✘ (503 `OFFLINE`) |
-| Edge | `POST /v1/admin/access/users/{user_id}/revoke` | USER revocation → `SCHEDULE_REVOKED` (§3.18.3) | admin | ✘ (503 `OFFLINE`) |
-| Edge | `POST /v1/admin/access/codes/rotate` | one-time staff override codes, shown once (§3.18.4) | admin | ✘ (503 `OFFLINE`) |
-| Edge | `POST /v1/admin/bundle/refresh` | pull + verify + install the newest bundle now (§3.18.5) | admin | ✘ (503) |
-| Edge | `GET /v1/admin/attempt/{id}/signals` | raw-signal debug view | admin | ✔ |
-| Edge | `POST /v1/admin/rate-limit/reset` | clear lockout counter | admin | ✔ |
-| Edge | `POST` · `DELETE /v1/admin/eval/context` | tag / untag eval attempts | admin | ✔ |
-| Edge | `POST /v1/admin/clock` | demo clock (`DEMO_MODE=1` only) | admin | ✔ |
-| Edge | `POST /v1/admin/random-challenge` | random challenge `AUTO` / `FORCE` / `FORCE_NEXT` / `OFF` (`DEMO_MODE=1` only) | admin | ✔ |
-| Edge | `POST /v1/enroll` · `DELETE /v1/enroll/{user_id}` | enrolment (bundle users only) / erasure | admin | ✔ (`cloud_state: skipped_offline` / cloud erasure `queued`) |
-| Edge | `GET /v1/metrics` | dashboard metrics | localhost | ✔ |
+| Edge | `POST /v1/session/start` | attempt_id, nonce, flash sequence (+ PASSIVE depth job) | public | ✔ |
+| Edge | `POST /v1/attempt/{id}/probe` | early cloud probe: face-lock frame, starts the Rekognition match (202) | public | ✔ (`cloud: skipped`) |
+| Edge | `POST /v1/attempt/{id}/frames` | main decision (DecisionResponse) | public (attempt nonce) | ✔ |
+| Edge | `POST /v1/attempt/{id}/challenge` | step-up challenge result | public (challenge nonce) | ✔ |
+| Edge | `POST /v1/attempt/{id}/fallback` | TOTP / CARD / EMAIL_OTP / STAFF_OVERRIDE | public | ✔ (no EMAIL_OTP) |
+| Edge | `POST /v1/attempt/{id}/otp/send` | send email OTP via cloud | public | ✘ (503) |
+| Edge | `POST /v1/attempt/{id}/rendered` | client face-lock → rendered beacon | public | ✔ |
+| Edge | `GET /v1/attempt/{id}` | latest DecisionResponse | public | ✔ |
+| Edge | `GET /v1/health` | models, PAD self-test, DepthProbe status, `degraded_reasons` | public | ✔ |
+| Edge | `GET /v1/mode` | public badge subset: mode, state, reason, forced, forced_until, queue depth, cache state, demo clock | public | ✔ |
+| Edge | `GET /v1/auth/status` | staff-store state, bootstrap hint (no usernames) | public | ✔ |
+| Edge | `POST /v1/auth/login` | staff sign-in (password + TOTP) → session token | public (throttled) | ✔ |
+| Edge | `POST /v1/auth/logout` · `POST /v1/auth/activity` · `GET /v1/auth/me` | end session · refresh idle timer · who am I | any principal | ✔ |
+| Edge | `POST /v1/auth/password` · `POST /v1/auth/mfa/enroll` · `POST /v1/auth/mfa/confirm` | own password change · TOTP enrolment | any principal (staff session only) | ✔ |
+| Edge | `GET /v1/events` | SSE: `decision` + `rendered` events (`event: auth` on session end) | `events:read` | ✔ |
+| Edge | `GET /v1/metrics` | dashboard metrics | `metrics:read` | ✔ |
+| Edge | `GET /v1/admin/mode/detail` | full runtime status (bundle, rate limit, policy bars, cloud match, ...) | `store:read` | ✔ |
+| Edge | `POST /v1/admin/mode` | force OFFLINE (auto-revert) / AUTO (immediate) | `mode:switch` | ✔ |
+| Edge | `GET /v1/admin/store` · `POST /v1/admin/sync` | SC2 store view · sync now | `store:read` · `sync:run` | ✔ · ✘ (503) |
+| Edge | `GET /v1/admin/sync/last` · `GET /v1/admin/alerts` | full last sync report + server flags · edge policy alerts / security events | `audit:read` | ✔ |
+| Edge | `GET /v1/admin/users` | enrolled-user list (no templates) | `enrol:read` | ✔ |
+| Edge | `GET /v1/admin/access/users` | Users & Access table: cloud master + bundle + local enrolment (§3.18.1) | `access:read` | ✔ (read-only, bundle) |
+| Edge | `PUT /v1/admin/access/users/{user_id}` | create / edit / re-admit / restore a schedule entry (§3.18.2) | `access:edit` | ✘ (503 `OFFLINE`) |
+| Edge | `POST /v1/admin/access/users/{user_id}/revoke` | USER revocation → `SCHEDULE_REVOKED` (§3.18.3) | `access:revoke` | ✘ (503 `OFFLINE`) |
+| Edge | `POST /v1/admin/access/codes/rotate` | one-time staff override codes, shown once (§3.18.4) | `codes:rotate` (staff session, own `staff_id`; `codes:rotate_any` for others) | ✘ (503 `OFFLINE`) |
+| Edge | `POST /v1/admin/bundle/refresh` | pull + verify + install the newest bundle now (§3.18.5) | `bundle:refresh` | ✘ (503) |
+| Edge | `GET /v1/admin/attempt/{id}/signals` | raw-signal debug view | `attempt:signals` | ✔ |
+| Edge | `POST /v1/admin/rate-limit/reset` | clear lockout counter | `ratelimit:reset` | ✔ |
+| Edge | `POST` · `DELETE /v1/admin/eval/context` | tag / untag eval attempts | `eval:admin` | ✔ |
+| Edge | `POST /v1/admin/clock` | demo clock (`DEMO_MODE=1` only, else 403 `NOT_DEMO_MODE`) | `demo:clock` | ✔ |
+| Edge | `POST /v1/admin/random-challenge` | random challenge `AUTO` / `FORCE` / `FORCE_NEXT` / `OFF` (`DEMO_MODE=1` only) | `challenge:control` | ✔ |
+| Edge | `POST /v1/enroll` · `DELETE /v1/enroll/{user_id}` | enrolment (bundle users only) / erasure | `enrol:write` · `enrol:erase` | ✔ (`cloud_state: skipped_offline` / cloud erasure `queued`) |
+| Edge | `GET /v1/admin/roles` | role / permission catalog (§0.1.3) | any principal | ✔ |
+| Edge | `GET` · `POST /v1/admin/staff` · `GET` · `PATCH` · `DELETE /v1/admin/staff/{staff_id}` · `POST .../password` · `.../unlock` · `.../mfa/reset` | staff accounts (§0.1.7) | `staff:manage` (staff session; never an API key or the legacy token) | ✔ |
+| Edge | `GET` · `POST /v1/admin/api-keys` · `DELETE /v1/admin/api-keys/{key_id}` | edge API keys (§0.1.7) | `staff:manage` | ✔ |
+| Edge | `GET /v1/admin/auth/audit` | auth audit log (§0.1.7) | `audit:read` | ✔ |
 | Edge | `GET /v1/depth/pending` · `POST /v1/depth/frames` | DepthProbe long-poll · depth upload (also on `0.0.0.0:EDGE_LAN_PORT`) | `X-Depth-Token` + `depth_nonce` | ✔ |
 | Cloud | `POST /v1/match` | Rekognition 1:N / 1:1 | kiosk HMAC | — |
-| Cloud | `GET /v1/schedule/{kiosk_id}` | signed bundle (ETag / 304) | kiosk HMAC | — |
+| Cloud | `GET /v1/schedule/{kiosk_id}` | signed bundle (ETag `"v<version>-<issued_at epoch>"` / 304) | kiosk HMAC | — |
 | Cloud | `GET /v1/revocations` | revocation feed since seq | kiosk HMAC | — |
 | Cloud | `POST /v1/sync` | idempotent decision ingest | kiosk HMAC | — |
 | Cloud | `POST /v1/otp/send` · `POST /v1/otp/verify` | SES email OTP | kiosk HMAC | — |
 | Cloud | `POST /v1/liveness/session` · `GET …/result` | Face Liveness step-up (optional) | kiosk HMAC | — |
 | Cloud | `GET /v1/health` | heartbeat | public | — |
-| Cloud | `POST /v1/enroll` · `DELETE /v1/enroll/{user_id}` | enrolment · erasure | kiosk HMAC | — |
+| Cloud | `POST /v1/enroll` · `DELETE /v1/enroll/{user_id}?actor=` | enrolment · erasure (asserted actor recorded) | kiosk HMAC | — |
 | Cloud | `POST /v1/schedule/check` | diagnostic SC1 check (not called by the edge) | kiosk HMAC | — |
-| Cloud | `/v1/admin/*` (§4.9, §4.9a) | schedule (+ per-kiosk signed-bundle upload), revocations, users / access / code rotation / audit, alerts, decisions, stats, metrics, contact, fake outbox | kiosk HMAC + admin | — |
+| Cloud | `/v1/admin/*` (§4.9, §4.9a) | schedule (+ per-kiosk signed-bundle upload), revocations, users / access / code rotation / audit, alerts, decisions, stats, metrics, contact, fake outbox | kiosk HMAC + cloud API key with the route's permission (§4.9 table); legacy `X-Admin-Token` only with the cloud flag | — |
 
 **Removed in v1.1 (must not be implemented or referenced)**:
 

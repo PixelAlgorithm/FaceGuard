@@ -41,6 +41,13 @@ function str(path: string, fallback: string): string {
   return fallback
 }
 
+function numList(path: string, fallback: number[]): number[] {
+  const v = pick(path)
+  if (Array.isArray(v) && v.every((x) => typeof x === 'number' && Number.isInteger(x) && x > 0)) return v as number[]
+  missingKeys.push(path)
+  return fallback
+}
+
 function strList(path: string, fallback: string[]): string[] {
   const v = pick(path)
   if (Array.isArray(v) && v.every((x) => typeof x === 'string')) return v as string[]
@@ -108,7 +115,9 @@ export const THRESHOLDS = {
   fallback: {
     totpDigits: num('fallback.totp.digits', 6),
     emailOtpDigits: num('fallback.email_otp.digits', 6),
-    staffCodeLength: num('fallback.staff_override.code_length', 8),
+    staffCodeLength: num('fallback.staff_override.code_length', 10),
+    /** older code lengths still accepted by the edge until those codes expire (EO-11) */
+    staffCodeLegacyLengths: numList('fallback.staff_override.legacy_code_lengths', [8]),
   },
   connectivity: {
     statusPollMs: num('connectivity.status_poll_ms', 2000),
@@ -177,8 +186,12 @@ export const UI = {
    * match overlaps the capture. Fire-and-forget; `?probe=0` disables it (A/B timing runs).
    */
   earlyProbe: new URLSearchParams(window.location.search).get('probe') !== '0',
-  /** Network timeouts (ms). */
-  timeouts: { sessionStart: 3000, frames: 8000, challenge: 8000, fallback: 8000, mode: 1500, admin: 4000, accessAdmin: 15000 },
+  /**
+   * Network timeouts (ms). `accessAdmin` / `enroll` cover writes that return a shown-once secret (rotated
+   * codes, TOTP URI): they must outlast the edge's worst case (cloud admin call 8 s + one re-signed retry +
+   * bundle refresh), otherwise the browser aborts while the edge commits and the secret is lost (audit KAO-05).
+   */
+  timeouts: { sessionStart: 3000, frames: 8000, challenge: 8000, fallback: 8000, mode: 1500, admin: 4000, auth: 10000, accessAdmin: 45000, enroll: 60000 },
 } as const
 
 // ---------------------------------------------------------------- runtime settings
@@ -190,15 +203,19 @@ export const STORAGE_KEYS = {
   delegate: 'hid.delegate',
   kioskId: 'hid.kioskId',
   evalContext: 'hid.evalContext',
-  adminToken: 'hid.adminToken', // sessionStorage
+  /** @deprecated legacy shared-token slot (sessionStorage); removed on the public kiosk route */
+  adminToken: 'hid.adminToken',
+  /** staff session token (sessionStorage), persisted only on /admin, /operator, /register */
+  session: 'hid.session',
   mockScenario: 'hid.mock.scenario',
   mockState: 'hid.mock.state',
 } as const
 
-/** VITE_EDGE_URL > same origin when the edge itself serves the built kiosk (port 8000) > http://127.0.0.1:8000. */
-export const EDGE_URL = (
-  import.meta.env.VITE_EDGE_URL || (window.location.port === '8000' ? window.location.origin : 'http://127.0.0.1:8000')
-).replace(/\/+$/, '')
+/**
+ * VITE_EDGE_URL > http://127.0.0.1:8000. (The edge does not serve the built kiosk itself; a static host for
+ * dist/ must be listed in the edge's CORS origins - audit KAO-13.)
+ */
+export const EDGE_URL = (import.meta.env.VITE_EDGE_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '')
 export const DEFAULT_KIOSK_ID = import.meta.env.VITE_KIOSK_ID || 'KIOSK_MAIN_01'
 
 function readLocal(key: string): string | null {
@@ -236,13 +253,24 @@ function writeSession(key: string, value: string | null): void {
 }
 
 /**
- * Mock edge on/off: ?mock=1|0 > this TAB's sessionStorage > VITE_MOCK. Evaluated once per page load.
+ * Developer tools (mock edge, ?debug, ?camflip, ?delegate, ?kiosk) exist only in a dev server build or an
+ * explicit VITE_ALLOW_MOCK=1 build. A production build ignores them, so a link or a typed ?mock=1 on a real
+ * kiosk can never switch it to simulated decisions (audit KAO-03 / KF-04).
+ */
+export const DEV_TOOLS_ALLOWED: boolean = !import.meta.env.PROD || import.meta.env.VITE_ALLOW_MOCK === '1'
+
+/**
+ * Mock edge on/off (only when DEV_TOOLS_ALLOWED): ?mock=1|0 > this TAB's sessionStorage > VITE_MOCK. Evaluated once per page load.
  * Deliberately per tab (sessionStorage), never localStorage: one ?mock=1 visit must not leave the live
  * kiosk / admin tabs on the simulated edge (fake decisions and latencies in a live demo). A value left in
  * localStorage by older builds is removed.
  */
 export const MOCK_ENABLED: boolean = (() => {
   writeLocal(STORAGE_KEYS.mock, null)
+  if (!DEV_TOOLS_ALLOWED) {
+    writeSession(STORAGE_KEYS.mock, null)
+    return false
+  }
   const q = new URLSearchParams(window.location.search).get('mock')
   if (q === '1' || q === '0') {
     writeSession(STORAGE_KEYS.mock, q === '1' ? '1' : null)
@@ -260,6 +288,7 @@ export function exitMockHref(): string {
 }
 
 function persistedFlag(param: string, key: string): string | null {
+  if (!DEV_TOOLS_ALLOWED) return null
   const q = new URLSearchParams(window.location.search).get(param)
   if (q !== null) {
     writeLocal(key, q === '' ? null : q)
@@ -274,17 +303,22 @@ export const DEBUG_ENABLED: boolean = persistedFlag('debug', STORAGE_KEYS.debug)
 /**
  * ?camflip=1 if the camera stream itself arrives MIRRORED (some camera apps / OS settings): inverts the
  * yaw sign so that + stays = the subject's left. Check it on the ?debug=1 overlay. Persisted; ?camflip=0 resets.
+ * Production builds: VITE_CAMERA_FLIPPED=1 at build time (the query string is ignored).
  */
-export const CAMERA_FLIPPED: boolean = persistedFlag('camflip', STORAGE_KEYS.camflip) === '1'
+export const CAMERA_FLIPPED: boolean = DEV_TOOLS_ALLOWED
+  ? persistedFlag('camflip', STORAGE_KEYS.camflip) === '1'
+  : import.meta.env.VITE_CAMERA_FLIPPED === '1'
 
 /** ?delegate=cpu|gpu forces the MediaPipe delegate (default GPU with CPU fallback). Persisted. */
 export const DELEGATE_OVERRIDE: 'CPU' | 'GPU' | null = (() => {
-  const v = (persistedFlag('delegate', STORAGE_KEYS.delegate) ?? '').toUpperCase()
+  // production builds: VITE_DELEGATE=cpu|gpu at build time (the query string is ignored)
+  const raw = DEV_TOOLS_ALLOWED ? persistedFlag('delegate', STORAGE_KEYS.delegate) : (import.meta.env.VITE_DELEGATE as string | undefined)
+  const v = (raw ?? '').toUpperCase()
   return v === 'CPU' || v === 'GPU' ? v : null
 })()
 
 /** ?kiosk= applies to this page load only (not persisted: a stale override used to survive reloads). */
-let kioskQueryOverride: string | null = new URLSearchParams(window.location.search).get('kiosk') || null
+let kioskQueryOverride: string | null = DEV_TOOLS_ALLOWED ? new URLSearchParams(window.location.search).get('kiosk') || null : null
 
 /** Kiosk id: ?kiosk= (this page load) > localStorage (set from /admin) > VITE_KIOSK_ID. */
 export function getKioskId(): string {
@@ -316,21 +350,4 @@ export const KIOSK_IDS = ['KIOSK_MAIN_01', 'KIOSK_LIB_01', 'KIOSK_LAB_01', 'KIOS
  */
 export function getEvalContextLocal(): string | null {
   return readLocal(STORAGE_KEYS.evalContext)
-}
-
-export function getAdminToken(): string {
-  try {
-    return window.sessionStorage.getItem(STORAGE_KEYS.adminToken) ?? ''
-  } catch {
-    return ''
-  }
-}
-
-export function setAdminToken(token: string): void {
-  try {
-    if (token) window.sessionStorage.setItem(STORAGE_KEYS.adminToken, token)
-    else window.sessionStorage.removeItem(STORAGE_KEYS.adminToken)
-  } catch {
-    /* ignore */
-  }
 }

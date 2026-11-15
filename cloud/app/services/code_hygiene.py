@@ -24,8 +24,10 @@ from ..policy_bridge import load_documented_override_values
 log = logging.getLogger("hid.cloud.codes")
 
 DOCUMENTED_CODE_IDS = frozenset({"OVR-001", "OVR-002", "OVR-003"})
-# (iterations, edge floor, salt, hash) -> documented? (PBKDF2 is ~40 ms each)
-_MEMO: dict[tuple[int, int, str, str], bool] = {}
+# (iterations, edge floor, salt, hash, documented values) -> documented? (PBKDF2 is ~40 ms each). Keyed by the
+# values too, so an explicit list (rotate) is memoised as well instead of re-hashing every stored code each time.
+_MEMO: dict[tuple[int, int, str, str, tuple[str, ...]], bool] = {}
+_MEMO_MAX = 4096
 _EDGE_MIN_ITERATIONS = 100000  # thresholds.yaml fallback.staff_override.pbkdf2_iterations (set_edge_min_iterations)
 
 
@@ -48,8 +50,8 @@ def is_documented(code: Any, iterations: int, values: tuple[str, ...] | None = N
     if vals is None:
         return True  # fail secure: cannot tell -> treat as documented
     salt_hex, want = str(code.get("salt", "")), str(code.get("hash", ""))
-    memo_key = (iterations, _EDGE_MIN_ITERATIONS, salt_hex, want)
-    if values is None and memo_key in _MEMO:
+    memo_key = (iterations, _EDGE_MIN_ITERATIONS, salt_hex, want, tuple(vals))
+    if memo_key in _MEMO:
         return _MEMO[memo_key]
     try:
         salt = bytes.fromhex(salt_hex)
@@ -57,8 +59,9 @@ def is_documented(code: Any, iterations: int, values: tuple[str, ...] | None = N
         return True  # malformed code entry is unusable anyway
     hit = any(hmac.compare_digest(hashlib.pbkdf2_hmac("sha256", v.encode(), salt, n).hex(), want)
               for n in _candidate_iterations(iterations) for v in vals)
-    if values is None:
-        _MEMO[memo_key] = hit
+    if len(_MEMO) >= _MEMO_MAX:
+        _MEMO.clear()
+    _MEMO[memo_key] = hit
     return hit
 
 

@@ -27,8 +27,16 @@ PEPPER = "hidhack-demo-pepper"
 T0 = datetime(2026, 11, 14, 4, 35, tzinfo=UTC)
 
 
+def etag(version: int, issued: datetime = T0) -> str:
+    """Bundle ETag (V2 §E): "v<bundle_version>-<issued_at epoch>"; the FixedClock issues at T0."""
+    return f'"v{version}-{int(issued.timestamp())}"'
+
+
 def make_settings(**kw) -> Settings:
-    base = dict(kiosk_hmac_key=KIOSK_KEY, schedule_bundle_hmac_key=BUNDLE_KEY, cloud_api_key=API_KEY,
+    """Test settings. Existing tests use the shared kiosk key and the legacy X-Admin-Token, so both opt-ins are ON
+    here; tests of the production default (both OFF) pass auth_legacy_admin_token=False etc. explicitly."""
+    base = dict(auth_legacy_admin_token=True, allow_shared_kiosk_key=True,
+                kiosk_hmac_key=KIOSK_KEY, schedule_bundle_hmac_key=BUNDLE_KEY, cloud_api_key=API_KEY,
                 admin_token=ADMIN, card_id_pepper=PEPPER, otp_pepper="otp-pepper", face_backend="fake",
                 liveness_backend="fake", store_backend="memory", email_backend="fake", blob_backend="memory",
                 metrics_sink="memory", health_refresh_s=3600.0)

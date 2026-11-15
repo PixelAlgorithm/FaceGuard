@@ -12,12 +12,15 @@ import hashlib
 import hmac
 import json
 import logging
+import secrets
+import ssl
 import time
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
-from edge.config import Settings, Thresholds
+from edge.config import Settings, Thresholds, cloud_tls_verify
 from edge.policy.signals import CloudMatch
 
 log = logging.getLogger("edge.cloud")
@@ -26,14 +29,18 @@ log = logging.getLogger("edge.cloud")
 class CloudUnavailable(Exception):
     """The cloud could not be used: transport error / timeout (status None), 401 (our kiosk signature or key
     was rejected) or a 5xx. `connectivity_miss` = it says something about reachability (transport error or 5xx)
-    and should count as a heartbeat miss; a 401 is a configuration problem, not an outage."""
+    and should count as a heartbeat miss; a 401 is a configuration problem, not an outage. A 5xx whose error
+    reason says only a cloud dependency is down (EMAIL_UNAVAILABLE: SES / mailer) is NOT a connectivity miss."""
 
-    def __init__(self, message: str, status: int | None = None) -> None:
+    def __init__(self, message: str, status: int | None = None, reason: str | None = None) -> None:
         super().__init__(message)
         self.status = status
+        self.reason = reason
 
     @property
     def connectivity_miss(self) -> bool:
+        if self.reason in NOT_CONNECTIVITY_REASONS:
+            return False
         return self.status is None or self.status >= 500
 
 
@@ -49,12 +56,21 @@ class CloudRejected(Exception):
         self.reason = reason
 
 
+EMAIL_UNAVAILABLE = "EMAIL_UNAVAILABLE"  # cloud healthy, mailer down (offline-verification audit F7)
+NOT_CONNECTIVITY_REASONS = frozenset({EMAIL_UNAVAILABLE})
+
+
+def _error_reason(err: Any) -> str | None:
+    reason = err.get("reason") if isinstance(err, dict) else None
+    return str(reason)[:64] if isinstance(reason, str) and reason else None
+
+
 def _cloud_error(resp: httpx.Response, what: str) -> Exception:
     """Map a non-2xx cloud response: 401 / 5xx -> CloudUnavailable; any other status -> CloudRejected."""
-    if resp.status_code == 401 or resp.status_code >= 500:
-        return CloudUnavailable(f"{what} HTTP {resp.status_code}", resp.status_code)
     body = _safe_json(resp)
     err = body.get("error") if isinstance(body, dict) else None
+    if resp.status_code == 401 or resp.status_code >= 500:
+        return CloudUnavailable(f"{what} HTTP {resp.status_code}", resp.status_code, _error_reason(err))
     code = str(err.get("code")) if isinstance(err, dict) and err.get("code") else f"HTTP_{resp.status_code}"
     msg = str(err.get("message")) if isinstance(err, dict) and err.get("message") else f"{what} HTTP {resp.status_code}"
     retry = None
@@ -64,9 +80,7 @@ def _cloud_error(resp: httpx.Response, what: str) -> Exception:
             retry = max(0, int(float(raw)))
         except ValueError:
             retry = None
-    reason = err.get("reason") if isinstance(err, dict) else None
-    reason = str(reason)[:64] if isinstance(reason, str) and reason else None
-    return CloudRejected(resp.status_code, code, msg[:300], retry, reason)
+    return CloudRejected(resp.status_code, code, msg[:300], retry, _error_reason(err))
 
 
 CLOCK_DRIFT_CORRECT_S = 30.0  # sign with server time once |X-Server-Time - local| exceeds this
@@ -79,6 +93,15 @@ MATCH_POOL_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=
                                  keepalive_expiry=KEEPALIVE_EXPIRY_S)
 OTP_CLOUD_ERROR_STATUS = frozenset({401, 429})  # + every 5xx: the cloud did not judge the code (R11)
 WARM_SKIP_S = 20.0  # session/start warm-up is skipped if the client completed a request this recently
+
+
+REQUEST_ID_BYTES = 12  # secrets.token_urlsafe(12) -> 16 chars of [A-Za-z0-9_-] (cloud pattern ^[A-Za-z0-9_-]{1,64}$)
+
+
+def new_request_id() -> str:
+    """Per-call nonce inside the signed body / query (probe rbac-e2e 10b): two identical admin calls in the same
+    second must not produce identical signatures, which the cloud's replay guard would reject."""
+    return secrets.token_urlsafe(REQUEST_ID_BYTES)
 
 
 def _local_sign(key: str, method: str, path: str, ts: str, body: bytes) -> str:
@@ -107,6 +130,8 @@ class CloudClient:
         self.health_path = str(thresholds.get("connectivity.health_path"))
         self.warm_timeout_s = float(thresholds.get("connectivity.heartbeat_timeout_ms")) / 1000.0
         self._transport = transport
+        # EAE-07: CLOUD_TLS_CA_FILE pins the cloud certificate (ConfigError at startup when unreadable)
+        self.tls_verify: ssl.SSLContext | bool = cloud_tls_verify(settings.cloud_tls_ca_file)
         self._client: httpx.AsyncClient | None = None
         self.clock_offset_s = 0.0  # server - local, applied only when drift > CLOCK_DRIFT_CORRECT_S
         self._last_used: float | None = None  # monotonic time this client last got a response
@@ -120,7 +145,8 @@ class CloudClient:
     async def start(self) -> None:
         if self.enabled and self._client is None:
             self._client = httpx.AsyncClient(base_url=self.settings.cloud_api_url, transport=self._transport,
-                                             timeout=httpx.Timeout(5.0, connect=1.0), limits=MATCH_POOL_LIMITS)
+                                             timeout=httpx.Timeout(5.0, connect=1.0), limits=MATCH_POOL_LIMITS,
+                                             verify=self.tls_verify)
 
     async def stop(self) -> None:
         task, self._warm_task = self._warm_task, None
@@ -277,27 +303,53 @@ class CloudClient:
         return body["verified"]
 
     async def enroll(self, meta: dict[str, Any], jpegs: list[bytes]) -> dict[str, Any]:
-        payload = {**meta, "images_b64": [base64.b64encode(j).decode() for j in jpegs]}
+        """POST /v1/enroll (device-scoped: kiosk HMAC). `meta` carries the edge-derived `actor` (RBAC v2 D) inside
+        the signed body."""
+        payload = {**meta, "request_id": new_request_id(),
+                   "images_b64": [base64.b64encode(j).decode() for j in jpegs]}
         resp = await self._post("/v1/enroll", payload, 15.0)
         return {"status": resp.status_code, "body": _safe_json(resp)}
 
-    async def delete_user(self, user_id: str) -> dict[str, Any]:
-        resp = await self._send("DELETE", f"/v1/enroll/{user_id}", b"", 10.0, content_type=None)
+    async def delete_user(self, user_id: str, *, actor: str) -> dict[str, Any]:
+        """DELETE /v1/enroll/{user_id}?actor=... : the actor (always sent, RBAC v2 D) travels in the query string,
+        which is part of the signed PATH (EAE-04)."""
+        if not actor:
+            raise ValueError("actor is required for a cloud erasure")
+        path = (f"/v1/enroll/{quote(user_id, safe='')}?actor={quote(actor, safe='')}"
+                f"&request_id={new_request_id()}")
+        resp = await self._send("DELETE", path, b"", 10.0, content_type=None)
         return {"status": resp.status_code, "body": _safe_json(resp)}
+
+    async def offline_enrolment_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        """SC2-D4: POST /v1/enroll/offline-record (metadata only, never images) so the cloud audits an enrolment
+        made while OFFLINE and flags offline ALLOWs whose template it never indexed."""
+        resp = await self._post("/v1/enroll/offline-record", {**record, "request_id": new_request_id()}, 8.0)
+        return {"status": resp.status_code, "body": _safe_json(resp)}
+
+    def admin_credential_headers(self) -> dict[str, str]:
+        """RBAC v2 D outbound credential: CLOUD_EDGE_PROXY_KEY -> Authorization: Bearer; else the legacy
+        CLOUD_ADMIN_TOKEN -> X-Admin-Token. Never ADMIN_TOKEN (the inbound edge secret). {} = none configured."""
+        if self.settings.cloud_edge_proxy_key:
+            return {"Authorization": f"Bearer {self.settings.cloud_edge_proxy_key}"}
+        if self.settings.cloud_admin_token:
+            return {"X-Admin-Token": self.settings.cloud_admin_token}
+        return {}
 
     async def admin(self, method: str, path: str, json_body: dict[str, Any] | None = None,
                     timeout_s: float = 8.0) -> Any:
-        """Cloud admin route (API.md 4.9): kiosk HMAC + X-Admin-Token (CLOUD_ADMIN_TOKEN, else ADMIN_TOKEN).
+        """Cloud admin route (API.md 4.9): kiosk HMAC + the outbound admin credential (admin_credential_headers).
         Returns the parsed 2xx body. Raises CloudUnavailable (transport / 401 / 5xx / unreadable body) or
-        CloudRejected (any other 4xx, with the cloud's error code + message). Bodies are never logged: the
+        CloudRejected (any other 4xx, with the cloud's error code + reason). Bodies are never logged: the
         code-rotation response carries one-time plaintext codes."""
-        token = self.settings.cloud_admin_token
-        if not token:
-            raise CloudUnavailable("no admin token configured for the cloud (CLOUD_ADMIN_TOKEN / ADMIN_TOKEN)")
+        cred = self.admin_credential_headers()
+        if not cred:
+            raise CloudUnavailable("no cloud admin credential configured (CLOUD_EDGE_PROXY_KEY / CLOUD_ADMIN_TOKEN)")
+        if json_body is not None and method.upper() in ("POST", "PUT"):
+            json_body = {**json_body, "request_id": new_request_id()}
         body = b"" if json_body is None else json.dumps(json_body, separators=(",", ":")).encode("utf-8")
         t = time.perf_counter()
         resp = await self._send(method, path, body, timeout_s, content_type="application/json" if body else None,
-                                extra_headers={"X-Admin-Token": token})
+                                extra_headers=cred)
         log.info(json.dumps({"event": "cloud_admin", "method": method, "path": path.split("?")[0],
                              "status": resp.status_code,
                              "latency_ms": round((time.perf_counter() - t) * 1000.0, 1)}))

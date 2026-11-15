@@ -63,10 +63,8 @@ export function ScanningOverlay({
               : 'No-flash check selected: the screen will not change colour.'}
           </p>
           <p className="rounded-lg bg-black/60 px-3 py-1 text-[clamp(11px,1.5vh,16px)] text-amber-200/90">
-            Operator: screen brightness to maximum{fullscreen ? '' : ' · tap the screen once for fullscreen'} ·{' '}
-            <a href={`/admin${window.location.search}`} target="_blank" rel="noreferrer" className="underline decoration-amber-200/50 hover:text-white">
-              control panel (A)
-            </a>
+            {/* KA-01 / KF-04: no link or shortcut to a privileged console on the public route */}
+            Operator: screen brightness to maximum{fullscreen ? '' : ' · tap the screen once for fullscreen'}
           </p>
         </div>
         <button

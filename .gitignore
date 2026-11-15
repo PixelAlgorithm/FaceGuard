@@ -1,5 +1,11 @@
-# secrets & env
+# secrets & env (templates stay tracked)
 .env
+.env.*
+!.env.example
+!.env.mock
+staff.fernet
+staff.lock
+audit.jsonl*
 *.pem
 *.key
 # models & data (biometric data never committed)
@@ -19,5 +25,9 @@ dist/
 .vite/
 # os
 .DS_Store
+# local agent tooling state (never part of the project)
+.claude-flow/
+.ruv-swarm/
+.swarm/
 # live deploy state (may hold keys/IDs)
 cloud/infra/.state/

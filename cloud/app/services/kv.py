@@ -8,7 +8,8 @@ Every backend implements the same primitives so idempotency (put_if_absent) and 
     put_if_absent(ns, key, item, ttl)  -> bool            (False if a live item exists)
     cas(ns, key, item, expected_rev)   -> bool            (expected_rev None == must not exist)
     delete(ns, key)
-    list(ns, prefix="")                -> [(key, item)]   (ascending key order)
+    list(ns, prefix="", start="")      -> [(key, item)]   (ascending key order; prefix match is case-sensitive,
+                                                           start = inclusive lower key bound, a key-range query)
 
 `ttl` is an absolute epoch-seconds expiry (DynamoDB TTL attribute `ttl`). Items carry `_rev`.
 DynamoDB layout: three tables with the same key schema (pk HASH = namespace, sk RANGE = key):
@@ -28,10 +29,23 @@ from pathlib import Path
 from typing import Any, Protocol
 
 RESERVED = ("pk", "sk", "_rev", "ttl")
+_PUT_RETRIES = 8
 
 
 class KVError(RuntimeError):
     pass
+
+
+class StoreUnavailable(RuntimeError):
+    """The store could not answer and no last-good value exists: callers answer 503, never guess."""
+
+
+def _prefix_upper(prefix: str) -> str | None:
+    """Smallest string greater than every string starting with `prefix` (None = no upper bound)."""
+    for i in range(len(prefix) - 1, -1, -1):
+        if ord(prefix[i]) < 0x10FFFF:
+            return prefix[:i] + chr(ord(prefix[i]) + 1)
+    return None
 
 
 class KV(Protocol):
@@ -42,7 +56,7 @@ class KV(Protocol):
     def put_if_absent(self, ns: str, key: str, item: dict, ttl: int | None = None) -> bool: ...
     def cas(self, ns: str, key: str, item: dict, expected_rev: int | None, ttl: int | None = None) -> bool: ...
     def delete(self, ns: str, key: str) -> None: ...
-    def list(self, ns: str, prefix: str = "") -> list[tuple[str, dict]]: ...
+    def list(self, ns: str, prefix: str = "", start: str = "") -> list[tuple[str, dict]]: ...
     def ping(self) -> None: ...
 
 
@@ -103,11 +117,11 @@ class MemoryKV:
         with self._lock:
             self._d.pop((ns, key), None)
 
-    def list(self, ns: str, prefix: str = "") -> list[tuple[str, dict]]:
+    def list(self, ns: str, prefix: str = "", start: str = "") -> list[tuple[str, dict]]:
         with self._lock:
             out = []
             for (n, k), (item, rev, ttl) in self._d.items():
-                if n == ns and k.startswith(prefix) and _alive(ttl, self._now()):
+                if n == ns and k.startswith(prefix) and k >= start and _alive(ttl, self._now()):
                     it = copy.deepcopy(item)
                     it["_rev"] = rev
                     out.append((k, it))
@@ -207,13 +221,18 @@ class SqliteKV:
         with self._lock:
             self._conn.execute("DELETE FROM kv WHERE ns=? AND key=?", (ns, key))
 
-    def list(self, ns: str, prefix: str = "") -> list[tuple[str, dict]]:
-        esc = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    def list(self, ns: str, prefix: str = "", start: str = "") -> list[tuple[str, dict]]:
+        # Key-range query (case-sensitive, uses the primary key): LIKE is case-insensitive for ASCII in SQLite,
+        # so prefix "u_A" also returned "u_a..." rows.
+        lower = max(prefix, start)
+        upper = _prefix_upper(prefix) if prefix else None
+        sql = "SELECT key, item, rev, ttl FROM kv WHERE ns=? AND key >= ?"
+        args: list[Any] = [ns, lower]
+        if upper is not None:
+            sql += " AND key < ?"
+            args.append(upper)
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT key, item, rev, ttl FROM kv WHERE ns=? AND key LIKE ? ESCAPE '\\' ORDER BY key",
-                (ns, esc + "%"),
-            ).fetchall()
+            rows = self._conn.execute(sql + " ORDER BY key", args).fetchall()
         out = []
         for k, data, rev, ttl in rows:
             if _alive(ttl, self._now()):
@@ -290,9 +309,13 @@ class DynamoKV:
         return self._unmarshal(raw)
 
     def put(self, ns: str, key: str, item: dict, ttl: int | None = None) -> None:
-        cur = self.get(ns, key)
-        rev = (cur["_rev"] if cur else 0) + 1
-        self._c.put_item(TableName=self._table(ns), Item=self._marshal(ns, key, item, rev, ttl))
+        """Unconditional upsert with a monotonic `_rev`: read-then-conditional-write, retried, so two concurrent
+        puts can never both write the same rev (a later CAS on that rev would then clobber one of them)."""
+        for _ in range(_PUT_RETRIES):
+            cur = self.get(ns, key)
+            if self.cas(ns, key, item, cur["_rev"] if cur else None, ttl):
+                return
+        raise KVError(f"put {ns}/{key}: contention")
 
     def put_if_absent(self, ns: str, key: str, item: dict, ttl: int | None = None) -> bool:
         return self.cas(ns, key, item, None, ttl)
@@ -307,9 +330,10 @@ class DynamoKV:
             values = {":now": {"N": str(now)}}
             rev = 1
         else:
-            cond = "#rev = :rev"
-            names = {"#rev": "_rev"}
-            values = {":rev": {"N": str(expected_rev)}}
+            # an expired (TTL-passed, not yet reaped) item is invisible to get(): it must not satisfy a CAS either
+            cond = "#rev = :rev AND (attribute_not_exists(#ttl) OR #ttl > :now)"
+            names = {"#rev": "_rev", "#ttl": "ttl"}
+            values = {":rev": {"N": str(expected_rev)}, ":now": {"N": str(now)}}
             rev = expected_rev + 1
         try:
             self._c.put_item(
@@ -328,19 +352,30 @@ class DynamoKV:
     def delete(self, ns: str, key: str) -> None:
         self._c.delete_item(TableName=self._table(ns), Key={"pk": {"S": ns}, "sk": {"S": key}})
 
-    def list(self, ns: str, prefix: str = "") -> list[tuple[str, dict]]:
-        kwargs: dict[str, Any] = {
-            "TableName": self._table(ns),
-            "KeyConditionExpression": "pk = :ns" + (" AND begins_with(sk, :p)" if prefix else ""),
-            "ExpressionAttributeValues": {":ns": {"S": ns}, **({":p": {"S": prefix}} if prefix else {})},
-            "ConsistentRead": True,
-        }
+    def list(self, ns: str, prefix: str = "", start: str = "") -> list[tuple[str, dict]]:
+        values: dict[str, Any] = {":ns": {"S": ns}}
+        cond = "pk = :ns"
+        if start and start > prefix:  # key range: start .. end of the prefix
+            values[":s"] = {"S": start}
+            upper = _prefix_upper(prefix) if prefix else None
+            if upper is not None:
+                cond += " AND sk BETWEEN :s AND :e"
+                values[":e"] = {"S": upper}
+            else:
+                cond += " AND sk >= :s"
+        elif prefix:
+            cond += " AND begins_with(sk, :p)"
+            values[":p"] = {"S": prefix}
+        kwargs: dict[str, Any] = {"TableName": self._table(ns), "KeyConditionExpression": cond,
+                                  "ExpressionAttributeValues": values, "ConsistentRead": True}
         out: list[tuple[str, dict]] = []
         while True:
             r = self._c.query(**kwargs)
             for raw in r.get("Items", []):
                 ttl = raw.get("ttl", {}).get("N")
                 if ttl is not None and not _alive(int(ttl), self._now()):
+                    continue
+                if prefix and not raw["sk"]["S"].startswith(prefix):  # BETWEEN includes the upper bound itself
                     continue
                 out.append((raw["sk"]["S"], self._unmarshal(raw)))
             if "LastEvaluatedKey" not in r:

@@ -12,12 +12,12 @@ from edge.policy.tests.test_cases import CASES
 
 HERE = Path(__file__).parent
 DECISION_POLICY = HERE.parents[2] / "docs" / "DECISION_POLICY.md"
-# DECISION_POLICY.md §9 row IDs exactly as the doc writes them (56 rows; I1/I2 split into a = no LVB, b = LVB present
-# but untrusted; R11 = EMAIL_OTP cloud-verify timeout). test_matrix_rows_match_the_doc keeps this list in sync.
+# DECISION_POLICY.md §9 row IDs exactly as the doc writes them (58 rows; I1/I2 split into a = no LVB, b = LVB present
+# but untrusted; R11 = EMAIL_OTP cloud-verify timeout; I4 = rollback + held revocation (F04); R12 = locked method). test_matrix_rows_match_the_doc keeps this list in sync.
 MATRIX_ROWS = (
     [f"MO{i}" for i in range(1, 5)] + [f"A{i}" for i in range(1, 7)] + [f"N{i}" for i in range(1, 16)]
-    + [f"F{i}" for i in range(1, 11)] + [f"E{i}" for i in range(1, 6)] + ["I1a", "I1b", "I2a", "I2b", "I3"]
-    + [f"R{i}" for i in range(1, 12)]
+    + [f"F{i}" for i in range(1, 11)] + [f"E{i}" for i in range(1, 6)] + ["I1a", "I1b", "I2a", "I2b", "I3", "I4"]
+    + [f"R{i}" for i in range(1, 13)]
 )
 _ROW = r"(MO\d|A\d|N\d{1,2}|F\d{1,2}|E\d|I\d[ab]?|R\d{1,2})"
 _PATTERNS = {
@@ -51,7 +51,7 @@ def doc_matrix_rows() -> list[str]:
 
 def test_matrix_rows_match_the_doc():
     doc = doc_matrix_rows()
-    assert len(doc) == len(set(doc)) == 56, doc
+    assert len(doc) == len(set(doc)) == 58, doc
     assert sorted(MATRIX_ROWS) == sorted(doc)
 
 
@@ -69,6 +69,7 @@ def test_no_test_cites_a_row_id_that_is_not_in_the_matrix():
 TAGS["A1"] = "test_cases.py::test_Q10_rate_limited_retry_after"
 TAGS["A5"] = "test_cases.py::test_Q11_pad_model_exception_is_system_error"
 TAGS["MO4"] = "test_MO4_connectivity_offline_or_failed_cloud_call"
+TAGS["I4"] = "test_pf_schedule.py::test_F04_clock_rollback_still_denies_a_revoked_candidate"
 
 
 @pytest.mark.parametrize("scn", [lambda: OB(), lambda: B().set(cloud={"ok": False}), lambda: B().set(cloud=None)])

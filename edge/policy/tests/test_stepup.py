@@ -398,7 +398,10 @@ def test_O29_staff_override_lockout_without_hash_check(monkeypatch):
     hashed = calls["n"]
     d = f2.fallback(method="STAFF_OVERRIDE", code="48213907", after_s=8)  # correct code, but locked
     ROWS_COVERED.add("R9")
-    assert d.decision == "DENY" and calls["n"] == hashed  # rejected without a hash check
+    ROWS_COVERED.add("R12")
+    # rejected without a hash check; KF-03: a locked method is not a factor failure -> FALLBACK_LOCKED + wait
+    assert d.decision == "STEP_UP" and calls["n"] == hashed and "FALLBACK_LOCKED" in d.reason_codes
+    assert d.next_action.retry_after_s == 299 and d.next_action.attempts_left == 0  # unchanged
     # lock started at 10:00:07 -> ends 10:05:07; a fresh attempt at 10:05:10 is accepted again
     f3 = Flow(OB().who("u_7a8b", "SRV", "2026-11-14T10:05:10").set(attempt_id="att_TEST0003"), state=state)
     assert f3.fallback(method="STAFF_OVERRIDE", code="48213907").decision == "ALLOW"

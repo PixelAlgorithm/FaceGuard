@@ -57,15 +57,15 @@ export function KioskApp() {
     }
   }, [])
 
-  // Operator shortcuts: Esc = reset, F = fullscreen, A = control panel (new tab), T = take the capture lock back from /operator,
-  // 1-9/0 = mock scenario.
+  // Operator shortcuts: Esc = reset (refused while the edge is deciding), F = fullscreen, T = take the capture lock back
+  // from /operator, 1-9/0 = mock scenario (mock builds only). No shortcut opens a privileged console from the public
+  // route (audit KF-04): staff use /admin, /operator, /register in their own browser profile.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return
-      if (e.key === 'Escape') ctrl.reset()
+      if (e.key === 'Escape') ctrl.cancelByUser()
       else if (e.key === 't' || e.key === 'T') ctrl.takeOverCapture()
-      else if (e.key === 'a' || e.key === 'A') window.open(`/admin${window.location.search}`, '_blank', 'noopener')
       else if (e.key === 'f' || e.key === 'F') {
         if (document.fullscreenElement) void document.exitFullscreen()
         else void document.documentElement.requestFullscreen().catch(() => undefined)
@@ -139,7 +139,7 @@ export function KioskApp() {
           onSelect={ctrl.selectMethod}
           onSubmit={(req) => void ctrl.submitFallback(req)}
           onRequestOtp={() => void ctrl.requestOtp()}
-          onCancel={ctrl.reset}
+          onCancel={() => void ctrl.cancelByUser()}
           onActivity={ctrl.touch}
         />
       ) : null}
@@ -153,7 +153,8 @@ export function KioskApp() {
         <p className="absolute right-[2.2vh] bottom-[10vh] z-30 rounded bg-black/70 px-2 py-1 text-xs text-white/70">
           camera: {snap.camera.label || '(no label)'} · {snap.camera.deviceCount} device(s) · {snap.camera.delegate} ·
           controls: {snap.camera.controls}
-          {snap.camera.virtualMatch ? ` · virtual-camera pattern "${snap.camera.virtualMatch}"` : ''}
+          {/* KF-05: never name the matched virtual-camera pattern on the public screen (tells an attacker what to rename) */}
+          {snap.camera.virtualMatch ? ' · virtual camera suspected' : ''}
         </p>
       ) : null}
       {MOCK_ENABLED && (view.kind === 'scanning' || view.kind === 'boot') ? <MockPanel /> : null}

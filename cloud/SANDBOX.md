@@ -1,6 +1,6 @@
 # cloud/SANDBOX.md — AWS sandbox: what we need, what may be blocked, how we degrade
 
-Owner: `cloud-aws`. Last update: 2026-11-15 ~06:20 UTC / 11:50 IST (code + docs only, no AWS calls; L2 strict booleans + R-H trims, READMIT reason guard, README route list). The §13b blue-green redeploy ran (cutover 2026-11-14T17:18:00Z per `cloud/infra/.state/deploy.env`); the v1.4 admin-access code (§13d) is **NOT live** and needs a new blue-green redeploy, **PENDING operator approval**.
+Owner: `cloud-aws`; deploy tooling hardening by `cloud-infra` 2026-11-15 (§14: new flags, read it before any redeploy). Last update: 2026-11-15 ~06:20 UTC / 11:50 IST (code + docs only, no AWS calls; L2 strict booleans + R-H trims, READMIT reason guard, README route list). The §13b blue-green redeploy ran (cutover 2026-11-14T17:18:00Z per `cloud/infra/.state/deploy.env`); the v1.4 admin-access code (§13d) is **NOT live** and needs a new blue-green redeploy, **PENDING operator approval**.
 
 **Identity authority (one line, used everywhere below):** decisions are made on the edge (local-first); online,
 Rekognition is authoritative with a local cross-check (`edge/policy/identity.py`); offline or on cloud timeout the
@@ -11,14 +11,14 @@ local matcher decides under offline bars (P7).
 | Item | State |
 |---|---|
 | Sandbox | AWS Workshop Studio event **"HID Hackathon GenAI - University"**, account <ACCOUNT_ID>, role `WSParticipantRole/Participant` (AdministratorAccess attached), **us-east-1 only** for Rekognition (ap-south-1 Rekognition denied by SCP). **Production would run in ap-south-1 (Mumbai)** for data residency (DPDP optics) and ~20–40 ms RTT. |
-| Deployed (2026-11-14 ~10:00 UTC, operator-approved) | **`CLOUD_API_URL=https://8c1yi8fjgj.execute-api.us-east-1.amazonaws.com`** (API Gateway HTTP API `8c1yi8fjgj` → EC2 `i-0cde00aab5c12d5bf` t3.small AL2023, port 9000, instance profile `hid-kiosk-ec2-profile`). FACE_BACKEND=rekognition, STORE_BACKEND=dynamodb, EMAIL_BACKEND=ses, seed `config/schedule.demo.json` (bundle v42, `u_prj1` entitled, demo card hashes recomputed with CARD_ID_PEPPER). Secrets: SSM SecureString `/hid-kiosk/app-env` (aws/ssm), not in user-data (verified). |
+| Deployed (2026-11-14 ~10:00 UTC, operator-approved) | **`CLOUD_API_URL=https://<api-id>.execute-api.us-east-1.amazonaws.com`** (API Gateway HTTP API `<api-id>` → EC2 `<instance-id>` t3.small AL2023, port 9000, instance profile `hid-kiosk-ec2-profile`). FACE_BACKEND=rekognition, STORE_BACKEND=dynamodb, EMAIL_BACKEND=ses, seed `config/schedule.demo.json` (bundle v42, `u_prj1` entitled, demo card hashes recomputed with CARD_ID_PEPPER). Secrets: SSM SecureString `/hid-kiosk/app-env` (aws/ssm), not in user-data (verified). |
 | Data plane | Rekognition collection `hid-kiosk-users`: **10 faces, 2 users** (read-only check 2026-11-14 15:50 UTC: `u_prj1` ACTIVE 5 faces, `u_tm03` ACTIVE 5 faces, no orphan faces, face model 7.0); DynamoDB `hid_users`, `hid_decisions`, `hid_state` (on-demand, SSE aws/dynamodb, TTL `ttl` ENABLED); S3 `hid-kiosk-<ACCOUNT_ID>-us-east-1` (SSE-KMS aws/s3 + bucket key, public access blocked, TLS-only policy, **lifecycle 1 day on every prefix**); CloudWatch dashboard `hid-kiosk` + alarm `hid-kiosk-post-hoc-revoked`. No CMK. |
-| SES | identity `studies.prajwalm@gmail.com` requested (sandbox: 200/day, 1/s); OTP only after the operator clicks the AWS verification mail. |
+| SES | identity `<verified-address>` requested (sandbox: 200/day, 1/s); OTP only after the operator clicks the AWS verification mail. |
 | Rekognition | Consenting team faces only (operator decision), indexed by edge enrolments made while ONLINE: `u_prj1`, `u_tm03`. **Edge user `u_tm02` is missing from Rekognition** (enrolled on the edge only): online, with `match.rekognition.enabled: true`, it gets no cloud match -> `NOT_ENROLLED` -> DENY (API.md §3.15). Fix = a consented re-enrolment of `u_tm02` while the edge is ONLINE, with the e-mail field filled (the LIVE build requires `email`; blank -> cloud 422, `cloud_indexed: false`; after the redeploy `email` is optional and the face is indexed without it). Decisions are made on the edge (local-first); online, Rekognition is authoritative with a local cross-check (`edge/policy/identity.py`); offline or on cloud timeout the local matcher decides under offline bars (P7). |
 | Live state (read-only check 2026-11-14 16:24 UTC) | `GET /v1/health` -> `status ok, rekognition ok, dynamodb ok, face_backend rekognition, email_backend ses`, uptime 23100 s (still the ~09:55 UTC build). Live edge `GET /v1/mode` -> `ONLINE`, bundle **v45** FRESH (cloud-issued, issued 12:30:41Z, expires 2026-11-15T00:30:41Z), `revocation_seq 7`, sync queue 0, `cloud_match.degraded: true` (recent cloud matches missed the edge time-box; each such attempt is decided OFFLINE by the local matcher under offline bars, P7; miss count not stored, so not quoted). Creds: `sts get-caller-identity` OK (WSParticipantRole/Participant). |
-| Redeploys | **Round 5 (§13b) ran**: `cloud/infra/.state/deploy.env` records `CUTOVER_AT=2026-11-14T17:18:00Z`, instance `i-01b6e4e075101b819`, same API `8c1yi8fjgj`; artifact `cloud/infra/build/hid-cloud.tgz` built 2026-11-14 17:16 UTC (append-mode enrolment, optional `email`, override-code hygiene, `PUT /v1/admin/schedule/{kiosk_id}`, synthetic tagging). Not re-checked against AWS this round (no AWS calls). **v1.4 admin-access (§13d) - PENDING operator approval, NOT live**: the live build predates `GET /v1/admin/users`, `PUT /v1/admin/users/{user_id}/access` (create / re-admit R-B / restore R-C, `consent`, `restore`), `POST /v1/admin/codes/rotate`, `GET /v1/admin/audit`, `error.reason`, `409 ALREADY_REVOKED`, the ERASE / READMIT feed types and the v1.4 field limits, so the edge reports `503 CLOUD_UNAVAILABLE` reason `ENDPOINT_NOT_DEPLOYED` for those writes until the redeploy. Green in code: `pytest cloud/tests` 259 passed (2026-11-15 ~06:20 UTC, after the L2 / L4 fixes; incl. `test_contract_admin_access.py` against `docs/contracts/admin_access.examples.json`), ruff check clean; scratch run on 127.0.0.1:9094 (fake backends, dummy keys): `cloud.tools.smoke` PASS. |
+| Redeploys | **Round 5 (§13b) ran**: `cloud/infra/.state/deploy.env` records `CUTOVER_AT=2026-11-14T17:18:00Z`, instance `<instance-id>`, same API `<api-id>`; artifact `cloud/infra/build/hid-cloud.tgz` built 2026-11-14 17:16 UTC (append-mode enrolment, optional `email`, override-code hygiene, `PUT /v1/admin/schedule/{kiosk_id}`, synthetic tagging). Not re-checked against AWS this round (no AWS calls). **v1.4 admin-access (§13d) - PENDING operator approval, NOT live**: the live build predates `GET /v1/admin/users`, `PUT /v1/admin/users/{user_id}/access` (create / re-admit R-B / restore R-C, `consent`, `restore`), `POST /v1/admin/codes/rotate`, `GET /v1/admin/audit`, `error.reason`, `409 ALREADY_REVOKED`, the ERASE / READMIT feed types and the v1.4 field limits, so the edge reports `503 CLOUD_UNAVAILABLE` reason `ENDPOINT_NOT_DEPLOYED` for those writes until the redeploy. Green in code: `pytest cloud/tests` 259 passed (2026-11-15 ~06:20 UTC, after the L2 / L4 fixes; incl. `test_contract_admin_access.py` against `docs/contracts/admin_access.examples.json`), ruff check clean; scratch run on 127.0.0.1:9094 (fake backends, dummy keys): `cloud.tools.smoke` PASS. |
 | S3 audit frames | **Not implemented.** The cloud never uploads decision / audit frames to S3; the bucket holds only deploy artifacts (and, if `ENROLL_STORE_REFERENCE=true`, which is off, an enrolment reference image). The 1-day lifecycle on every prefix (incl. `audit/`) is in place for when it is built. |
-| Teardown | `AWS_PROFILE=hid-sandbox bash cloud/infra/teardown.sh --apply` (deletes API, instance, SG, IAM role/profile, tables, bucket, collection, SSM parameter, dashboard/alarm, SES identity). |
+| Teardown | `AWS_PROFILE=hid-sandbox bash cloud/infra/teardown.sh --apply --confirm hid-kiosk` (deletes API, instance, SG, IAM role/profile, tables, bucket, collection, SSM parameter, dashboard/alarm, SES identity). |
 
 ## 1. How to run the probe (once the lead confirms credentials are live)
 
@@ -84,7 +84,7 @@ Re-check 2026-11-14 16:24 UTC: `sts get-caller-identity` still valid (same role)
 | S3 list-buckets / head-bucket | ALLOWED | 0 buckets |
 | KMS list-keys / aliases / aws/s3 | ALLOWED | aws/s3, aws/dynamodb, aws/ssm managed keys Enabled |
 | SES get-account / quota / identities | ALLOWED | **sandbox** (production_access=false), 200 msgs/24 h, 1 msg/s, no identities yet |
-| EC2 describe-* / offerings / AMI | ALLOWED | default VPC vpc-0eed6adbb9d83b01c, 6 default subnets; t3.micro/small/medium, t3a.small, c6i/c7i/m6i.large offered; AL2023 ami-096ef200a877f36af |
+| EC2 describe-* / offerings / AMI | ALLOWED | default VPC <default-vpc>, 6 default subnets; t3.micro/small/medium, t3a.small, c6i/c7i/m6i.large offered; AL2023 ami-096ef200a877f36af |
 | SSM describe-parameters / instance information | ALLOWED | 0 parameters |
 | Lambda / API Gateway | ALLOWED | account concurrency 400 (110 unreserved) - provisioned concurrency possible; 0 HTTP APIs |
 | CloudWatch / Logs | ALLOWED | no dashboards, no HIDKiosk metrics |
@@ -210,13 +210,13 @@ Order, what each creates, and approximate us-east-1 cost (sandbox-funded):
 | 1 | `cloud/infra/data_plane.sh --apply` | Rekognition collection `hid-kiosk-users`; DynamoDB `hid_users`, `hid_decisions`, `hid_state` (on-demand, TTL `ttl`, SSE aws/dynamodb); S3 `hid-kiosk-<acct>-us-east-1` (SSE-KMS aws/s3 + bucket key, public access blocked, TLS-only, lifecycle 1 d on every prefix); dashboard `hid-kiosk`; alarm `hid-kiosk-post-hoc-revoked` | < $0.10/day | immediate |
 | 2 | `cloud/infra/ses_setup.sh --apply --sender <a> --recipient <b>` (optional) | SES e-mail identities (verification mails) | $0 | immediate |
 | 3 | `cloud/infra/deploy_ec2.sh --apply` | IAM role `hid-kiosk-ec2-role` + inline least-privilege policy + instance profile; SG `hid-kiosk-api-sg` (tcp 9000); 1× t3.small AL2023 (IMDSv2, 8 GB gp3); API Gateway HTTP API `hid-kiosk-api` | ≈ $0.027/h (~$0.27 per 10 h) | immediate |
-| 4 | `cloud/.venv/bin/python -m cloud.tools.smoke --base <url> --user u_smoke_<name> --images <dir> --probe <jpg> --cleanup` | 1 enrolled test user (consenting member), deleted at the end | ~$0.01 | `--cleanup` |
-| 5 | `cloud/infra/teardown.sh --apply` | deletes all of the above (incl. the face collection) | $0 | — |
+| 4 | `cloud/.venv/bin/python -m cloud.tools.smoke --live --base <url> --user u_smoke_<name> --images <dir> --probe <jpg> --cleanup` | 1 enrolled test user (consenting member), deleted at the end | ~$0.01 | `--cleanup` |
+| 5 | `cloud/infra/teardown.sh --apply --confirm hid-kiosk` | deletes all of the above (incl. the face collection) | $0 | — |
 | (opt) | `cloud/infra/data_plane.sh --apply --with-cmk` | customer-managed KMS key | ~$1/month prorated | **hard: AWS enforces ≥ 7-day deletion wait** — not recommended |
 | (alt) | `cloud/infra/deploy_lambda.sh --apply [--pc 1]` | Lambda + role + HTTP API (only if EC2 is denied) | ≈ $0 (+$0.0075/h with PC) | immediate |
 
 If the probe shows IAM role creation denied: step 3 becomes `deploy_ec2.sh --apply --instance-profile <pre-provisioned>`
-(option A) or `--no-role` (option B), or skip AWS hosting and run the API on a laptop with the `hid-sandbox`
+(option A; `--no-role` was removed, see §14), or skip AWS hosting and run the API on a laptop with the `hid-sandbox`
 profile (option C) — see §5.
 
 ## 11. Lead decisions applied (rounds 1-2)
@@ -243,11 +243,11 @@ timeout the local matcher decides under offline bars (P7). ap-south-1 would remo
 
 To get a quotable number, re-run and **store** the output (eval/ owner keeps the file; nearest-rank p95; this sends a
 non-face JPEG only):
-`cloud/.venv/bin/python -m cloud.tools.latency --base https://8c1yi8fjgj.execute-api.us-east-1.amazonaws.com --n 20 --image cloud/tools/fixtures/noface_gradient_noise.jpg | tee eval/results/cloud_latency_$(date -u +%Y%m%dT%H%MZ).txt`
+`cloud/.venv/bin/python -m cloud.tools.latency --live --base https://<api-id>.execute-api.us-east-1.amazonaws.com --n 20 --image cloud/tools/fixtures/noface_gradient_noise.jpg | tee eval/results/cloud_latency_$(date -u +%Y%m%dT%H%MZ).txt`
 Not run yet: it is step 6 of §13b (after the redeploy, which is PENDING operator approval).
 
 ### 11b. Round 3 (deployment, operator-approved) — applied
-- Deployed exactly the approved list: data plane (no CMK), SES identity `studies.prajwalm@gmail.com`, EC2 t3.small +
+- Deployed exactly the approved list: data plane (no CMK), SES identity `<verified-address>`, EC2 t3.small +
   IAM role/instance profile + SG + API Gateway HTTP API, plus the sanctioned SSM SecureString `/hid-kiosk/app-env`.
 - S3 lifecycle tightened to **1 day on every prefix** (D10), verified with `get-bucket-lifecycle-configuration`.
 - Cloud seeds `config/schedule.demo.json` (u_prj1 entitled); placeholder demo card hashes are recomputed at seed time
@@ -290,23 +290,23 @@ from the same role/profile/SG, API Gateway integration re-pointed, old instance 
 DynamoDB store is not empty, so the seed file is ignored and the live master (v45, revocations) is kept.
 
 ```bash
-cd /Users/prajwalm/Documents/hidhack/Project
-export AWS_PROFILE=hid-sandbox B=https://8c1yi8fjgj.execute-api.us-east-1.amazonaws.com
+cd <project root>
+export AWS_PROFILE=hid-sandbox B=https://<api-id>.execute-api.us-east-1.amazonaws.com
 aws sts get-caller-identity >/dev/null || echo "ExpiredToken -> bash tooling/aws_creds_from_clipboard.sh"
 # 1. blue-green: aborts WITHOUT touching the API if the new instance is unhealthy; rolls the API back on cutover failure
-bash cloud/infra/deploy_ec2.sh --apply --replace
+bash cloud/infra/deploy_ec2.sh --apply --replace --demo
 # 2. dashboard + alarm with the Synthetic="false" filter (no data-plane resources touched)
 bash cloud/infra/data_plane.sh --apply --skip-rekognition --skip-dynamodb --skip-s3
 # 3. backfill once (idempotent marker)
 cloud/.venv/bin/python -m cloud.tools.backfill_metrics --cutover "$(grep '^CUTOVER_AT=' cloud/infra/.state/deploy.env | cut -d= -f2)" --apply
 # 4. smoke WITHOUT faces: health, signed bundle + ETag/304, sync replay -> duplicates (items tagged synthetic)
-cloud/.venv/bin/python -m cloud.tools.smoke_noface --base "$B"
+cloud/.venv/bin/python -m cloud.tools.smoke_noface --live --base "$B"
 #    upload refusals only (stores nothing): tampered -> 403 FORBIDDEN, lower version -> 409 INVALID_STATE, ETag unchanged
-cloud/.venv/bin/python -m cloud.tools.smoke_upload --base "$B"
+cloud/.venv/bin/python -m cloud.tools.smoke_upload --live --base "$B"
 # 5. live edge still ONLINE (read-only)
 curl -sS http://127.0.0.1:8000/v1/mode | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["mode"], d["schedule_bundle"]["version"])'
 # 6. /v1/match latency, 20 x non-face JPEG; STORE the output (§12) - only stored numbers may be quoted
-cloud/.venv/bin/python -m cloud.tools.latency --base "$B" --n 20 --image cloud/tools/fixtures/noface_gradient_noise.jpg \
+cloud/.venv/bin/python -m cloud.tools.latency --live --base "$B" --n 20 --image cloud/tools/fixtures/noface_gradient_noise.jpg \
   | tee "eval/results/cloud_latency_$(date -u +%Y%m%dT%H%MZ).txt"
 ```
 
@@ -327,14 +327,15 @@ Codes are freshly generated (OVR-001..003 dropped); values go only to the mode-6
 `--codes-file` OUTSIDE `edge/data/` (the default `--out` is the live edge's `bundle.signed.json`).
 
 ```bash
-cd /Users/prajwalm/Documents/hidhack/Project && B=https://8c1yi8fjgj.execute-api.us-east-1.amazonaws.com
+cd <project root> && B=https://<api-id>.execute-api.us-east-1.amazonaws.com
 mkdir -p -m 700 ~/.hid
 # (a) source = the live authoritative master (keeps v43-v45 changes); keys read from .env, never printed
 cloud/.venv/bin/python -c "import json,sys; from cloud.tools.cloudclient import CloudClient as C; r,_=C(sys.argv[1],'KIOSK_MAIN_01').request('GET','/v1/admin/schedule',admin=True); r.raise_for_status(); json.dump(r.json()['doc'],open(sys.argv[2],'w'))" "$B" ~/.hid/master_live.json
 cloud/.venv/bin/python scripts/sign_bundle.py --src ~/.hid/master_live.json --version 46 \
   --out ~/.hid/bundle_v46.signed.json --codes-file ~/.hid/DEMO_CODES_v46.txt
-# (b) upload: kiosk HMAC request signature + X-Admin-Token from .env (curl line shows $CLOUD_API_KEY / $ADMIN_TOKEN only)
-cloud/.venv/bin/python -m cloud.tools.cloudcurl --base "$B" --admin PUT /v1/admin/schedule/KIOSK_MAIN_01 --data @"$HOME/.hid/bundle_v46.signed.json"
+# (b) upload: kiosk HMAC request signature + Authorization: Bearer $FG_CLOUD_ADMIN_KEY (curl line shows placeholders only;
+#     the legacy X-Admin-Token is sent only with FG_ALLOW_LEGACY_ADMIN_TOKEN=1, see §14)
+cloud/.venv/bin/python -m cloud.tools.cloudcurl --live --base "$B" --admin PUT /v1/admin/schedule/KIOSK_MAIN_01 --data @"$HOME/.hid/bundle_v46.signed.json"
 #     expect HTTP 200 {"bundle_version":46,"etag":"\"46\"","served":"verbatim"|"cloud_resigned",...}
 #     403 = signature/scope, 409 = version not > stored (message says which --version), 422 = expired/documented codes
 # (c) the edge installs it on its next 15-min refresh; check read-only:
@@ -363,29 +364,29 @@ must not run it). Code: `cloud/app/routers/admin.py`, `services/schedule_service
   (leftover report: v48 with 0 codes) until someone rotates them (step 6; the plaintext is shown once).
 
 ```bash
-cd /Users/prajwalm/Documents/hidhack/Project
-export AWS_PROFILE=hid-sandbox B=https://8c1yi8fjgj.execute-api.us-east-1.amazonaws.com
+cd <project root>
+export AWS_PROFILE=hid-sandbox B=https://<api-id>.execute-api.us-east-1.amazonaws.com
 aws sts get-caller-identity >/dev/null || echo "ExpiredToken -> bash tooling/aws_creds_from_clipboard.sh"
 cloud/.venv/bin/python -m pytest cloud/tests -q            # must be green before shipping
 # 1. blue-green, same backends as the last deploy (defaults: rekognition / dynamodb / ses, seed ignored on a non-empty
 #    store). Do NOT pass --skip-build: build/hid-cloud.tgz (2026-11-14 17:16 UTC) predates the v1.4 code.
-bash cloud/infra/deploy_ec2.sh --apply --replace
+bash cloud/infra/deploy_ec2.sh --apply --replace --demo
 # 2. health + the new route answers (read-only)
 curl -sS "$B/v1/health"; echo
-cloud/.venv/bin/python -m cloud.tools.cloudcurl --base "$B" --kiosk KIOSK_MAIN_01 --admin GET /v1/admin/users \
+cloud/.venv/bin/python -m cloud.tools.cloudcurl --live --base "$B" --kiosk KIOSK_MAIN_01 --admin GET /v1/admin/users \
   | tail -n +3 | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["bundle_version"], d["staff_ids"], {u["user_id"]: (u["role"], u["status"]) for u in d["users"]})'
 #    expect every row to carry "status"; u_prj1 shows ERASED (or is absent if a legacy erase popped it with no revocation)
 # 3. smoke without faces (health, bundle ETag/304, sync replay -> duplicates) + upload refusals
-cloud/.venv/bin/python -m cloud.tools.smoke_noface --base "$B"
-cloud/.venv/bin/python -m cloud.tools.smoke_upload --base "$B"
+cloud/.venv/bin/python -m cloud.tools.smoke_noface --live --base "$B"
+cloud/.venv/bin/python -m cloud.tools.smoke_upload --live --base "$B"
 # 4. re-add u_prj1 "Prajwal M." (ROLE = the operator's choice; default student). One call: creates the entry if a legacy
 #    erase removed it, and lifts the ERASED suspension (consent: true) -> feed READMIT reason READMIT
 ROLE=student
-cloud/.venv/bin/python -m cloud.tools.cloudcurl --base "$B" --kiosk KIOSK_MAIN_01 --admin \
+cloud/.venv/bin/python -m cloud.tools.cloudcurl --live --base "$B" --kiosk KIOSK_MAIN_01 --admin \
   PUT /v1/admin/users/u_prj1/access --data "{\"display\":\"Prajwal M.\",\"role\":\"$ROLE\",\"consent\":true,\"actor\":\"lead\"}"
 #    expect 200 {"created": true|false, "readmitted": true (if he was ERASED), "user": {"status": "ACTIVE", ...}}
 #    409 USER_REVOKED -> he also holds an ADMIN revocation: repeat with "restore":true if the operator agrees
-cloud/.venv/bin/python -m cloud.tools.cloudcurl --base "$B" --kiosk KIOSK_MAIN_01 GET "/v1/revocations?since=0" | tail -n 12
+cloud/.venv/bin/python -m cloud.tools.cloudcurl --live --base "$B" --kiosk KIOSK_MAIN_01 GET "/v1/revocations?since=0" | tail -n 12
 #    expect the last u_prj1 item: {"type": "READMIT", "target_id": "u_prj1", "reason": "READMIT"}
 # 5. the live edge (lead restarts it with the v1.4 edge code first) installs the re-signed bundle now:
 curl -sS -X POST http://127.0.0.1:8000/v1/admin/bundle/refresh -H "X-Admin-Token: $(grep '^ADMIN_TOKEN=' .env | cut -d= -f2-)"; echo
@@ -394,8 +395,10 @@ curl -sS -X POST http://127.0.0.1:8000/v1/admin/bundle/refresh -H "X-Admin-Token
 #      -H "X-Admin-Token: $(grep '^ADMIN_TOKEN=' .env | cut -d= -f2-)" \
 #      --data "{\"display\":\"Prajwal M.\",\"role\":\"$ROLE\",\"consent\":true,\"actor\":\"lead\"}"
 # 6. staff override codes: rotate from the Control Panel (Staff codes -> s_guard01), plaintext shown ONCE; or here
-#    (prints the codes to this terminal only; replace_existing drops s_guard01's older codes):
-#    cloud/.venv/bin/python -m cloud.tools.cloudcurl --base "$B" --kiosk KIOSK_MAIN_01 --admin POST /v1/admin/codes/rotate \
+#    (the terminal shows the codes MASKED; --reveal-secrets writes them to a NEW 0600 file; replace_existing
+#    drops s_guard01's older codes):
+#    cloud/.venv/bin/python -m cloud.tools.cloudcurl --live --base "$B" --kiosk KIOSK_MAIN_01 --admin POST /v1/admin/codes/rotate \
+#      --reveal-secrets "$HOME/.hid/codes_$(date -u +%Y%m%dT%H%MZ).json" \
 #      --data '{"staff_id":"s_guard01","count":4,"actor":"lead"}'
 ```
 
@@ -403,3 +406,98 @@ After step 4 `u_prj1` is entitled again but has **no faces in Rekognition** if t
 re-enrols with consent while ONLINE via `/register` (the kiosk offers "Re-admit and enrol"), which indexes new faces.
 Rollback: `deploy_ec2.sh --replace` aborts without touching the API if the new instance is unhealthy and rolls the
 integration back if the cutover check fails; the data plane (DynamoDB master, Rekognition) is not changed by step 1.
+
+## 14. Deployment tooling hardening (cloud-infra, 2026-11-15) - read before the next redeploy
+
+Code only; nothing was run against AWS. Verified with a stub `aws`/`curl`/`openssl` harness:
+`cloud/.venv/bin/python -m pytest cloud/infra/tests` (no credentials, no network).
+
+**Stacks and state (CIT-01).** Every name derives from `HID_PREFIX` (+ `HID_REGION` for account-global IAM roles and
+the dashboard; stack id `<prefix>--<region>` outside us-east-1, and a prefix may not contain `--` or end in a
+region name, so stack ids never collide). The default stack (`hid-kiosk` in us-east-1) keeps its historical names (`hid_users`,
+`hid_decisions`, `hid_state`, collection `hid-kiosk-users`, tag `Project=hid-kiosk`, `.state/deploy.env`), so the live
+deployment is addressed exactly as before. Any other prefix gets `<prefix>_users|_decisions|_state`,
+`<prefix>-users`, `Project=<prefix>` and `.state/<stack>.env`. Shell variables named like state keys (BUCKET,
+KMS_KEY_ID, INSTANCE_ID, ...) are cleared before the state file is read, so only the stack's own state counts. The state file records account, prefix, region,
+collection and table names; a run with credentials for another account, or a `REKOGNITION_COLLECTION_ID_OVERRIDE` that
+contradicts the recorded collection, is refused. Unknown keys in a state file are ignored.
+
+**Teardown (CIT-06).** `teardown.sh --apply --confirm <stack-id>` (typed confirmation). Only NotFound-type errors mean
+"absent"; AccessDenied, throttling or network errors stop the run with a non-zero exit and the state kept. Tables are
+created with deletion protection (teardown disables it right before the delete; a CMK already pending deletion is skipped, so re-runs complete); `--backup` takes on-demand backups
+first (they retain data: delete them to complete a DPDP erasure). A final pass must find the collection, tables,
+bucket and tagged instances gone before the state file is removed. Only this stack's state file is deleted.
+
+**Deploy (CIT-02/05/07/08/10/11/16).**
+- A seed is mandatory: `--seed-schedule config/<file>.json` (refused if it holds placeholder demo card hashes or
+  demo-card users) or `--demo` (seeds `config/schedule.demo.json`; the documented demo card ids then work as CARD
+  credentials for the demo users). The live master is in DynamoDB, so a redeploy of the demo stack passes `--demo`
+  and the seed is ignored.
+- `--store sqlite` needs `--ephemeral-ok` (every replacement resets the master, the revocation feed and the ledger,
+  and edges with a higher cursor/bundle version stop receiving revocations). `fake`/`memory` backends are refused.
+- `--no-role` is removed: it put a presigned URL to the full app env into EC2 user-data. Use `--instance-profile NAME`
+  or laptop hosting (§5). Each run deletes leftover `deploy/*/app.env` objects from earlier `--no-role` deploys.
+- User-data carries no secret; the artifact's SHA-256 (recorded as `ARTIFACT_SHA256`) is checked on the instance
+  before extraction; the root volume is an encrypted gp3 volume; temp env files are removed on any exit.
+- Blue-green: every API Gateway call is checked, `get-integration` must return the new URI, and the new backend must
+  answer `/v1/health` through the API 3 times in a row before the old instance is terminated. When the app reports
+  `deploy_stamp` in `/v1/health` (value `HID_DEPLOY_STAMP` from the app env; cloud-app change requested) the answers
+  must carry the new stamp; until then the integration URI check is the guard and the script says so. On any failure
+  the old instance keeps serving, stays recorded as `INSTANCE_ID`, and the API is rolled back.
+  The new instance is recorded as `FAILED_INSTANCE_ID` for inspection/termination. An app env above 4 KB (many
+  KIOSK_KEYS_JSON / CLOUD_API_KEYS_JSON entries) is stored in the SSM Advanced tier (8 KB cap; larger -> refused).
+- Port 9000 exposure: the security group allows tcp/9000 only from `--cidr`; rules for any other CIDR on that port are
+  revoked on every run. Behind API Gateway the default is still `0.0.0.0/0` (an HTTP API has no fixed source
+  addresses) and the gateway -> instance hop is plain HTTP over the public network: request bodies (face crops,
+  enrolment frames, OTP codes, rotated override codes) and the API key / admin credential headers cross it in clear.
+  The `$default` stage is throttled (50 rps, burst 100). Production: private subnet + VPC link to an internal ALB/NLB
+  with TLS, WAF rate rules and access logs (not built). With `--no-apigw`, pass `--cidr <your egress>/32`.
+- Self-signed fallback (`--no-apigw --tls selfsigned`): the console is polled for the fingerprint; the pin
+  `.state/cloud-cert.pem` is written only on an exact match, otherwise the deploy fails. Certificates last 30 days.
+- Requirements are exported with hashes and vendored with `uv pip install --require-hashes`. The build ships an
+  explicit allowlist `edge/auth/{__init__,rbac,tokens}.py` and fails unless `import edge.auth.rbac, edge.auth.tokens,
+  cloud.app.main` works from the stage alone (`build_artifact.sh --stage-only` runs just this check).
+- `run` never prints AWS response bodies (Lambda responses contain every app secret); `HID_VERBOSE=1` prints them
+  through `cloud/infra/redact.py`. Lambda calls use `--query FunctionArn`. Rotate any secret that was deployed with
+  `deploy_lambda.sh --apply` before this change.
+
+**Alarms (CIT-09).** `data_plane.sh --apply --alarm-email <on-call address>` creates an SNS topic (unencrypted: CloudWatch
+cannot publish to an alias/aws/sns topic, and alarm payloads hold only alarm/metric names; with a stack CMK the topic
+uses the CMK and its key policy gets a cloudwatch.amazonaws.com grant; an existing alias/aws/sns topic is warned about),
+subscribes the address (its owner confirms the AWS e-mail) and sets it as AlarmActions/OKActions on four alarms:
+`ALERT_REVOKED_USER_ADMITTED` (`<prefix>-post-hoc-revoked`), `ALERT_LOG_TAMPER`, `ALERT_SYNC_CONFLICT`,
+`ALERT_SPOOF_BURST`. `--alarm-topic-arn ARN` reuses a topic. Without either, a warning says nobody is notified.
+
+**IAM (CIT-15).** `ses:SendEmail` is limited to `ses:FromAddress` = the configured sender; `kms:Encrypt/Decrypt/
+GenerateDataKey` is granted on the stack CMK only when `data_plane.sh --with-cmk` created one (then the tables, the
+bucket default encryption and the SSM app env use it, and `KMS_KEY_ID` reaches the app). Templates with an unresolved
+`${VAR}` fail to render.
+
+**App env (CIT-14, RBAC design v2).** `make_app_env.py` and `ensure_env.py` parse `.env` like the edge (first value
+wins, quotes, whitespace-led `# comments`, `export` prefix) and refuse duplicate keys or values the cloud loader would
+read differently. Shipped names: `CLOUD_API_KEYS_JSON` (validated), `AUTH_LEGACY_ADMIN_TOKEN`, `KIOSK_KEYS_JSON`,
+`ALLOW_SHARED_KIOSK_KEY`, `OTP_PEPPER` (required), `ADMIN_TOKEN` only with `AUTH_LEGACY_ADMIN_TOKEN=1`. Kiosk keys follow
+the cloud's rule: per-kiosk `KIOSK_KEYS_JSON`, or `ALLOW_SHARED_KIOSK_KEY=1` + `KIOSK_HMAC_KEY` (**the current live
+.env needs `ALLOW_SHARED_KIOSK_KEY=1` added**, else the deploy refuses). The rendered values are validated with the
+cloud's own `settings_from_env` and `cloud.app.rbac.parse_api_keys`, so a config the cloud would refuse never ships.
+Lambda: Variables over 4 KB are refused, and a new version must answer `GET /v1/health` (direct invoke) before alias
+`live` moves to it. Key names are capped at 64 chars (the cloud's limit). Printed output masks every secret value from
+.env (value-based, plus JSON/quoted/`String measured:` forms in AWS errors). The SSM tier is never downgraded. EC2 env lines are
+single-quoted (systemd keeps JSON verbatim). `ensure_env` forces mode 0600 on every run and writes atomically.
+
+**Operator tools (CIT-12/13).** smoke, smoke_noface, smoke_upload, latency and cloudcurl refuse a non-local `--base`
+(also one taken from `CLOUD_API_URL`) unless `--live` is passed. Admin calls send `Authorization: Bearer
+$FG_CLOUD_ADMIN_KEY`; the legacy `X-Admin-Token` only with `FG_ALLOW_LEGACY_ADMIN_TOKEN=1`. cloudcurl masks override
+codes, OTPs, outbox bodies, override-code hash/salt and bearer credentials; `--reveal-secrets PATH` writes the full response to a new 0600 file.
+
+**Before the next redeploy of the live stack:**
+```bash
+cloud/.venv/bin/python -m cloud.tools.apikey --name "operator" --roles admin --expires-days 7    # FG_CLOUD_ADMIN_KEY
+cloud/.venv/bin/python -m cloud.tools.apikey --name "edge main" --roles edge_proxy --kiosk-id KIOSK_MAIN_01  # CLOUD_EDGE_PROXY_KEY
+# append both printed entries to CLOUD_API_KEYS_JSON='[...]' in .env (or set AUTH_LEGACY_ADMIN_TOKEN=1 for one more round)
+# add ALLOW_SHARED_KIOSK_KEY=1 to .env (shared KIOSK_HMAC_KEY), or per-kiosk KIOSK_KEYS_JSON
+cloud/.venv/bin/python -m cloud.tools.ensure_env --check
+bash cloud/infra/data_plane.sh --apply --skip-rekognition --skip-s3 --alarm-email <on-call address>  # protection + alarms
+bash cloud/infra/deploy_ec2.sh --apply --replace --demo
+cloud/.venv/bin/python -m cloud.tools.smoke_noface --live --base "$B"
+```

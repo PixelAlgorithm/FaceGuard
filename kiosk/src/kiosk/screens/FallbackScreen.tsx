@@ -1,6 +1,7 @@
 /**
  * SECOND_FACTOR step: method picker limited to next_action.methods, then the method's entry screen.
- * TOTP 6-digit keypad · STAFF_OVERRIDE staff id + 8-digit code · CARD (simulated reader: card id)
+ * TOTP 6-digit keypad · STAFF_OVERRIDE staff id + one-time code (fallback.staff_override.code_length digits, 10;
+ * legacy 8-digit codes still accepted) · CARD (simulated reader: card id)
  * · EMAIL_OTP (POST otp/send, then code). Submits POST /v1/attempt/{id}/fallback.
  */
 import { useRef, useState, type FormEvent, type ReactNode } from 'react'
@@ -9,6 +10,7 @@ import { MOCK_ENABLED, THRESHOLDS } from '../../config'
 import { MOCK_CREDENTIALS } from '../../api/mockScenarios'
 import type { FallbackViewModel } from '../controller'
 import { MethodIcon, Spinner } from '../components/Icons'
+import { staffCodeAction } from '../fallbackState'
 import { primaryCode, reasonText, triesLeftText } from '../reasons'
 
 const METHOD_TEXT: Record<FallbackMethod, { title: string; sub: string }> = {
@@ -29,6 +31,7 @@ interface Props {
 
 function CodeEntry({
   length,
+  legacyLengths = [],
   label,
   mask,
   busy,
@@ -38,7 +41,10 @@ function CodeEntry({
   onSubmit,
   onActivity,
 }: {
+  /** the configured code length: the only length Verify / Enter submit */
   length: number
+  /** shorter legacy lengths (staff codes: 8) submitted only through the explicit legacy button (KA-05) */
+  legacyLengths?: number[]
   label: string
   mask: boolean
   busy: boolean
@@ -51,6 +57,8 @@ function CodeEntry({
   onActivity: () => void
 }) {
   const [code, setCode] = useState('')
+  const action = staffCodeAction(code, length, legacyLengths)
+  const complete = action === 'submit'
   const inputRef = useRef<HTMLInputElement>(null)
   const update = (next: string, refocus = false) => {
     setCode(next.replace(/\D/g, '').slice(0, length))
@@ -60,8 +68,8 @@ function CodeEntry({
   }
   const submit = (e?: FormEvent) => {
     e?.preventDefault()
-    if (code.length === length && extraValid && !busy) onSubmit(code)
-    else if (code.length !== length) inputRef.current?.focus({ preventScroll: true }) // e.g. Enter in Staff ID
+    if (complete && extraValid && !busy) onSubmit(code)
+    else if (!complete) inputRef.current?.focus({ preventScroll: true }) // e.g. Enter in Staff ID
   }
   const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'clear', '0', 'back']
   return (
@@ -120,12 +128,22 @@ function CodeEntry({
       </div>
       <button
         type="submit"
-        disabled={busy || code.length !== length || !extraValid}
+        disabled={busy || !complete || !extraValid}
         className="flex min-h-[7vh] min-w-[30vw] items-center justify-center gap-3 rounded-2xl bg-stepup px-10 text-[clamp(22px,3.8vh,44px)] font-black text-stepup-ink disabled:opacity-40"
       >
         {busy ? <Spinner className="h-[4vh] w-[4vh]" /> : null}
         Verify
       </button>
+      {action === 'legacy' ? (
+        <button
+          type="button"
+          disabled={busy || !extraValid}
+          onClick={() => onSubmit(code)}
+          className="min-h-[6vh] rounded-2xl bg-white/15 px-8 text-[clamp(16px,2.6vh,30px)] font-bold ring-1 ring-white/40 disabled:opacity-40"
+        >
+          Submit {code.length}-digit legacy code
+        </button>
+      ) : null}
     </form>
   )
 }
@@ -171,6 +189,7 @@ function MethodBody({ vm, onSubmit, onRequestOtp, onActivity }: Omit<Props, 'onS
       return (
         <CodeEntry
           length={f.staffCodeLength}
+          legacyLengths={f.staffCodeLegacyLengths.filter((n) => n < f.staffCodeLength)}
           label="Staff member: enter the one-time override code"
           mask
           busy={vm.busy}
@@ -239,7 +258,8 @@ function MethodBody({ vm, onSubmit, onRequestOtp, onActivity }: Omit<Props, 'onS
 
 export function FallbackScreen(props: Props) {
   const { vm, onSelect, onCancel, onActivity } = props
-  const code = primaryCode(vm.decision.reason_codes.filter((c) => c !== 'FALLBACK_FAILED'))
+  // outcome codes of the last submission are shown in the error banner, not as the header reason
+  const code = primaryCode(vm.decision.reason_codes.filter((c) => c !== 'FALLBACK_FAILED' && c !== 'FALLBACK_LOCKED'))
   const reason = code ? reasonText(code, 'STEP_UP') : 'Please verify your identity'
   const steps = vm.decision.next_action.steps
   return (
@@ -294,7 +314,9 @@ export function FallbackScreen(props: Props) {
         <button
           type="button"
           onClick={onCancel}
-          className="min-h-14 rounded-xl bg-white/10 px-6 py-3 text-[clamp(16px,2.4vh,26px)] font-semibold ring-1 ring-white/30"
+          disabled={vm.busy}
+          title={vm.busy ? 'Checking your code…' : undefined}
+          className="min-h-14 rounded-xl bg-white/10 px-6 py-3 text-[clamp(16px,2.4vh,26px)] font-semibold ring-1 ring-white/30 disabled:opacity-40"
         >
           Cancel
         </button>

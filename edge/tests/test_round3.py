@@ -279,7 +279,7 @@ def test_depth_challenge_upload_computes_m1_against_passive(thresholds):
 @requires_models
 def test_template_cache_status_and_age_always_reported(client, admin_headers, example_bundle):
     ctx = client.app.state.ctx
-    m = client.get("/v1/mode").json()
+    m = client.get("/v1/admin/mode/detail", headers=admin_headers).json()
     assert m["template_cache"]["model"].startswith("arcface") and m["template_cache"]["age_h"] is not None
     before = m["template_cache"]["count"]
     frames_ = [synth.jpeg(synth.base_frame(shift_px=s)) for s in (-8, -4, 0, 4, 8)]

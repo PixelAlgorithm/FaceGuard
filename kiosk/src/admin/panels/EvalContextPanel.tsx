@@ -2,6 +2,7 @@
 import { useState, useSyncExternalStore } from 'react'
 import { EVAL_CONDITIONS, EVAL_LABELS, SPLITS, getApi, type EvalCondition, type EvalContext, type EvalLabel, type Split } from '../../api'
 import { STORAGE_KEYS, getEvalContextLocal, writeLocal } from '../../config'
+import { PERM } from '../../shared/auth/permissions'
 import { ActionButton, Card } from '../ui'
 
 function subscribeStorage(cb: () => void) {
@@ -99,6 +100,7 @@ export function EvalContextPanel({ token }: { token: string }) {
       </div>
       <div className="mt-3 flex flex-wrap items-start gap-2">
         <ActionButton
+          perm={PERM.evalAdmin}
           label="Set eval context"
           tone="primary"
           disabled={!token || !ctx.run_id.trim() || !ctx.subject_id.trim() || ctx.run_id.length > 64 || ctx.subject_id.length > 64}
@@ -109,6 +111,7 @@ export function EvalContextPanel({ token }: { token: string }) {
           }}
         />
         <ActionButton
+          perm={PERM.evalAdmin}
           label="Clear"
           disabled={!token}
           run={async () => {

@@ -19,7 +19,8 @@ labelled as not an eval result:
 **measurement pending**. Earlier live `/v1/metrics` samples were in memory only, were lost at edge restarts and have
 no stored file, so they are not quoted anywhere. The early cloud probe (`docs/API.md` §3.1a) is live since the edge
 restart with policy 2026-11-14.3 and is not measured either. Before any client latency goes on a slide: record it
-(e.g. a `snapshot_metrics.py` snapshot after a set of attempts) into `eval/results/`, then quote it with n and its CI,
+(e.g. a `snapshot_metrics.py` snapshot after a set of attempts; it needs an evaluator API key in `FG_EVAL_API_KEY`
+and exits 5 on a missing or refused credential) into `eval/results/`, then quote it with n and its CI,
 as "p95 under 2 s **in this sample**" if it is, never "always" or "guaranteed", and never rounded.
 
 Judging weights: Problem-Solution Fit 25 · Technical 25 · Innovation 20 · Functionality/Usability 15 · Presentation 15.
@@ -29,7 +30,10 @@ Sources for every expected outcome below: `docs/DECISION_POLICY.md` (matrix rows
 `edge/data/bundle.signed.json`** and `config/thresholds.yaml`. The installed bundle is the **cloud-issued v45**
 (`issued_at` 2026-11-14T12:30:41Z = 18:00:41 IST, `expires_at` 00:30:41Z = 06:00:41 IST on 15 Nov), built from the
 cloud's copy of `config/schedule.demo.json` and **filtered to `KIOSK_MAIN_01` / MAIN_GATE only**. It still holds the
-publicly documented fixture override codes `OVR-001`…`OVR-003` until the lead uploads v46+ with fresh codes.
+publicly documented fixture override codes `OVR-001`…`OVR-003` until the lead uploads v46+ with fresh codes. (The
+current cloud code strips documented codes from a store seeded before the hygiene rule and publishes a higher
+version, `cloud/app/services/schedule_service.py`; whether the deployed cloud already runs that code is not checked
+here, so check `schedule_bundle.version` in P2.)
 `config/schedule.example.json` is the test fixture behind the canonical test vectors (Q01, L05, S01 …) in
 `docs/POLICY_TEST_CASES.md`; where a step cites a vector, the vector uses the fixture users (Priya, Rahul) and the step
 uses the demo user with the same role and rule.
@@ -42,8 +46,10 @@ Kiosk wording: the middle outcome is shown as **REQUEST VERIFICATION** (subtitle
 ### 1.1 Setup and pre-flight (before going on stage)
 
 Layout: kiosk laptop facing the presenter; projector shows the kiosk UI (`http://localhost:5173/?mock=0`) and the
-`/admin` dashboard (`http://localhost:5173/admin?mock=0`) side by side: live decision feed from `GET /v1/events`, metrics
-from `GET /v1/metrics`, mode badge, sync-queue counter. Use `localhost`: Vite listens on IPv6 `[::1]:5173` only, so
+`/admin` dashboard (`http://localhost:5173/admin?mock=0`) side by side: live decision feed from `GET /v1/events`
+(permission `events:read`), metrics from `GET /v1/metrics` (`metrics:read`), mode badge, sync-queue counter. `/admin`
+shows a staff sign-in first (`docs/API.md` §0.1); the feed and metrics need a signed-in account with those
+permissions. Use `localhost`: Vite listens on IPv6 `[::1]:5173` only, so
 `127.0.0.1:5173` refuses. The kiosk result screen shows **decision + plain-language reason + decision time +
 ONLINE/OFFLINE badge**, plus a **DEMO CLOCK** badge whenever the demo clock is active. The badge polls `GET /v1/mode`
 every 2 s (`connectivity.status_poll_ms` 2000). "Decision time" on screen is the **client face lock → rendered**
@@ -56,7 +62,11 @@ mask ring (M2, bands 0.50 / 0.75), so glasses can turn a genuine ALLOW into REQU
 (physical tasks only) holds props and fires the admin calls: from the `/admin` page control panel
 (`kiosk/src/admin/panels/ControlPanel.tsx`: mode force OFFLINE / AUTO, sync now, rate-limit reset, demo clock, and a
 **random liveness challenge** control with `AUTO` / `FORCE_NEXT` / `FORCE` / `OFF` buttons showing the current mode;
-admin token required, `DEMO_MODE=1`), or with the curl lines in 1.4 as the fallback. A consenting teammate who is **not enrolled** is needed for step 6 (the bundle placeholders `u_tm02`–`u_tm04`
+`DEMO_MODE=1`), or with the curl lines in 1.4 as the fallback. The operator signs in to `/admin` with a personal
+staff account holding the role `admin` (password + TOTP; the account cannot be called `admin`, a reserved username).
+Only `admin` holds every control used here: the demo clock needs `demo:clock` (admin only), the random challenge
+`challenge:control`, mode `mode:switch`, sync `sync:run`, rate-limit reset `ratelimit:reset`. A button whose
+permission the account lacks is disabled with "Needs <permission>". A consenting teammate who is **not enrolled** is needed for step 6 (the bundle placeholders `u_tm02`–`u_tm04`
 are "Team member 2–4"; check with `GET /v1/admin/users` who has a template). Rekognition collection `hid-kiosk-users`
 holds `u_prj1` and `u_tm03`; `u_tm02` is enrolled on the edge only, so online it gets no cloud match. Never put a judge or
 audience member in front of the camera: online frames go to Rekognition, and only consenting team faces are used.
@@ -73,25 +83,31 @@ LIBRARY and SERVER_ROOM scenarios exist only as test vectors (S01, O04, F2) and 
 
 **Demo-clock rule** (`docs/API.md` §3.14): any demo-clock time must be later than the bundle's `issued_at` − 300 s
 (**after ~17:55:41 IST with v45**), or the cache reads as clock rollback (INVALID). If the lead installs v46+, the bar
-moves to v46's `issued_at` − 300 s; sign it with `scripts/sign_bundle.py --version 46 --now <early enough>` if the demo
-clock must go back to e.g. 21:00.
+moves to v46's `issued_at` − 300 s; sign it with `scripts/sign_bundle.py --version 46 --now <early enough> --demo-cards`
+if the demo clock must go back to e.g. 21:00 (without `--demo-cards` the signer drops the documented demo card hashes,
+so `HID-DEMO-0001` would stop working). The current cloud code also re-issues the same version with `issued_at` = now
+once its last issue for the kiosk is older than half the bundle lifetime, which moves the bar too: read
+`schedule_bundle.issued_at` from `GET /v1/admin/mode/detail` right before the run.
 
 Props, in order: A4 colour print of Prajwal · phone showing Prajwal's photo · phone playing a short video of Prajwal
 (blinking, smiling) · eye-cut print of Prajwal (worn by a teammate) · demo card ID `HID-DEMO-0001` · Prajwal's
 authenticator app (the `u_prj1` TOTP) · backup video cued (including a recorded virtual-camera / injection clip, since
 OBS Studio is not installed on the kiosk laptop). **No staff code**: v45 carries only the public fixture codes, so
-STAFF_OVERRIDE is not used in the scripted run; the CARD and TOTP are the fallback factors.
+STAFF_OVERRIDE is not used in the scripted run; the CARD and TOTP are the fallback factors. (The edge leaves
+documented codes out of its decisions unless `DEMO_MODE=1`, and the demo edge runs with `DEMO_MODE=1`, so here they
+would still match: one more reason not to type them.)
 
 Pre-flight checklist (rehearse once, end to end):
 
 | # | Check | Why |
 |---|---|---|
-| P1 | Edge runs with `DEMO_MODE=1`, `KIOSK_ID=KIOSK_MAIN_01`; `GET /v1/health` → `status: ok`, all models loaded, `self_test.passed` true (`minifasnet_real_index` 1, `input_scale` "0-255 BGR"), `detail.policy_runtime` `real` | anything else means the policy runtime is fail-secure (every attempt DENY `SYSTEM_ERROR`) |
-| P2 | `GET /v1/mode` → `schedule_bundle.version` 45 (or the lead's v46+), `cache_state` FRESH, `expires_at` after the end of the run. **Do not run `scripts/sign_bundle.py` with its defaults**: it signs `bundle_version` 42 from `config/schedule.demo.json`, which the edge rejects as older than v45 (`BUNDLE_REJECTED`, the LVB stays), and it overwrites `edge/data/DEMO_CODES.txt`. A replacement needs `--version` > the installed version | the demo clock is moved to 22:10–22:30; both are after v45's `issued_at` − 300 s. Later than `issued_at` + 12 h (`cache.bundle_max_staleness_hours`) → EXPIRED. The demo clock never re-signs the bundle |
-| P3 | `GET /v1/mode` → `mode` ONLINE, `schedule_bundle.refresh_age_s` < 1800, `demo_clock` null | online needs a bundle confirmed by the cloud within `schedule.online_max_bundle_age_min` (30 min); otherwise every attempt runs OFFLINE with mode reason `bundle_stale`. The cloud 304 confirmation every `cache.bundle_refresh_interval_min` (15) keeps it fresh |
-| P3b | Nobody `PUT`s a new schedule during the run. Cloud `GET /v1/admin/schedule` (kiosk-signed + `X-Admin-Token`) → `doc.users` contains `u_prj1` | step 14 re-checks each offline ALLOW against the cloud's authoritative document; a document without `u_prj1` would show `SCHEDULE_CHANGED` / `ALERT_SCHEDULE_MISMATCH` on stage. A newer bundle published during the run moves the demo-clock bar (P2) |
+| P0 | The operator's staff account exists (bootstrap: `edge/.venv/bin/python -m edge.auth create-user --username <personal name> --display-name "…" --role admin --mfa`, README "First admin") and MFA is enrolled. Sign in to `/admin` shortly before going on stage | `admin` is in `AUTH_MFA_REQUIRED_ROLES` by default, so sign-in needs the TOTP. Sessions live in edge memory: an **edge restart signs everyone out**. The server ends a session after `AUTH_SESSION_IDLE_MIN` (30) min without a non-GET request (polls and the SSE feed never extend it), and the console signs out on its own after 10 min without input |
+| P1 | Edge runs with `DEMO_MODE=1`, `KIOSK_ID=KIOSK_MAIN_01`; `GET /v1/health` → `status: degraded` with `degraded_reasons` exactly `["demo_mode"]` (`DEMO_MODE=1` is always reported), all models loaded, `self_test.passed` true (`minifasnet_real_index` 1, `input_scale` "0-255 BGR"), `detail.policy_runtime` `real` | any other degraded reason needs a look first: `policy_runtime_fail_secure` means every attempt is DENY `SYSTEM_ERROR`; `legacy_admin_token`, `env_file_permissive`, `auth_unavailable` or `auth_bruteforce` are auth problems |
+| P2 | `GET /v1/admin/mode/detail` (`store:read`) → `schedule_bundle.version` 45 (or the lead's v46+), `cache_state` FRESH, `expires_at` after the end of the run (`cache_state` is also on the public `GET /v1/mode`). **Do not run `scripts/sign_bundle.py` with its defaults**: it re-stamps the bundle from `config/schedule.demo.json` (default version = installed + 1, so the edge does accept it), drops the documented demo card hashes unless `--demo-cards` (step 9 needs `HID-DEMO-0001`), mints fresh 10-digit override codes and overwrites `edge/data/DEMO_CODES.txt` | the demo clock is moved to 22:10–22:30; both are after v45's `issued_at` − 300 s. Later than `issued_at` + 12 h (`cache.bundle_max_staleness_hours`) → EXPIRED. The demo clock never re-signs the bundle |
+| P3 | `GET /v1/mode` → `mode` ONLINE, `forced` false, `demo_clock` null; `GET /v1/admin/mode/detail` → `schedule_bundle.refresh_age_s` < 1800 | online needs a bundle confirmed by the cloud within `schedule.online_max_bundle_age_min` (30 min); otherwise every attempt runs OFFLINE with mode reason `bundle_stale`. The cloud 304 confirmation every `cache.bundle_refresh_interval_min` (15) keeps it fresh |
+| P3b | Nobody `PUT`s a new schedule during the run. Cloud `GET /v1/admin/schedule` (kiosk-signed + a cloud admin credential with `schedule:read`: `Authorization: Bearer fgk_…` from `CLOUD_API_KEYS_JSON`; `X-Admin-Token` only with the cloud's `AUTH_LEGACY_ADMIN_TOKEN=1`, `docs/API.md` §0.1.9) → `doc.users` contains `u_prj1` | step 14 re-checks each offline ALLOW against the cloud's authoritative document; a document without `u_prj1` would show `SCHEDULE_CHANGED` / `ALERT_SCHEDULE_MISMATCH` on stage. A newer bundle published during the run moves the demo-clock bar (P2) |
 | P4 | Profile in `config/thresholds.yaml` (shipped, do not change): `challenge.random_rate` 0.15 and `offline.overrides.challenge.random_rate` 0.30; `liveness.moire.enforce` true; `liveness.mask.m2_rgb_enforce` true; `liveness.flash.enforce` false; `liveness.depth.enabled` false; `rate_limit.enabled` true. **Pre-run**: `POST /v1/admin/random-challenge {"mode": "OFF"}` and `POST /v1/admin/rate-limit/reset` | random challenges stay on in the product; they are switched **off for the scripted run only**, so no scripted ALLOW draws one by chance (the mode is in memory: re-send `OFF` after any edge restart, which resets it to `AUTO`). Moiré and M2 are enforced; flash is **advisory** and depth is off, and we say both on stage |
-| P5 | `GET /v1/admin/users` lists `u_prj1` with templates, `totp_local` true, `card` true; `GET /v1/mode` → `template_cache.age_h` < 72; the step-6 teammate is **not** listed | offline matching is local-only against this kiosk's entitled users; a template cache older than `cache.template_cache_max_age_hours` (72) is unusable |
+| P5 | `GET /v1/admin/users` (`enrol:read`) lists `u_prj1` with templates, `totp_local` true, `card` true; `GET /v1/admin/mode/detail` → `template_cache.age_h` < 72 (the public `GET /v1/mode` shows only `template_cache.count`); the step-6 teammate is **not** listed | offline matching is local-only against this kiosk's entitled users; a template cache older than `cache.template_cache_max_age_hours` (72) is unusable |
 | P6 | One online dry run of Prajwal: ALLOW. **Expected today** (cold connections): `reason_codes` `[ACCESS_OK, OFFLINE_MODE]`, `scores.rekognition` null, while the badge says ONLINE, and `GET /v1/mode` `cloud_match.degraded` true. The early probe is live since the edge restart with policy 2026-11-14.3; the target is ALLOW `[ACCESS_OK]` with `scores.rekognition` set (not yet measured, so check which you get) | from the venue the `/v1/match` round trip is about 0.4–1.4 s, so it misses the 700 ms budget and that attempt is decided OFFLINE (P7, fail-secure). Know which state you are in before going on stage, and say it if asked |
 | P7 | Kiosk stays on `KIOSK_MAIN_01` for the whole run. No `?kiosk=` switch, no restart as another kiosk | v45 covers only `KIOSK_MAIN_01` (see above) |
 | P8 | Real IST time is between **06:00 and 21:55** for the real-time steps (1–7, 10–11, 13–14). **If the run is later than 21:55**, set the demo clock for those steps too, e.g. `{"set_local": "21:00"}` (in window, and after v45's `issued_at` − 300 s), and reset it before step 14 | student MAIN_GATE window ends 22:00 (grace to 22:15); after that a real-time ALLOW becomes REQUEST VERIFICATION (grace) or DENY `SCHEDULE_OUTSIDE_WINDOW` |
@@ -122,11 +138,11 @@ the cold-connection state.
 | 4 | 0:55–1:15 | `KIOSK_MAIN_01` | real | phone playing the video of Prajwal (blinking, smiling) | — | **DENY** · `SPOOF_DEVICE_DETECTED` and/or `SPOOF_PASSIVE` / `SPOOF_MOIRE` · NONE. Flash is advisory: the operator view shows `scores.signals.flash` = `ADVISORY_<zone>` with no decision effect. If PAD, detector and moiré only reach UNSURE: **REQUEST VERIFICATION** · `LIVENESS_UNSURE` · CHALLENGE → the clip cannot follow the random 2-action challenge → **DENY** · `CHALLENGE_FAILED` | N12, or N9 → R6/R7 |
 | 5 | 1:15–1:55 | `KIOSK_MAIN_01` | real | teammate wearing the eye-cut print of Prajwal, blinking on purpose | **before**: `POST /v1/admin/random-challenge {"mode": "FORCE_NEXT"}`; **after**: `{"mode": "OFF"}` + `POST /v1/admin/rate-limit/reset` | A mask cue or UNSURE signal → **REQUEST VERIFICATION** · `MASK_CUE_EDGE` and/or `LIVENESS_UNSURE` · CHALLENGE. If nothing looked suspicious, the forced draw makes the would-be ALLOW a **REQUEST VERIFICATION** · `RANDOM_CHALLENGE` · CHALLENGE instead. Either way: 2 actions in random order, one of SMILE / OPEN_MOUTH (mandatory) + one of BLINK / TURN_LEFT / TURN_RIGHT → the blink or turn passes, the paper does not smile or open its mouth → `STEP_UP` · original codes + `CHALLENGE_FAILED` · CHALLENGE (new nonce, `attempts_left` 0) → second miss → **DENY** · `CHALLENGE_FAILED` · NONE. Honest contingency: PAD may DENY it outright (`SPOOF_PASSIVE`), see 1.6. Always send `OFF` afterwards: an unused `FORCE_NEXT` stays armed and would hit step 11 | N9 / N14 → R6 → R7 · M01, RC05, RC06, C06, C07 |
 | 6 | 1:55–2:10 | `KIOSK_MAIN_01` | real | consenting teammate who is **not enrolled** | — | **DENY** · `NOT_ENROLLED` · CONTACT_DESK. Schedule not evaluated | N13 · I03 |
-| 7 | 2:10–2:40 | — (enrolment page) | real | the same teammate | open `http://localhost:5173/enroll.html` | **Enrolment with consent** (30 s): consent checkbox with the DPDP text (purpose + storage limitation, deleted after the event) must be ticked; admin token; **e-mail field filled** (the deployed cloud requires it; without it the face is enrolled on the edge only, `cloud_indexed: false`); 5 frames at up to 1280 px → `POST /v1/enroll` (liveness-gated, template encrypted on the laptop, forwarded to Rekognition only when online) → `GET /v1/admin/users` now lists the user. Use a bundle placeholder ID that has no template yet (`u_tm04` unless P5 showed otherwise). Say: re-enrolling the same ID **appends** a look on the edge (≤ 24 templates, first 5 pinned; new frames that don't resemble the original → 409; erase to replace), and erasure is `DELETE /v1/enroll/{user_id}`. Never re-enrol `u_prj1` / `u_tm03` online before the cloud redeploy (the deployed cloud replaces their Rekognition faces). Re-presenting for an ALLOW is optional, only if rehearsed | API §3.15 |
+| 7 | 2:10–2:40 | — (enrolment page) | real | the same teammate | open `http://localhost:5173/register` (the old `/enroll.html` only redirects there) and sign in (needs `enrol:write`: the admin account, or an `enroller`) | **Enrolment with consent** (30 s): consent checkbox with the DPDP text (purpose + storage limitation, deleted after the event) must be ticked; **e-mail field filled** (the deployed cloud requires it; without it the face is enrolled on the edge only, `cloud_indexed: false`); 5 frames at up to 1280 px → `POST /v1/enroll` (liveness-gated, template encrypted on the laptop, forwarded to Rekognition only when online) → `GET /v1/admin/users` now lists the user. Use a bundle placeholder ID that has no template yet (`u_tm04` unless P5 showed otherwise); it is already in the signed bundle, so no schedule write is needed (adding a person who is not in the schedule needs `access:edit`, admin only; an `enroller` sees "Ask an admin to add <user_id> to the schedule"). Say: re-enrolling the same ID **appends** a look on the edge (≤ 24 templates, first 5 pinned; new frames that don't resemble the original → 409; erase to replace), and erasure is `DELETE /v1/enroll/{user_id}` (`enrol:erase`). Never re-enrol `u_prj1` / `u_tm03` online before the cloud redeploy (the deployed cloud replaces their Rekognition faces). Re-presenting for an ALLOW is optional, only if rehearsed | API §3.15 |
 | 8 | 2:40–2:55 | `KIOSK_MAIN_01` · MAIN_GATE (low) | **22:30** | Prajwal (live) | `POST /v1/admin/clock {"set_local": "22:30"}`; DEMO CLOCK badge visible | **DENY** · `SCHEDULE_OUTSIDE_WINDOW` · NONE. Main gate closes 22:00 for students, grace ends 22:15. Live and recognised, still denied | N4 (S04 = the 07:40 variant) |
 | 9 | 2:55–3:20 | `KIOSK_MAIN_01` · MAIN_GATE (low) | **22:10** | Prajwal (live), then card `HID-DEMO-0001` | `POST /v1/admin/clock {"set_local": "22:10"}`; on the prompt, enter the card ID (or a TOTP) | **REQUEST VERIFICATION** · `SCHEDULE_GRACE_WINDOW` · SECOND_FACTOR, methods `[TOTP, CARD, EMAIL_OTP, STAFF_OVERRIDE]` (`stepup.methods.online_default`; if the attempt fell back to OFFLINE: `OFFLINE_MODE`, `OFFLINE_FALLBACK_REQUIRED`, methods `[TOTP, CARD, STAFF_OVERRIDE]`) → card hash matches `u_prj1` and is not revoked → **ALLOW** · `ACCESS_OK`, `FALLBACK_OK` · OPEN_DOOR; `resolved_codes` = `[SCHEDULE_GRACE_WINDOW]`. TOTP also works: it always verifies against real wall time, never the demo clock | N3 → R1 · S01 / S02 |
 | 10 | 3:20–3:25 | — | **reset** (or `21:00` if P8 applies) | — | `POST /v1/admin/clock {"reset": true}`; DEMO CLOCK badge disappears | real IST time from here on (P8) | R18 |
-| 11 | 3:25–3:40 | `KIOSK_MAIN_01` · MAIN_GATE (low) | real (P8) | Prajwal (live) | `POST /v1/admin/mode {"force": "OFFLINE"}` → badge **OFFLINE** at the next 2 s poll | **ALLOW** · `ACCESS_OK`, `OFFLINE_MODE` · OPEN_DOOR. Local liveness + local ArcFace at the stricter offline bars (`offline.overrides`: PAD 0.85, cosine 0.55, margin 0.15); cached signed bundle FRESH; IN_WINDOW. (Random challenge is `OFF` for the script; in the product the offline rate is 0.30) | F1 · O01 |
+| 11 | 3:25–3:40 | `KIOSK_MAIN_01` · MAIN_GATE (low) | real (P8) | Prajwal (live) | `POST /v1/admin/mode {"force": "OFFLINE"}` (the Control Panel's "Force OFFLINE" button sends exactly this body) → badge **OFFLINE** at the next 2 s poll. Without `max_minutes` a forced OFFLINE auto-reverts to AUTO after 60 min (`connectivity.forced_offline_default_min`; `forced_until` on `GET /v1/mode`), far longer than this segment | **ALLOW** · `ACCESS_OK`, `OFFLINE_MODE` · OPEN_DOOR. Local liveness + local ArcFace at the stricter offline bars (`offline.overrides`: PAD 0.85, cosine 0.55, margin 0.15); cached signed bundle FRESH; IN_WINDOW. (Random challenge is `OFF` for the script; in the product the offline rate is 0.30) | F1 · O01 |
 | 12 | 3:40–4:10 | `KIOSK_MAIN_01` · MAIN_GATE (low) | **22:10** | Prajwal (live), then his TOTP (or the card) | still OFFLINE; `POST /v1/admin/clock {"set_local": "22:10"}` | **REQUEST VERIFICATION** · `SCHEDULE_GRACE_WINDOW`, `OFFLINE_MODE`, `OFFLINE_FALLBACK_REQUIRED` · SECOND_FACTOR, methods `[TOTP, CARD, STAFF_OVERRIDE]` (`stepup.methods.offline_default`; no EMAIL_OTP offline) → 6-digit TOTP (or card) → **ALLOW** · `ACCESS_OK`, `FALLBACK_OK`, `OFFLINE_MODE` · OPEN_DOOR; `resolved_codes` = `[SCHEDULE_GRACE_WINDOW]`. Then `POST /v1/admin/clock {"reset": true}` **at once** (before step 14). The high-risk offline rule (SERVER_ROOM: always a second factor, `[TOTP, STAFF_OVERRIDE]`, no card) is told, not shown: it is not in v45 (test vectors O04, F2) | F3 → R1 · O11 / O12 |
 | 13 | 4:10–4:25 | — | real | — | `GET /v1/admin/store` on the dashboard | the queued records with exactly the SC2.5 fields: `attempt_id, seq, kiosk_id, zone, ts_utc, user_id, candidate_user_id, decision, reason_codes, resolved_codes, scores` (2 dp), `fallback` (`method`, `staff_id`, `code_id`, `totp_step`: a non-secret time-step counter, never the code), `schedule_version, cache_state, mode, prev_hash, record_hash`; plus `never_stored` (images, face crops, depth maps, embeddings, display names, TOTP values, raw card IDs), `chain_ok`, encryption AES-256-GCM, `retention_hours` 24 | SC2.5 |
 | 14 | 4:25–4:45 | — | **real (reset first)** | — | check the DEMO CLOCK badge is gone (`{"reset": true}` again if not), then `POST /v1/admin/mode {"force": "AUTO"}`; if the queue has not started draining after ~15 s, `POST /v1/admin/sync` | badge SYNCING (offline rules still apply) → queue counts down to **0** → ONLINE. `POST /v1/sync`: ≤ 50 items per batch (`sync.batch_size`) plus TOMBSTONE items, with `chain_head` / `chain_head_hmac`; response `accepted` / `duplicates` / `rejected` / `flags`. The cloud re-checks each offline ALLOW against the authoritative schedule; acked records are purged locally. Sync stamps `kiosk_now_utc` from the demo clock, so a clock left shifted by more than 120 s raises `ALERT_CLOCK_SKEW` on stage | SC2.6 |
@@ -166,13 +182,24 @@ failed cloud match during an attempt also counts as a miss). Reconnect needs `su
 
 ### 1.4 Admin calls (operator cheat sheet)
 
-All admin calls need `X-Admin-Token`; `/v1/admin/clock` and `/v1/admin/random-challenge` work only with `DEMO_MODE=1`.
-Body field names follow `docs/API.md` §3.14 / §3.14a. Codes are typed on the kiosk, never on a command line.
+All admin calls need a staff session token (`Authorization: Bearer fgs_…`, from `POST /v1/auth/login`) whose account
+holds the permission listed in `docs/API.md` §0.1.4; the operator's `admin` account holds all of them. The shared
+`X-Admin-Token` works only if the edge was started with `AUTH_LEGACY_ADMIN_TOKEN=1` (off by default, audited, and
+`/v1/health` then reports `legacy_admin_token`). An API key cannot replace the session here: keys can never hold
+`demo:clock`. `/v1/admin/clock` and `/v1/admin/random-challenge` work only with `DEMO_MODE=1` (else `403` reason
+`NOT_DEMO_MODE`). Body field names follow `docs/API.md` §3.14 / §3.14a. Codes are typed on the kiosk, never on a
+command line.
 
 ```bash
-E=http://127.0.0.1:8000; H="X-Admin-Token: $ADMIN_TOKEN"; J="Content-Type: application/json"
+E=http://127.0.0.1:8000; J="Content-Type: application/json"
+# sign in once (admin account; the password is read silently, printf is a shell builtin so it never shows in ps)
+read -r U; read -rs P; read -r C   # username, password (no " or \ in it), current 6-digit TOTP
+T=$(printf '{"username":"%s","password":"%s","totp_code":"%s"}' "$U" "$P" "$C" | curl -s $E/v1/auth/login -H "$J" -d @- \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'); unset P C
+H="Authorization: Bearer $T"
 curl -s       $E/v1/health                                                              # P1
-curl -s       $E/v1/mode                                                                # P2, P3, P6, badge state any time
+curl -s       $E/v1/mode                                                                # P3, P6, public badge subset any time
+curl -s       $E/v1/admin/mode/detail -H "$H"                                           # P2, P3, P5 (full status, store:read)
 curl -s       $E/v1/admin/users -H "$H"                                                 # P5, step 7
 curl -sX POST $E/v1/admin/random-challenge -H "$H" -H "$J" -d '{"mode": "OFF"}'         # pre-run (P4), after step 5
 curl -sX POST $E/v1/admin/rate-limit/reset -H "$H"                                      # pre-run, after step 5, any retried spoof step
@@ -181,14 +208,17 @@ curl -sX POST $E/v1/admin/clock -H "$H" -H "$J" -d '{"set_local": "22:30"}'     
 curl -sX POST $E/v1/admin/clock -H "$H" -H "$J" -d '{"set_local": "22:10"}'             # steps 9 and 12
 curl -sX POST $E/v1/admin/clock -H "$H" -H "$J" -d '{"reset": true}'                    # step 10, end of step 12, before step 14
 curl -sX POST $E/v1/admin/clock -H "$H" -H "$J" -d '{"set_local": "21:00"}'             # only if the run is after 21:55 (P8)
-curl -sX POST $E/v1/admin/mode  -H "$H" -H "$J" -d '{"force": "OFFLINE"}'               # step 11
+curl -sX POST $E/v1/admin/mode  -H "$H" -H "$J" -d '{"force": "OFFLINE"}'               # step 11 (auto-reverts after 60 min)
 curl -s       $E/v1/admin/store -H "$H"                                                 # step 13
 curl -sX POST $E/v1/admin/mode  -H "$H" -H "$J" -d '{"force": "AUTO"}'                  # step 14 (clock reset first)
 curl -sX POST $E/v1/admin/sync  -H "$H"                                                 # step 14 (if slow)
 ```
 
 After the run: `curl -sX POST $E/v1/admin/random-challenge -H "$H" -H "$J" -d '{"mode": "AUTO"}'` restores the shipped
-random-challenge behaviour (an edge restart does the same).
+random-challenge behaviour (an edge restart does the same), and `curl -sX POST $E/v1/auth/logout -H "$H"` ends the
+curl session. A forced OFFLINE for a longer rehearsal: `{"force": "OFFLINE", "max_minutes": 240}` (1–240); only
+`DEMO_MODE=1` with `{"force": "OFFLINE", "reason": "DEMO"}` and no `max_minutes` stays forced without a deadline
+(as does an edge started with env `FORCE_OFFLINE=1`).
 
 ### 1.5 Closing metrics (step 16)
 
@@ -374,10 +404,10 @@ Clopper-Pearson upper bound on the slide. For example, 0/30 print attacks accept
 We don't claim it. Zero errors in N trials only bounds the rate below 3/N at 95%, so 0.2% needs about 1,497 error-free impostor comparisons. We generate impostor comparisons offline with `eval/collect_faces.py` + `eval/compare.py` on consenting team photos (`eval/captures/`, gitignored, deleted after the event), cross-matching every probe against every other subject's template (`[N_imp]` comparisons, plus LFW padding), and set the threshold at the 99.8th impostor percentile on a dev split of subjects. Then we report FMR on held-out subjects: `[k/N]`, 95% UB `[UB]`. Live FRR of 0.6% would need about 500 error-free genuine transactions, so we show our bound and the volume needed.
 
 **Privacy / DPDP Act 2023?**
-Consent page (`/enroll.html`: no tick, no template) and purpose limitation (access control only). Templates, not images, are stored on the edge, encrypted, with a 72 h maximum template-cache age; enrolment is liveness-gated. No images are stored offline at all; the offline decision log is AES-256-GCM encrypted, holds pseudonymous IDs and 2-dp scores, and is purged on sync ack or after 24 h. Erasure: `DELETE /v1/enroll/{user_id}` removes the local template, the TOTP secret and the cloud user. Today's sandbox is in us-east-1; production would keep data in ap-south-1 (Mumbai). Only consenting team faces were used today, and everything is deleted by the teardown script.
+Consent page (`/register`, behind staff sign-in; the old `/enroll.html` redirects there: no tick, no template) and purpose limitation (access control only). Templates, not images, are stored on the edge, encrypted, with a 72 h maximum template-cache age; enrolment is liveness-gated. No images are stored offline at all; the offline decision log is AES-256-GCM encrypted, holds pseudonymous IDs and 2-dp scores, and is purged on sync ack or after 24 h. Erasure: `DELETE /v1/enroll/{user_id}` removes the local template, the TOTP secret and the cloud user. Today's sandbox is in us-east-1; production would keep data in ap-south-1 (Mumbai). Only consenting team faces were used today, and everything is deleted by the teardown script.
 
 **Is offline mode a security hole?**
-Offline is stricter than online, never looser. Higher PAD and match thresholds; no auto-ALLOW in high-risk zones; no automatic offline ALLOW if the cached schedule is past its 12 h limit (only a staff override can admit), and no match at all if templates are older than 72 h. SYNCING still uses offline rules, and an online kiosk whose bundle hasn't been confirmed by the cloud for 30 min also switches to offline rules. A bundle that fails verification (in transit or tampered on disk) is rejected and never replaces the last valid one. Fallback factors work with zero connectivity (offline TOTP, staff code, HID card ID; no card in high-risk zones). The queue is encrypted, hash-chained and minimal, and every offline decision is re-evaluated by the cloud on reconnect, with discrepancy alerts (for example a user revoked while the kiosk was offline, or the same TOTP step used at two kiosks). Templates are scoped to that kiosk's entitled users only.
+Offline is stricter than online, never looser. Higher PAD and match thresholds; no auto-ALLOW in high-risk zones; no automatic offline ALLOW if the cached schedule is past its 12 h limit (only a staff override can admit), and no match at all if templates are older than 72 h. SYNCING still uses offline rules, and an online kiosk whose bundle hasn't been confirmed by the cloud for 30 min also switches to offline rules. A bundle that fails verification (in transit or tampered on disk), or is signed under a key id other than the pinned `SCHEDULE_BUNDLE_KEY_ID`, is rejected and never replaces the last valid one. Honest open risks: the bundle signature is still symmetric HMAC-SHA256, so every kiosk holds the signing key and one stolen kiosk could sign a bundle for any kiosk (Ed25519 with public keys on the kiosk is the production follow-up), and there is no persisted anti-rollback floor at boot yet. Fallback factors work with zero connectivity (offline TOTP, staff code, HID card ID; no card in high-risk zones). Staff codes are one-time and 10 digits; 3 consecutive wrong codes for one named guard lock that guard's codes for 300 s, and any 10 override failures in 5 min (unknown guard ids included) lock every override for 300 s; locks survive an edge restart. A code used at one kiosk is retired by the cloud at sync and listed in the next signed bundle (`consumed_code_ids`), so other kiosks refuse it once they have installed that bundle (an offline kiosk cannot know earlier; reuse is then flagged at sync). The queue is encrypted, hash-chained and minimal, and every offline decision is re-evaluated by the cloud on reconnect, with discrepancy alerts (for example a user revoked while the kiosk was offline, or the same TOTP step used at two kiosks). Templates are scoped to that kiosk's entitled users only.
 
 **How does this scale to many kiosks?**
 The heavy work runs at the edge (about 2 MB PAD models on CPU, so no GPU), and the cloud handles identity, schedules and audit. Per-campus template sync pushes only the users authorised for each door. `/v1/sync` is idempotent and keyed by `attempt_id`. The API is stateless (EC2 ASG or Lambda with provisioned concurrency). Rekognition quotas can be raised for production, and the 1:1 CompareFaces path avoids 1:N search where a card or claimed ID exists. Metrics go to CloudWatch for the fleet dashboard.
@@ -397,7 +427,8 @@ The flash is exactly 3 gentle colours in 0.7 s (≤ 3 changes per second). The k
 **What would you do with more time?**
 Run the eval we designed, with more subjects and lighting conditions; calibrate the moiré and mask-ring bands on its dev
 split; measure the early cloud probe; re-validate the kiosk's frame timing and enforce the colour-flash nonce; run the H4
-depth calibration and enable depth; S3 audit frames; Ed25519-signed bundles (HMAC-SHA256 today); a licensed
+depth calibration and enable depth; S3 audit frames; Ed25519-signed bundles (HMAC-SHA256 today) and a persisted
+anti-rollback floor for the bundle at boot; a licensed
 matcher; depth/NIR hardware for masks; real HID reader / mobile-credential integration; CEN/TS 18099 injection testing.
 
 ---

@@ -15,17 +15,28 @@ Reports p50/p95 per stage (server latency_ms) and client round trips with a perc
     edge/.venv/bin/python scripts/bench_latency.py --runs 40 --port 8096
 
 Never points at the live edge: ports 8000/8001/5173 are refused.
+
+Auth (RBAC): before starting the scratch edge the script provisions an API key into the scratch EDGE_DATA_DIR
+(`python -m edge.auth create-api-key --name bench --role evaluator --role enroller --expires-days 1
+--print-key-only`) and sends it as `Authorization: Bearer` (POST /v1/enroll, POST /v1/admin/rate-limit/reset).
+`--auth legacy` instead sets AUTH_LEGACY_ADMIN_TOKEN=1 plus a random ADMIN_TOKEN in the child env only.
+`--auth auto` (default) = key when edge/auth/cli.py exists, else legacy. The scratch edge always gets a fresh
+random EDGE_DATA_KEY (the live data key is never used). The key/token is never printed or written; a 401/403
+stops the run with a clear error (exit 5).
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import hashlib
 import json
 import math
 import os
 import platform
+import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -50,6 +61,11 @@ STAGES = ["quality", "liveness", "match", "policy", "total"]
 LIVE_PORTS = {8000, 8001, 5173}
 EXCLUDED_CODES = {"RATE_LIMITED", "SYSTEM_ERROR"}
 N_BOOT = 2000
+EXIT_AUTH = 5
+AUTH_CLI = ROOT / "edge" / "auth" / "cli.py"
+API_KEY_RE = re.compile(r"^fgk_(?P<key_id>[a-z0-9]{8})\.[A-Za-z0-9_-]{32,128}$")
+CLI_LOCK_BUSY = 75  # edge.auth CLI: store lock busy, retry
+KEY_ROLES = ("evaluator", "enroller")  # ratelimit:reset + store:read (mode detail) + enrol:write
 SCOPE_NOTE = "server-side only, synthetic frames, offline mode, excludes face lock / flash window / rendering"
 
 
@@ -88,6 +104,84 @@ def boot_ci(values: list[float], q: float, n_boot: int = N_BOOT, seed: int = 0) 
 
 def pct(values: list[float], q: float) -> float:
     return float(np.percentile(np.asarray(values, dtype=np.float64), q * 100))
+
+
+class ScratchAuth:
+    """Credential for the scratch edge only. Holds the secret; describe() never includes it."""
+
+    def __init__(self, kind: str, secret: str, key_id: str = "") -> None:
+        self.kind, self._secret, self.key_id = kind, secret, key_id
+
+    def headers(self) -> dict[str, str]:
+        if self.kind == "api_key":
+            return {"Authorization": f"Bearer {self._secret}"}
+        return {"X-Admin-Token": self._secret}
+
+    def describe(self) -> str:
+        if self.kind == "api_key":
+            return f"API key key:{self.key_id} (roles {'+'.join(KEY_ROLES)}, expires in 1 day, scratch store)"
+        return "legacy X-Admin-Token (AUTH_LEGACY_ADMIN_TOKEN=1, random ADMIN_TOKEN in the child env only)"
+
+
+def scratch_env(data_dir: Path, with_cloud: bool) -> dict[str, str]:
+    env = {**os.environ, "EDGE_DATA_DIR": str(data_dir), "EDGE_LAN_PORT": "0", "FORCE_OFFLINE": "0",
+           "DEMO_MODE": "0", "EDGE_DATA_KEY": base64.urlsafe_b64encode(secrets.token_bytes(32)).decode()}
+    for k in ("BUNDLE_PATH", "STAFF_STORE_KEY"):
+        env.pop(k, None)
+    if not with_cloud:  # synthetic frames must not reach Rekognition or the cloud decision ledger
+        env["CLOUD_API_URL"] = ""
+    return env
+
+
+def provision_api_key(env: dict[str, str]) -> ScratchAuth:
+    """Mint a 1-day evaluator+enroller key in the scratch store via the edge.auth CLI (stdout = the key only)."""
+    cmd = [sys.executable, "-m", "edge.auth", "create-api-key", "--name", "bench",
+           *[x for r in KEY_ROLES for x in ("--role", r)], "--expires-days", "1", "--print-key-only"]
+    for _ in range(2):
+        r = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, timeout=60, check=False)
+        if r.returncode != CLI_LOCK_BUSY:
+            break
+        time.sleep(1.0)
+    key = r.stdout.strip()
+    m = API_KEY_RE.match(key)
+    if r.returncode != 0 or not m:
+        tail = " | ".join(r.stderr.strip().splitlines()[-3:])[:300]
+        raise SystemExit(f"edge.auth create-api-key failed (exit {r.returncode}): {tail or 'no key on stdout'}")
+    return ScratchAuth("api_key", key, m["key_id"])
+
+
+def scratch_auth(mode: str, env: dict[str, str]) -> ScratchAuth:
+    """Set up the child env for the chosen auth mode and return the credential to send."""
+    if mode == "auto":
+        mode = "key" if AUTH_CLI.is_file() else "legacy"
+    if mode == "key":
+        env["AUTH_LEGACY_ADMIN_TOKEN"] = "0"
+        return provision_api_key(env)
+    token = secrets.token_urlsafe(32)
+    env |= {"AUTH_LEGACY_ADMIN_TOKEN": "1", "ADMIN_TOKEN": token}
+    return ScratchAuth("legacy", token)
+
+
+def check_auth(r: httpx.Response, what: str, auth: ScratchAuth) -> None:
+    if r.status_code in (401, 403):
+        try:
+            err = (r.json() or {}).get("error") or {}
+        except ValueError:
+            err = {}
+        reason = " ".join(str(err.get(k)) for k in ("code", "reason", "required") if err.get(k))[:200]
+        print(f"ERROR: scratch edge refused {what}: HTTP {r.status_code} {reason} ({auth.describe()})",
+              file=sys.stderr)
+        raise SystemExit(EXIT_AUTH)
+
+
+def mode_detail(client: httpx.Client, auth: ScratchAuth) -> dict:
+    """GET /v1/admin/mode/detail (store:read: bundle, zone, policy_version); 404 (older edge) -> GET /v1/mode."""
+    r = client.get("/v1/admin/mode/detail", headers=auth.headers())
+    check_auth(r, "GET /v1/admin/mode/detail", auth)
+    if r.status_code == 404:
+        r = client.get("/v1/mode")
+    r.raise_for_status()
+    return r.json()
 
 
 def wait_ready(base: str, proc: subprocess.Popen, timeout_s: float = 120.0) -> float:
@@ -150,9 +244,11 @@ def make_attempt_sized(session: dict[str, Any], size: tuple[int, int], *, n_fram
     return frames, meta
 
 
-def attempt(client: httpx.Client, kiosk: str, size: tuple[int, int], admin: dict, reset: bool) -> dict:
+def attempt(client: httpx.Client, kiosk: str, size: tuple[int, int], auth: ScratchAuth, reset: bool) -> dict:
     if reset:  # scratch edge only: keep the limiter from deciding instead of the pipeline
-        client.post("/v1/admin/rate-limit/reset", headers=admin).raise_for_status()
+        r = client.post("/v1/admin/rate-limit/reset", headers=auth.headers())
+        check_auth(r, "POST /v1/admin/rate-limit/reset", auth)
+        r.raise_for_status()
     t0 = time.perf_counter()
     r = client.post("/v1/session/start", json={"kiosk_id": kiosk, "client": {
         "camera_label": "FaceTime HD Camera", "user_agent": "bench", "screen": {}}, "flash_enabled": True})
@@ -187,6 +283,8 @@ def main() -> None:
                     help="do not reset the scratch edge's rate limiter before each attempt")
     ap.add_argument("--with-cloud", action="store_true",
                     help="keep CLOUD_API_URL (Rekognition on the path); default measures the edge only")
+    ap.add_argument("--auth", choices=["auto", "key", "legacy"], default="auto",
+                    help="scratch credential: API key via edge.auth CLI, or legacy random ADMIN_TOKEN")
     args = ap.parse_args()
     if args.runs < 20:
         raise SystemExit("--runs must be >= 20")
@@ -200,11 +298,13 @@ def main() -> None:
     port = args.port or free_port()
     base = f"http://127.0.0.1:{port}"
     data_dir = Path(tempfile.mkdtemp(prefix="edge_bench_"))
-    env = {**os.environ, "EDGE_DATA_DIR": str(data_dir), "EDGE_LAN_PORT": "0", "FORCE_OFFLINE": "0",
-           "DEMO_MODE": "0"}
-    env.pop("BUNDLE_PATH", None)
-    if not args.with_cloud:  # synthetic frames must not reach Rekognition or the cloud decision ledger
-        env["CLOUD_API_URL"] = ""
+    env = scratch_env(data_dir, args.with_cloud)
+    try:
+        auth = scratch_auth(args.auth, env)
+    except BaseException:
+        shutil.rmtree(data_dir, ignore_errors=True)
+        raise
+    print(f"scratch edge credential: {auth.describe()}")
     src_bundle = ROOT / "edge" / "data" / "bundle.signed.json"
     bundle_sha = sha256_file(src_bundle)
     if src_bundle.is_file():  # copy: the scratch edge never writes next to the live edge's files
@@ -222,20 +322,22 @@ def main() -> None:
         startup_s = wait_ready(base, proc)
         with httpx.Client(base_url=base, timeout=30.0) as c:
             health = c.get("/v1/health").json()
-            mode = c.get("/v1/mode").json()
-            admin = {"X-Admin-Token": os.environ.get("ADMIN_TOKEN", "")}
+            mode = mode_detail(c, auth)
             frames = [synth.jpeg(synth.base_frame(shift_px=s, size=size)) for s in (-8, -4, 0, 4, 8)]
             files = {f"frame_{i}": (f"f{i}.jpg", b, "image/jpeg") for i, b in enumerate(frames)}
             meta = {"user_id": "u_3c4d", "display_name": "Synthetic", "role": "student", "consent": True,
                     "consent_version": "bench", "provision_totp": False}
-            er = c.post("/v1/enroll", files=files, data={"meta": json.dumps(meta)}, headers=admin)
+            er = c.post("/v1/enroll", files=files, data={"meta": json.dumps(meta)}, headers=auth.headers())
+            check_auth(er, "POST /v1/enroll", auth)
             enrolled = er.status_code == 201
+            if not enrolled:
+                print(f"WARNING: enrolment failed (HTTP {er.status_code}); 1:N match runs on an empty gallery")
             kiosk = health["detail"]["kiosk_id"]
             reset = not args.no_reset_rate_limit
             for _ in range(args.warmup):
-                attempt(c, kiosk, size, admin, reset)
+                attempt(c, kiosk, size, auth, reset)
             load_start = os.getloadavg()
-            runs = [attempt(c, kiosk, size, admin, reset) for _ in range(args.runs)]
+            runs = [attempt(c, kiosk, size, auth, reset) for _ in range(args.runs)]
             load_end = os.getloadavg()
             mode_after = c.get("/v1/mode").json()
     finally:
@@ -251,7 +353,7 @@ def main() -> None:
            "startup_s": startup_s, "enrolled": enrolled, "reset": reset, "thr_sha": thr_sha, "thr": thr,
            "bundle_sha": bundle_sha, "bundle_copied": src_bundle.is_file(), "proc_rc": proc.returncode,
            "load": {"before_spawn": load_before, "before_runs": load_start, "after_runs": load_end},
-           "log_path": log_path}
+           "log_path": log_path, "auth": auth.describe()}
     write_csv(csv_path, runs, size)
     write_report(args, out, csv_path, runs, ctx)
 
@@ -325,7 +427,8 @@ Command (from the project root): `{cmd}`
 
 Raw per-attempt values: `{rel_csv}` ({len(runs)} rows). The script spawned its own `uvicorn edge.app:app` on
 scratch port {ctx['port']} (127.0.0.1) with a temp `EDGE_DATA_DIR` holding a copy of
-`edge/data/bundle.signed.json`, `CLOUD_API_URL=""`, `EDGE_LAN_PORT=0`, `FORCE_OFFLINE=0`, `DEMO_MODE=0`. It ran
+`edge/data/bundle.signed.json`, `CLOUD_API_URL=""`, `EDGE_LAN_PORT=0`, `FORCE_OFFLINE=0`, `DEMO_MODE=0`, a fresh
+random `EDGE_DATA_KEY`; admin calls authenticated with {ctx['auth']}. It ran
 {args.warmup} warm-up attempts, then {len(runs)} sequential measured attempts. The scratch edge was stopped
 afterwards (exit code {ctx['proc_rc']}) and its temp data dir deleted. The live edge (:8000/:8001) was not touched.
 

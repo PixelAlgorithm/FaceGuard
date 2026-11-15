@@ -122,6 +122,11 @@ def send(env: Env, rid: str, req: dict[str, Any], *, body: Any = ..., frames: li
     path = route["path"].format(**(req.get("path_params") or {}))
     headers = {k: (EDGE_ADMIN if v == "<ADMIN_TOKEN>" else v) for k, v in (req.get("headers") or {}).items()}
     body = req.get("body") if body is ... else body
+    if rid == "edge.access.codes.rotate" and "X-Admin-Token" in headers:
+        # RBAC v2 D: codes are minted for a signed-in staff member (own staff_id), never for the legacy token
+        sid = str((body or {}).get("staff_id") or "")
+        user = sid.removeprefix("s_") if re.fullmatch(r"s_[a-z][a-z0-9_]{1,30}", sid) else "guard01"
+        headers = {k: v for k, v in headers.items() if k != "X-Admin-Token"} | env.staff(user)
     kw: dict[str, Any] = {"headers": headers, "params": req.get("query") or None}
     if req.get("content_type") == "multipart/form-data":
         jp = frames if frames is not None else _face_frames()[: int(req.get("frames") or 5)]
@@ -298,6 +303,17 @@ def _enrol_fail(env: Env) -> None:
                                                               "message": "rekognition denied"}}, {})
 
 
+def _enrol_transport_fail(env: Env) -> None:
+    """The cloud enrol call times out (transport error) after the local template was stored."""
+    _create("u_kv02")(env)
+    from edge.cloud_client import CloudUnavailable
+
+    async def timed_out(*_a: Any, **_k: Any) -> dict[str, Any]:
+        raise CloudUnavailable("cloud enrol timed out")
+
+    env.ctx.cloud.enroll = timed_out
+
+
 def _readmit_prj1(env: Env) -> None:
     out = env.put("u_prj1", {"display": "Prajwal M.", "role": "student", "consent": True, "actor": "register"})
     assert out["readmitted"] and out["bundle"]["applied"] and out["user"]["in_bundle"], out
@@ -379,6 +395,8 @@ VALID_SPECS: dict[tuple[str, str], dict[str, Any]] = {
                                                          "keys": ENROLL_KEYS + ["warnings"]},
     ("edge.enroll.post", "online_cloud_failed"): {"app": {"models": True}, "prep": _enrol_fail,
                                                   "keys": ENROLL_KEYS},
+    ("edge.enroll.post", "cloud_transport_failed"): {"app": {"models": True}, "prep": _enrol_transport_fail,
+                                                     "keys": ENROLL_KEYS + ["cloud.status"]},
     ("edge.enroll.post", "offline_existing_bundle_user"): {"app": {"models": True}, "prep": _offline_with_totp,
                                                            "keys": ENROLL_KEYS + ["cloud", "totp_provisioning_uri"]},
     ("edge.enroll.post", "online_after_readmit"): {"app": {"models": True}, "prep": _readmit_prj1,

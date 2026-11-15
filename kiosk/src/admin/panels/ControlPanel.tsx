@@ -1,6 +1,6 @@
 /** Mode (SC2), sync, demo clock (SC1), random challenge (§3.14a) and the kiosk selector. */
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
-import { RANDOM_CHALLENGE_MODES, getApi, type RandomChallengeMode } from '../../api'
+import { RANDOM_CHALLENGE_MODES, getApi, type ModeResponse, type RandomChallengeMode } from '../../api'
 import { DEFAULT_KIOSK_ID, KIOSK_IDS, STORAGE_KEYS, getKioskId, kioskIdSource, writeLocal } from '../../config'
 import { errorText } from '../../shared/accessDirectory'
 import { HHMM_WRITE, defaultDemoTime, isRollbackTime } from '../../shared/accessRules'
@@ -8,6 +8,7 @@ import { ModeBadge } from '../../shared/ModeBadge'
 import { refreshMode, useModeStatus } from '../../shared/modeStore'
 import { toast } from '../../shared/toast'
 import { fmtTime } from '../format'
+import { PERM } from '../../shared/auth/permissions'
 import { ActionButton, Card, KeyVal } from '../ui'
 
 const RANDOM_HELP: Record<RandomChallengeMode, string> = {
@@ -26,9 +27,11 @@ function subscribeStorage(cb: () => void) {
   }
 }
 
-export function ControlPanel({ token }: { token: string }) {
+/** `detail`: GET /v1/admin/mode/detail (store:read); without it only the public /v1/mode subset is shown. */
+export function ControlPanel({ token, detail = null }: { token: string; detail?: ModeResponse | null }) {
   const api = getApi()
-  const { mode, reachable, error } = useModeStatus()
+  const { mode: publicMode, reachable, error } = useModeStatus()
+  const mode = detail ?? publicMode
   const kioskId = useSyncExternalStore(subscribeStorage, getKioskId)
   const dc = mode?.demo_clock ?? null
   // R-E: default = max(now_local, earliest_local) of the edge's demo clock (never a rollback by default)
@@ -83,9 +86,9 @@ export function ControlPanel({ token }: { token: string }) {
 
       <p className="mb-2 text-xs font-bold tracking-wide text-[#52514e] uppercase">Connectivity (SC2)</p>
       <div className="flex flex-wrap items-start gap-2">
-        <ActionButton label="Force OFFLINE" tone="danger" disabled={!token} run={() => after(api.setMode(token, 'OFFLINE'), 'Forced OFFLINE')} />
-        <ActionButton label="AUTO (reconnect)" tone="primary" disabled={!token} run={() => after(api.setMode(token, 'AUTO'), 'Mode AUTO: reconnecting')} />
-        <ActionButton label="Sync now" disabled={!token} run={() => after(api.triggerSync(token), 'Sync done')} />
+        <ActionButton label="Force OFFLINE" perm={PERM.modeSwitch} tone="danger" disabled={!token} run={() => after(api.setMode(token, 'OFFLINE'), 'Forced OFFLINE')} />
+        <ActionButton label="AUTO (reconnect)" perm={PERM.modeSwitch} tone="primary" disabled={!token} run={() => after(api.setMode(token, 'AUTO'), 'Mode AUTO: reconnecting')} />
+        <ActionButton label="Sync now" perm={PERM.syncRun} disabled={!token} run={() => after(api.triggerSync(token), 'Sync done')} />
       </div>
 
       <div className="mt-4 border-t border-[#e1e0d9] pt-3">
@@ -120,6 +123,7 @@ export function ControlPanel({ token }: { token: string }) {
           />
           <ActionButton
             label="Set clock"
+            perm={PERM.demoClock}
             tone="primary"
             disabled={!token || !clockOk || !demoMode}
             run={() => {
@@ -139,6 +143,7 @@ export function ControlPanel({ token }: { token: string }) {
           />
           <ActionButton
             label="Reset to real time"
+            perm={PERM.demoClock}
             disabled={!token || !demoMode}
             run={() =>
               after(api.setDemoClock(token, { reset: true }), 'Demo clock reset to real time').then((r) => {
@@ -176,6 +181,7 @@ export function ControlPanel({ token }: { token: string }) {
             <ActionButton
               key={m}
               label={m}
+              perm={PERM.challengeControl}
               disabled={!token}
               tone={mode?.random_challenge === m ? 'primary' : 'default'}
               run={() => after(api.setRandomChallenge(token, m), `Random challenge: ${m}`)}
@@ -184,7 +190,7 @@ export function ControlPanel({ token }: { token: string }) {
         </div>
         <p className="mt-1 text-xs text-[#898781]">
           {mode?.random_challenge ? `${mode.random_challenge}: ${RANDOM_HELP[mode.random_challenge]}. ` : ''}Only a would-be ALLOW is ever converted
-          (DEMO_MODE=1).
+          (DEMO_MODE=1).{!demoMode ? ' This edge reports no demo clock: without DEMO_MODE=1 the edge grants nobody challenge:control.' : ''}
         </p>
       </div>
 

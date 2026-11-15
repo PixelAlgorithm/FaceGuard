@@ -19,6 +19,8 @@ import uuid
 from dataclasses import dataclass, field
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024  # Rekognition limit for Image.Bytes
+DELETE_FACES_BATCH = 4096  # Rekognition DeleteFaces FaceIds limit per call (larger lists are chunked, never cut)
+FACE_GONE = "FACE_NOT_FOUND"  # UnsuccessfulFaceDeletions reason that still means "not in the collection"
 _MARKER_RE = re.compile(rb"HIDFAKE:([A-Za-z0-9_.:;=\-]+)")
 
 
@@ -212,10 +214,20 @@ class RekognitionFaces:
     def delete_faces(self, face_ids: list[str]) -> list[str]:
         """Faces still associated with a user are NOT deleted (UnsuccessfulFaceDeletions reason
         ASSOCIATED_TO_AN_EXISTING_USER): DisassociateFaces or DeleteUser first."""
-        if not face_ids:
-            return []
-        r = self._call(self._c.delete_faces, CollectionId=self.collection_id, FaceIds=face_ids[:4096])
-        return list(r.get("DeletedFaces", []))
+        return self.delete_faces_detailed(face_ids)[0]
+
+    def delete_faces_detailed(self, face_ids: list[str]) -> tuple[list[str], dict[str, list[str]]]:
+        """(deleted, refused face_id -> reasons) over every id, in chunks of DELETE_FACES_BATCH."""
+        deleted: list[str] = []
+        refused: dict[str, list[str]] = {}
+        for i in range(0, len(face_ids), DELETE_FACES_BATCH):
+            r = self._call(self._c.delete_faces, CollectionId=self.collection_id,
+                           FaceIds=face_ids[i:i + DELETE_FACES_BATCH])
+            deleted += list(r.get("DeletedFaces", []))
+            for u in r.get("UnsuccessfulFaceDeletions", []) or []:
+                if u.get("FaceId"):
+                    refused[u["FaceId"]] = list(u.get("Reasons") or [])
+        return deleted, refused
 
     def list_user_faces(self, user_id: str) -> list[str]:
         out: list[str] = []
@@ -401,10 +413,21 @@ class FakeFaces:
 
     def delete_faces(self, face_ids: list[str]) -> list[str]:
         """Like Rekognition: a face still associated with a user is not deleted (ASSOCIATED_TO_AN_EXISTING_USER)."""
+        return self.delete_faces_detailed(face_ids)[0]
+
+    def delete_faces_detailed(self, face_ids: list[str]) -> tuple[list[str], dict[str, list[str]]]:
         self._maybe_fail("DeleteFaces")
         with self._lock:
             owned = {f for fids in self._users.values() for f in fids}
-            return [f for f in face_ids if f not in owned and self._faces.pop(f, None) is not None]
+            deleted, refused = [], {}
+            for f in face_ids:
+                if f in owned:
+                    refused[f] = ["ASSOCIATED_TO_AN_EXISTING_USER"]
+                elif self._faces.pop(f, None) is not None:
+                    deleted.append(f)
+                else:
+                    refused[f] = [FACE_GONE]
+            return deleted, refused
 
     def list_user_faces(self, user_id: str) -> list[str]:
         self._maybe_fail("ListFaces")

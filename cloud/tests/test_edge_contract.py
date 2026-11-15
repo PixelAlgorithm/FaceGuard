@@ -53,7 +53,7 @@ def _body(items: list[dict], head: str) -> bytes:
 
 
 def test_edge_request_signer_is_accepted(client):
-    r = _edge_request(client, "GET", "/v1/revocations", query="since=0")  # edge signs the bare path
+    r = _edge_request(client, "GET", "/v1/revocations?since=0")  # KioskAuth signs raw_path (path + "?query")
     assert r.status_code == 200, r.text
 
 
@@ -62,9 +62,12 @@ def test_cloud_bundle_verifies_with_edge_verifier(client):
     b = r.json()
     assert bundle_mod.verify_bundle(b, BUNDLE_KEY.encode("utf-8")) is True
     assert "KIOSK_LIB_01" in b["kiosks"] and "KIOSK_LIB_01" in b["scope"]["kiosk_ids"]  # BundleStore._acceptable
-    inm = {"If-None-Match": f'"{b["bundle_version"]}"'}
+    inm = {"If-None-Match": r.headers["etag"]}  # the edge stores and resends the full ETag it received
     r2 = _edge_request(client, "GET", "/v1/schedule/KIOSK_LIB_01", headers=inm)
-    assert r2.status_code == 304  # SyncAgent._pull_bundle sends '"<version>"'
+    assert r2.status_code == 304
+    derived = getattr(sync_mod, "derived_etag", None)
+    if derived is not None:  # after a restart the edge derives it from the installed bundle: same value
+        assert derived(b) == r.headers["etag"]
 
 
 def test_edge_sync_items_accepted_idempotent_and_chain_clean(client):

@@ -24,7 +24,7 @@ def test_synthetic_flag_explicit_and_prefix(signed, services):
     _sync(signed, [make_record("att_real_1"),
                    make_record("att_flagged_1", synthetic=True),
                    make_record("att_smoke_abc_0")])
-    rows = {k: v for k, v in services.kv.list("decisions")}
+    rows = {k.split("|", 1)[1]: v for k, v in services.kv.list("decisions")}  # keys are <kiosk_id>|<attempt_id>
     assert rows["att_real_1"]["synthetic"] is False
     assert rows["att_flagged_1"]["synthetic"] is True and rows["att_smoke_abc_0"]["synthetic"] is True
     dims = [(r["name"], r["dims"].get("Synthetic")) for r in services.metrics.records

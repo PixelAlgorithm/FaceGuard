@@ -10,6 +10,8 @@ How the file is used (its own `how_to_test`):
   app's status, error.code and error.reason must match (message is informative text only).
 
 Hermetic: in-memory store, fake face backend, FixedClock; the signature window uses real time on both sides.
+Admin credential (design v2 §E): the production path, an edge_proxy API key bound to KIOSK_MAIN_01
+(`Authorization: Bearer fgk_...`); cloud.admin.audit needs audit:read, so it is replayed with an auditor key.
 """
 
 from __future__ import annotations
@@ -21,18 +23,29 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import pytest
+from edge.auth import tokens
 from pydantic import BaseModel, ValidationError
 
+from cloud.app import rbac
 from cloud.app import schemas as S
 from cloud.app.services import schedule_service as sched_mod
 from cloud.tools.fakeimg import make_fake_jpeg
 
-from .conftest import ADMIN, Signed
+from .conftest import Signed, make_settings
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT = json.loads((ROOT / "docs" / "contracts" / "admin_access.examples.json").read_text(encoding="utf-8"))
 ROUTES = {r["id"]: r for r in CONTRACT["routes"] if r["side"] == "cloud"}
 KIOSK = "KIOSK_MAIN_01"
+_PROXY_SECRET, _AUDIT_SECRET = "p" * 43, "a" * 43
+PROXY_KEY = f"fgk_edgeprx1.{_PROXY_SECRET}"
+AUDITOR_KEY = f"fgk_auditrr1.{_AUDIT_SECRET}"
+KEY_ENTRIES = [
+    {"key_id": "edgeprx1", "sha256": tokens.digest(_PROXY_SECRET), "roles": ["edge_proxy"], "name": "main-edge",
+     "kiosk_ids": [KIOSK]},
+    {"key_id": "auditrr1", "sha256": tokens.digest(_AUDIT_SECRET), "roles": ["auditor"], "name": "dashboard"},
+]
+WRONG_CREDENTIAL_EXAMPLES = {"admin_token_wrong", "admin_key_wrong"}
 
 REQUEST_MODELS: dict[str, type[BaseModel] | None] = {
     "cloud.admin.users.list": None,
@@ -133,6 +146,16 @@ def test_invalid_request_is_rejected_by_the_model(route_id, er):
 
 # ------------------------------------------------------------------ live: replay against the app
 @pytest.fixture
+def settings():
+    return make_settings(cloud_api_keys=rbac.parse_api_keys(json.dumps(KEY_ENTRIES)))
+
+
+def admin_headers(route_id: str) -> dict[str, str]:
+    key = AUDITOR_KEY if route_id == "cloud.admin.audit" else PROXY_KEY
+    return {"Authorization": f"Bearer {key}"}
+
+
+@pytest.fixture
 def main(client) -> Signed:
     return Signed(client, kiosk=KIOSK)
 
@@ -143,7 +166,7 @@ def call(c: Signed, route_id: str, req: dict, *, admin: bool | None = None, key:
     if req.get("query"):
         path += "?" + urlencode(req["query"])
     want_admin = route["auth"] == "cloud_kiosk_hmac_admin" if admin is None else admin
-    headers = {"X-Admin-Token": ADMIN} if want_admin else {}
+    headers = admin_headers(route_id) if want_admin else {}
     signer = c if key is None else Signed(c.c, kiosk=c.kiosk, key=key)
     return signer.request(route["method"], path, json_body=req.get("body"), headers=headers)
 
@@ -164,7 +187,8 @@ def erase_state(c: Signed) -> None:
 
 
 def status_of(c: Signed, uid: str) -> str:
-    users = {u["user_id"]: u for u in c.get("/v1/admin/users", headers={"X-Admin-Token": ADMIN}).json()["users"]}
+    users = {u["user_id"]: u
+             for u in c.get("/v1/admin/users", headers=admin_headers("cloud.admin.users.list")).json()["users"]}
     return users[uid]["status"] if uid in users else "ABSENT"
 
 
@@ -186,7 +210,7 @@ def test_invalid_request_is_a_422_without_reason(main, services, route_id, er):
 def test_state_error_status_code_and_reason(main, services, monkeypatch, route_id, er):
     name = er["name"]
     kw: dict = {}
-    if name == "admin_token_wrong":
+    if name in WRONG_CREDENTIAL_EXAMPLES:
         kw["admin"] = False
     elif name == "hmac_invalid":
         kw["key"] = "x" * 64
@@ -202,8 +226,12 @@ def test_state_error_status_code_and_reason(main, services, monkeypatch, route_i
         assert status_of(main, "u_prj1") == "ERASED"
     elif name in {"revoked_consent_without_restore", "already_revoked"}:
         assert status_of(main, "u_a3b4") == "REVOKED"
+    elif name == "staff_id_taken":  # the staff_id already belongs to another kiosk (SC2 D8)
+        services.schedule.rotate_codes(er["request"]["body"]["staff_id"], 1, kiosk_id="KIOSK_LIB_01")
+    elif name == "too_many_active_codes":  # the staff_id already holds the maximum of 10 active codes
+        services.schedule.rotate_codes(er["request"]["body"]["staff_id"], 10, kiosk_id=KIOSK)
     elif name in {"unknown_role", "unknown_zone", "create_without_consent", "create_without_display",
-                  "unknown_user"}:
+                  "unknown_user", "actor_invalid"}:
         pass  # baseline seed state (u_kv02 / u_zz99 absent, u_3c4d ACTIVE)
     else:
         pytest.fail(f"contract error example {route_id}:{name} has no state set-up in this test: add one")
@@ -285,7 +313,7 @@ def test_revocation_example(main, services):
     assert status_of(main, "u_3c4d") == "REVOKED"
     seq1, _ = services.schedule.revocations_since(0)
     again = call(main, "cloud.admin.revocations.post",  # a fresh signature (the replay cache refuses a resend)
-                 {"body": {**ex["request"]["body"], "actor": "again"}})
+                 {"body": {**ex["request"]["body"], "actor": "staff:s_again01"}})
     assert again.status_code == 409 and again.json()["error"]["reason"] == "ALREADY_REVOKED"
     assert services.schedule.revocations_since(0)[0] == seq1  # no new seq
 
@@ -310,7 +338,7 @@ def test_feed_example_erase_readmit_revoke_restore(main, services):
     since, _ = services.schedule.revocations_since(0)
     erase_state(main)
     assert put_access(main, "u_prj1", {"display": "Prajwal M.", "role": "student", "consent": True,
-                                       "actor": "register"}).json()["readmitted"] is True
+                                       "actor": "staff:s_enroller01"}).json()["readmitted"] is True
     assert call(main, "cloud.admin.revocations.post",
                 {"body": {"type": "USER", "target_id": "u_3c4d", "reason": "ADMIN"}}).status_code == 201
     assert put_access(main, "u_a3b4", {"role": "student", "consent": True, "restore": True}).json()["restored"]
@@ -327,9 +355,9 @@ def test_feed_example_erase_readmit_revoke_restore(main, services):
 def test_audit_example(main, services):
     ex = ROUTES["cloud.admin.audit"]["examples"][0]
     assert put_access(main, "u_kv02", {"display": "Prof. Arjun T.", "role": "faculty", "consent": True,
-                                       "actor": "register"}).status_code == 200
+                                       "actor": "staff:s_enroller01"}).status_code == 200
     rot = call(main, "cloud.admin.codes.rotate", {"body": {"staff_id": "s_guard01", "count": 4,
-                                                           "actor": "control-panel"}}).json()
+                                                           "actor": "staff:s_admin01"}}).json()
     r = call(main, "cloud.admin.audit", ex["request"])
     assert r.status_code == 200, r.text
     body = r.json()

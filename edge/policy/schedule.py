@@ -100,6 +100,14 @@ def revoked_at_or_before(bundle: Mapping[str, Any], user_id: str, user: Mapping[
     return False
 
 
+def revoked_any(bundle: Mapping[str, Any], user_id: str, user: Mapping[str, Any] | None) -> bool:
+    """Deny-only, time-agnostic: ANY revocation for the user (any revoked_at, or the user's revoked flag). Used when
+    the edge clock is untrusted (cache INVALID, audit F04) and before a step-up ALLOW (F11)."""
+    if any(isinstance(r, Mapping) and r.get("user_id") == user_id for r in bundle.get("revocations") or []):
+        return True
+    return bool(user and user.get("revoked"))
+
+
 def _within(valid_from: Any, valid_until: Any, t: datetime) -> bool:
     """Half-open validity [valid_from, valid_until); unparsable bound -> not within (fail secure)."""
     if valid_from is not None:
@@ -193,12 +201,7 @@ def _intervals(bundle: Mapping[str, Any], user: Mapping[str, Any], role_name: st
         iv = _to_interval(entry, d, tz)
         if iv:
             out.append(iv)
-    yesterday = d - timedelta(days=1)
-    for entry in _window_entries(bundle, user, role_name, role, zone, yesterday, vp):
-        if _crosses_midnight(entry):  # a crossing window belongs to the day it starts on
-            iv = _to_interval(entry, yesterday, tz)
-            if iv:
-                out.append(iv)
+    out += _crossing_from(bundle, user, role_name, role, zone, d - timedelta(days=1), vp, tz)
     if role_name == "visitor" and vp is not None:
         lo, hi = parse_ts(vp.get("valid_from")), parse_ts(vp.get("valid_until"))
         clipped = []
@@ -207,6 +210,23 @@ def _intervals(bundle: Mapping[str, Any], user: Mapping[str, Any], role_name: st
             if s2 < e2:
                 clipped.append((s2, e2))
         out = clipped
+    return out
+
+
+def _crossing_from(bundle: Mapping[str, Any], user: Mapping[str, Any], role_name: str, role: Mapping[str, Any],
+                   zone: str, day: date, vp: Mapping[str, Any] | None, tz: ZoneInfo, *,
+                   on_holiday: bool = False) -> list[Interval]:
+    """Midnight-crossing windows that START on `day` (a crossing window belongs to the day it starts on). A holiday
+    on `day` closes the whole window, its tail after midnight included (F02): such windows are returned only
+    with on_holiday=True (to report HOLIDAY instead of OUTSIDE_WINDOW)."""
+    if _holiday_applies(bundle, role_name, zone, day) != on_holiday:
+        return []
+    out: list[Interval] = []
+    for entry in _window_entries(bundle, user, role_name, role, zone, day, vp):
+        if _crosses_midnight(entry):
+            iv = _to_interval(entry, day, tz)
+            if iv:
+                out.append(iv)
     return out
 
 
@@ -231,13 +251,18 @@ def _holiday_applies(bundle: Mapping[str, Any], role_name: str, zone: str, d: da
 
 # ---------------------------------------------------------------- public API
 def evaluate_schedule(user_id: str, zone: str, t0: datetime, bundle: Mapping[str, Any],
-                      cfg: Mapping[str, Any]) -> str:
-    """Schedule result for `user_id` entering `zone` at `t0` (precedence = most restrictive first)."""
+                      cfg: Mapping[str, Any], *, revocation_slack_s: float = 0.0) -> str:
+    """Schedule result for `user_id` entering `zone` at `t0` (precedence = most restrictive first).
+
+    `revocation_slack_s` (live edge decisions only, audit F03): a revocation the edge already HOLDS counts when its
+    revoked_at <= t0 + slack, so an edge clock running up to `slack` behind the cloud cannot ignore it. The cloud's
+    re-evaluation at ts_utc keeps the strict default 0 (time-aware, SC2.6 rule 3). Only ever adds revocations."""
     _require_aware(t0, "t0")
     risk = zone_risk(bundle, zone)  # unknown zone -> KeyError (caller: SYSTEM_ERROR)
     t = t0.astimezone(_tz(bundle))
     user = (bundle.get("users") or {}).get(user_id)
-    if revoked_at_or_before(bundle, user_id, user if isinstance(user, Mapping) else None, t0):
+    at = t0 + timedelta(seconds=max(0.0, float(revocation_slack_s)))
+    if revoked_at_or_before(bundle, user_id, user if isinstance(user, Mapping) else None, at):
         return REVOKED  # DECISION_POLICY §5 precedence: REVOKED first (also for users absent from users{})
     if not isinstance(user, Mapping):
         return NO_ENTITLEMENT
@@ -253,10 +278,14 @@ def evaluate_schedule(user_id: str, zone: str, t0: datetime, bundle: Mapping[str
     if zone not in permitted_zones(bundle, user, role, vp):
         return ZONE_NOT_PERMITTED
     if _holiday_applies(bundle, role_name, zone, t.date()):
-        return HOLIDAY
-    intervals = _intervals(bundle, user, role_name, role, zone, t, vp)
+        return HOLIDAY  # today's holiday also closes the tail of yesterday's crossing windows (most restrictive)
+    intervals = _intervals(bundle, user, role_name, role, zone, t, vp)  # holiday-start tails already dropped
     if any(s <= t < e for s, e in intervals):
-        return IN_WINDOW
+        return IN_WINDOW  # P5: a valid window of a non-holiday day wins
+    closed = _crossing_from(bundle, user, role_name, role, zone, t.date() - timedelta(days=1), vp, _tz(bundle),
+                            on_holiday=True)
+    if any(s <= t < e for s, e in closed):
+        return HOLIDAY  # F02: inside the post-midnight tail of a window whose start day is a holiday
     g = int(cfg["grace_minutes_high_risk"] if risk == "high" else cfg["grace_minutes"])
     if g > 0:
         gd = timedelta(minutes=g)
@@ -294,14 +323,16 @@ def day_windows(bundle: Mapping[str, Any], user_id: str, zone: str, d: date) -> 
     return sorted(out, key=lambda x: (_minutes(x["start"]), _minutes(x["end"])))
 
 
-def entitled_user_ids(bundle: Mapping[str, Any] | None, zone: str, at: datetime) -> set[str]:
+def entitled_user_ids(bundle: Mapping[str, Any] | None, zone: str, at: datetime, *,
+                      revocation_slack_s: float = 0.0) -> set[str]:
     """Users who may be permitted in `zone` at `at` (not revoked, valid, zone permitted)."""
     _require_aware(at, "at")
     if not bundle or zone not in (bundle.get("zones") or {}):
         return set()
     out = set()
+    rev_at = at + timedelta(seconds=max(0.0, float(revocation_slack_s)))
     for uid, user in (bundle.get("users") or {}).items():
-        if not isinstance(user, Mapping) or revoked_at_or_before(bundle, uid, user, at):
+        if not isinstance(user, Mapping) or revoked_at_or_before(bundle, uid, user, rev_at):
             continue
         if not _within(user.get("valid_from"), user.get("valid_until"), at):
             continue

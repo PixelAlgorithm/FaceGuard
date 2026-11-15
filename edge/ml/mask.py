@@ -9,6 +9,12 @@ brow and eyelids (a few directions, varying radius). Per eye:
 Score = mean over both eyes of clip((coverage - C0) / (C1 - C0), 0, 1).
 R0/R1/K/RADIUS_TOL/C0/C1 are feature-definition constants; the cue bands are
 liveness.mask.m2_ring_score_weak / _strong in thresholds.yaml. [cal] uncalibrated: soft evidence.
+
+Gradients are computed on a region of interest only: the face box plus both eye annuli plus
+ROI_MARGIN_PX (blur + Sobel support + bilinear tap), clamped to the frame. Every sampled gradient is
+far enough from an interior ROI edge that it equals the full-frame value, and the frame borders stay
+where they were, so the signal is unchanged while a 4096 x 4096 frame no longer costs ~281 MB of
+float32 temporaries per call (audit EM-08).
 """
 
 from __future__ import annotations
@@ -25,6 +31,9 @@ K = 3.0
 RADIUS_TOL = 0.08
 C0, C1 = 0.35, 0.90
 MIN_IOD_PX = 30.0
+# GaussianBlur(sigma 1.0) on float32 uses a 9-tap kernel (radius 4) + Sobel 3x3 (radius 1) + the
+# bilinear remap's second tap (1) = 6 px of support; 8 px leaves slack. Geometry, not a threshold.
+ROI_MARGIN_PX = 8
 
 _theta = np.linspace(0.0, 2 * np.pi, ANGLES, endpoint=False)
 _rad = np.linspace(R0, R1, N_R)
@@ -53,6 +62,19 @@ def _eye_coverage(gx: np.ndarray, gy: np.ndarray, centre: np.ndarray, iod: float
     return float(consistent.mean())
 
 
+def _roi(kps: np.ndarray, iod: float, box: tuple[int, int, int, int], w: int, h: int) -> tuple[int, int, int, int]:
+    """Frame-clamped bounds covering the face box and both eye annuli plus ROI_MARGIN_PX."""
+    reach = R1 * iod
+    eyes = kps[:2]
+    lo_x = min(float(box[0]), float(eyes[:, 0].min()) - reach) - ROI_MARGIN_PX
+    lo_y = min(float(box[1]), float(eyes[:, 1].min()) - reach) - ROI_MARGIN_PX
+    hi_x = max(float(box[2]), float(eyes[:, 0].max()) + reach) + ROI_MARGIN_PX
+    hi_y = max(float(box[3]), float(eyes[:, 1].max()) + reach) + ROI_MARGIN_PX
+    rx1, ry1 = int(np.clip(np.floor(lo_x), 0, box[0])), int(np.clip(np.floor(lo_y), 0, box[1]))
+    rx2, ry2 = int(np.clip(np.ceil(hi_x), box[2], w)), int(np.clip(np.ceil(hi_y), box[3], h))
+    return rx1, ry1, rx2, ry2
+
+
 def mask_ring_signal(bgr: np.ndarray, face: FaceBox | None) -> MaskRingSignal:
     if face is None:
         return MaskRingSignal(mask_edge_ring=None)
@@ -62,11 +84,14 @@ def mask_ring_signal(bgr: np.ndarray, face: FaceBox | None) -> MaskRingSignal:
         return MaskRingSignal(mask_edge_ring=None)
     h, w = bgr.shape[:2]
     x1, y1, x2, y2 = face.clipped(w, h)
-    gray = cv2.GaussianBlur(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32), (0, 0), 1.0)
+    rx1, ry1, rx2, ry2 = _roi(kps, iod, (x1, y1, x2, y2), w, h)
+    roi = bgr[ry1:ry2, rx1:rx2]
+    gray = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY).astype(np.float32), (0, 0), 1.0)
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    mag = np.hypot(gx[y1:y2, x1:x2], gy[y1:y2, x1:x2])
+    mag = np.hypot(gx[y1 - ry1:y2 - ry1, x1 - rx1:x2 - rx1], gy[y1 - ry1:y2 - ry1, x1 - rx1:x2 - rx1])
     norm = float(np.median(mag)) + 1.0
-    cov = [_eye_coverage(gx, gy, kps[i], iod, norm) for i in (0, 1)]
+    offset = np.array([rx1, ry1], dtype=np.float32)
+    cov = [_eye_coverage(gx, gy, kps[i] - offset, iod, norm) for i in (0, 1)]
     score = float(np.mean([np.clip((c - C0) / (C1 - C0), 0.0, 1.0) for c in cov]))
     return MaskRingSignal(mask_edge_ring=round(score, 4), coverage=[round(c, 3) for c in cov])

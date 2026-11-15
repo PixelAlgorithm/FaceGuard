@@ -15,6 +15,8 @@ import copy
 import json
 from datetime import timedelta
 
+import pytest
+
 from edge.offline.bundle import sign_bundle
 from edge.offline.store import iso_utc
 from edge.offline.sync import RevocationOverlay
@@ -95,7 +97,7 @@ def test_legacy_overlay_file_with_an_erased_deny_entry_is_migrated_on_load(tmp_p
     assert ov.seq == 9
     assert [(e["user_id"], e["reason"]) for e in ov.entries()] == [("u_1a2b", "ADMIN"), ("u_prj1", "ERASED")]
     assert ov.reason("u_prj1") == "ERASED" and ov.reason("u_1a2b") == "ADMIN"
-    ov.apply({"items": [_readmit("u_prj1", "2026-11-14T12:45:00Z")], "revocation_seq": 11})
+    ov.apply({"items": [{**_readmit("u_prj1", "2026-11-14T12:45:00Z"), "seq": 11}], "revocation_seq": 11})
     again = RevocationOverlay(path, TEST_DATA_KEY)
     assert again.reason("u_prj1") is None and again.reason("u_1a2b") == "ADMIN" and again.seq == 11
     assert [e["user_id"] for e in again.entries()] == ["u_1a2b"]  # the legacy erasure no longer blocks
@@ -219,14 +221,46 @@ def test_reinstate_user_drops_only_erasure_state(make_rt, cloud):
     assert rt.reinstate_user("u_1a2b") is False and rt.overlay.reason("u_1a2b") == "ADMIN"
 
 
-def test_reinstate_user_cancels_a_not_yet_run_purge(make_rt, cloud):
-    """Overlay applied without the runtime (or a crash before the purge): re-enrolment wins over a stale purge."""
+def test_reinstate_user_completes_a_not_yet_run_purge_first(make_rt, cloud):
+    """Overlay applied without the runtime (or a crash before the purge): EO-05 -- the pre-erasure data is purged
+    BEFORE the re-enrolment is accepted (exactly once), never silently kept as the new identity anchor."""
     rt = make_rt(cloud)
     calls = _hooked(rt)
     rt.overlay.apply({"items": [_erase("u_3c4d", _t(-2))], "revocation_seq": 1})
     assert rt.reinstate_user("u_3c4d") is True
     rt.tick()
-    assert calls == [] and rt.credentials.totp_secret("u_3c4d") is not None
+    assert calls == ["u_3c4d"] and rt.credentials.totp_secret("u_3c4d") is None
+
+
+def test_reinstate_user_refuses_while_the_old_purge_keeps_failing(make_rt, cloud):
+    rt = make_rt(cloud)
+    rt.add_erase_hook(lambda uid: (_ for _ in ()).throw(OSError("disk full")))
+    rt.overlay.apply({"items": [_erase("u_3c4d", _t(-2))], "revocation_seq": 1})
+    rt.apply_erasures()
+    with pytest.raises(RuntimeError):
+        rt.reinstate_user("u_3c4d")
+    assert "u_3c4d" in rt.excluded_user_ids()
+
+
+def test_EO05_failed_erase_hook_keeps_the_purge_pending_and_retries(make_rt, cloud):
+    rt = make_rt(cloud)
+    attempts = {"n": 0}
+
+    def flaky(uid):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise OSError("disk full")
+
+    rt.add_erase_hook(flaky)
+    rt.overlay.apply({"items": [_erase("u_3c4d", _t(-2))], "revocation_seq": 1})
+    assert rt.apply_erasures() == []  # not complete
+    assert "u_3c4d" in rt.overlay.pending_purge() and "u_3c4d" not in rt._erased
+    types = [e["type"] for e in rt.events()]
+    assert "ALERT_LOCAL_ERASURE_FAILED" in types and "USER_ERASED_LOCAL" not in types
+    assert not rt.erasures_complete()
+    rt.tick()  # retried
+    assert attempts["n"] == 2 and rt.overlay.pending_purge() == [] and rt.erasures_complete()
+    assert "USER_ERASED_LOCAL" in [e["type"] for e in rt.events()]
 
 
 def test_a_crash_before_the_purge_purges_after_restart(make_rt, cloud):

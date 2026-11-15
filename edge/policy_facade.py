@@ -67,8 +67,8 @@ class FailSecureRuntime:
         return {"mode": "OFFLINE", "state": "OFFLINE", "forced": False, "reason": "policy_runtime_unavailable",
                 "policy_runtime_error": self.reason, "demo_clock": None, "sync_queue_depth": None}
 
-    def set_forced_mode(self, force: str) -> dict[str, Any]:
-        return self.mode_status()
+    def set_forced_mode(self, force: str, reason: str | None = None, max_minutes: Any = None) -> dict[str, Any]:
+        return self.mode_status()  # nothing to force: every attempt is DENY SYSTEM_ERROR
 
     def record_cloud_result(self, ok: bool) -> None: ...
 
@@ -77,6 +77,9 @@ class FailSecureRuntime:
 
     def entitled_user_ids(self) -> set[str]:
         return set()
+
+    def excluded_user_ids(self) -> set[str]:
+        return set()  # every attempt is DENY SYSTEM_ERROR here anyway
 
     def bundle_kiosk_ids(self) -> set[str]:
         return set()  # no verified bundle: the DEMO_MODE kiosk switch serves KIOSK_ID only

@@ -166,6 +166,34 @@ final class ProbeModel: ObservableObject {
 
     // MARK: pairing (QR / paste)
 
+    /// A depthprobe:// link opened from outside the app (QR, web page, another app) waiting for the operator to
+    /// confirm it in DepthProbe. Applying it silently would let any link re-point the phone (DE-04).
+    @Published private(set) var pendingConfigLink: URL?
+
+    func receiveConfigLink(_ url: URL) {
+        guard url.scheme?.lowercased() == EdgeDefaults.configScheme else { return }
+        pendingConfigLink = url
+    }
+
+    /// What the pending link would change, for the confirmation alert (the token value is never shown).
+    func pendingLinkSummary() -> String {
+        guard let url = pendingConfigLink,
+              let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems else { return "" }
+        let newURL = items.first { $0.name == "url" }?.value ?? ""
+        let host = (try? EdgeClient.baseURL(newURL)).map(EdgeClient.hostPort) ?? "(edge unchanged)"
+        let hasToken = items.contains { $0.name == "token" && !($0.value ?? "").isEmpty }
+        return "Edge: \(host)\n" + (hasToken ? "Sets a new device token." : "No token in this link.")
+            + "\nOnly apply links from the kiosk Mac's own pairing QR."
+    }
+
+    func confirmPendingLink() {
+        guard let url = pendingConfigLink else { return }
+        pendingConfigLink = nil
+        applyConfigLink(url)
+    }
+
+    func cancelPendingLink() { pendingConfigLink = nil }
+
     /// depthprobe://config?url=<edge URL>&token=<DEPTH_DEVICE_TOKEN>  (QR / clipboard from depth/ios/pair.sh)
     @discardableResult
     func applyConfigLink(_ url: URL) -> Bool {
@@ -200,7 +228,11 @@ final class ProbeModel: ObservableObject {
         guard !s.isEmpty else { return }
         if let u = URL(string: s), applyConfigLink(u) { return }
         if s.lowercased().hasPrefix("http://") || s.lowercased().hasPrefix("https://") {
+            let before = (try? EdgeClient.baseURL(edgeURL)).map(EdgeClient.hostPort)
+            let after = (try? EdgeClient.baseURL(s)).map(EdgeClient.hostPort)
             edgeURL = s
+            // A new host must not receive the old token (DE-01): re-pair to send it there.
+            if after != before { token = "" }
         } else {
             token = EdgeClient.normalizedToken(s)
         }
@@ -255,11 +287,17 @@ final class ProbeModel: ObservableObject {
         let portList = ports.map(String.init).joined(separator: " / ")
         setEdgeState(.working, "Searching this network for the edge (port \(portList))...", auto ? before.2 : nil)
         if let hit = await EdgeDiscovery.find(client: client, ports: ports, hotspotOnly: hotspotOnly) {
+            let before = (try? EdgeClient.baseURL(edgeURL)).map(EdgeClient.hostPort)
+            let found = "\(hit.host):\(hit.port)"
             internalChange = true
-            edgeURL = "http://\(hit.host):\(hit.port)"
+            edgeURL = "http://\(found)"
+            // Off the hotspot subnet anything can answer like the edge: never hand it the stored token (DE-01).
+            let tokenCleared = !hotspotOnly && before != found && !token.isEmpty
+            if tokenCleared { token = "" }
             internalChange = false
-            setEdgeState(.working, "Found the edge at \(hit.host):\(hit.port) - connecting...", nil)
-            return "\(hit.host):\(hit.port)"
+            setEdgeState(.working, "Found the edge at \(found) - connecting...",
+                         tokenCleared ? "Token cleared for the new address: scan the Mac's pairing QR again." : nil)
+            return found
         }
         if auto {
             setEdgeState(before.0, before.1, before.2)  // keep the original error visible

@@ -51,7 +51,7 @@ def test_Y02_same_attempt_different_content_is_conflict(signed, services):
     assert out["acks"][0]["status"] == "CONFLICT"
     assert "att_y02" in out["duplicates"] and "att_y02" in out["conflicts"]  # stored -> safe to purge
     assert "ALERT_SYNC_CONFLICT" in _alerts(out)
-    keys = [k for k, _ in services.kv.list("decisions", prefix="att_y02")]
+    keys = [k for k, _ in services.kv.list("decisions", prefix="KIOSK_LIB_01|att_y02")]
     assert len(keys) == 2  # both versions stored
     again = _sync(signed, batch("KIOSK_LIB_01", [make_record("att_y02", decision="ALLOW")]), verbose=True)
     assert "ALERT_SYNC_CONFLICT" not in _alerts(again)  # conflict variant itself is idempotent
@@ -94,7 +94,9 @@ def test_Y06_override_code_reuse_across_kiosks(signed):
                                                              codes=["ACCESS_OK", "FALLBACK_OK", "OFFLINE_MODE"])]),
                   verbose=True)
     assert first["acks"][0]["verdict"] == "CONFIRMED"
-    assert _alerts(first) == {"ALERT_OVERRIDE_USED"}
+    # OVR-001 is a publicly documented demo code the cloud never minted (stripped from every bundle): an edge that
+    # honoured it is flagged (CA-04 "unknown override code"); nothing is published for it
+    assert _alerts(first) == {"ALERT_OVERRIDE_USED", "ALERT_OFFLINE_POLICY_VIOLATION"}
     second = _sync(signed, batch("KIOSK_MAIN_01", [make_record(
         "att_y06b", kiosk="KIOSK_MAIN_01", zone="MAIN_GATE", ts="2026-11-14T05:10:00Z", fallback=fb,
         codes=["ACCESS_OK", "FALLBACK_OK", "OFFLINE_MODE"])]), verbose=True)
@@ -147,7 +149,8 @@ def test_Y10_tombstone_raises_purged_unsynced(signed):
     assert out["accepted"] == ["TOMBSTONE:10-13"]
     assert out["flags"] == [{"attempt_id": "TOMBSTONE:10-13", "type": "RECORDS_PURGED_UNSYNCED"}]
     again = _sync(signed, batch("KIOSK_LIB_01", [tomb]))
-    assert again["duplicates"] == ["TOMBSTONE:10-13"] and again["flags"] == []
+    # a resend after a lost ack gets the same flag again (F15), without a second alert
+    assert again["duplicates"] == ["TOMBSTONE:10-13"] and again["flags"] == out["flags"]
 
 
 def test_Y11_revocation_reaches_kiosk_via_feed_and_signed_bundle(signed, services):

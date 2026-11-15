@@ -3,6 +3,25 @@
  * Source: lead's API contract (docs/API.md v1.1) + docs/DECISION_POLICY.md §7 / §10.
  * Field names are snake_case exactly as on the wire.
  */
+import type {
+  ApiKeyCreate,
+  ApiKeyCreated,
+  ApiKeyInfo,
+  AuditQuery,
+  AuthAuditPage,
+  AuthMe,
+  AuthStatus,
+  LoginRequest,
+  LoginResult,
+  MfaEnrolment,
+  PasswordChange,
+  Reauth,
+  RolesCatalog,
+  StaffAccount,
+  StaffCreate,
+  StaffPasswordReset,
+  StaffUpdate,
+} from './authTypes.ts'
 
 export type Decision = 'ALLOW' | 'STEP_UP' | 'DENY'
 export type Mode = 'ONLINE' | 'OFFLINE'
@@ -227,6 +246,10 @@ export interface ModeResponse {
   state: ModeState
   since: string | null
   forced: boolean
+  /** a forced OFFLINE auto-reverts to AUTO at this time (POST /v1/admin/mode max_minutes, default 60) */
+  forced_until: string | null
+  /** schedule bundle cache state (public /v1/mode top-level; else schedule_bundle.cache_state); null = unknown, never FRESH */
+  cache_state: CacheState | null
   last_cloud_ok_at: string | null
   reason: string | null
   schedule_bundle: {
@@ -238,7 +261,8 @@ export interface ModeResponse {
   } | null
   revocation_seq: number | null
   template_cache: { count: number | null; model: string | null } | null
-  sync_queue_depth: number
+  /** null = the edge did not report it (never shown as 0; audit KAO-09) */
+  sync_queue_depth: number | null
   /**
    * Demo clock (API.md v1.4 §3.10/§3.14): present whenever DEMO_MODE=1 (else null). `contract` = the edge sent
    * the full v1.4 shape; an older edge sends only {active, now_local}, the other fields are then null.
@@ -393,6 +417,8 @@ export type CloudState = 'indexed' | 'failed' | 'skipped_offline' | 'not_configu
 export const CLOUD_STATES: readonly CloudState[] = ['indexed', 'failed', 'skipped_offline', 'not_configured']
 
 /** POST /v1/enroll -> 201 */
+export type EnrollCloudCall = { status: number; body: unknown } | { status: null; error: string }
+
 export interface EnrollResponse {
   user_id: string
   template_version: number
@@ -405,8 +431,11 @@ export interface EnrollResponse {
   frames_used: number
   frames_rejected: Array<Record<string, unknown>>
   min_pairwise_cosine: number | null
-  /** the cloud enrol call: {status, body} (informational), null when not called */
-  cloud: { status: number; body: unknown } | null
+  /**
+   * the cloud enrol call (informational), null when not called: {status, body} when the cloud answered,
+   * {status: null, error} on a transport failure (edge/enroll.py CloudUnavailable; audit KAO-04)
+   */
+  cloud: EnrollCloudCall | null
   schedule_role: string | null
   schedule_display: string | null
   role_requested: string | null
@@ -707,6 +736,14 @@ export interface ApiErrorExtra {
   installed_version?: number | null
   bundle_version?: number | null
   details?: unknown
+  /** 401 MFA_REQUIRED: opaque 2-minute single-use ticket for the second login leg (POST {mfa_ticket, totp_code}) */
+  mfa_ticket?: string | null
+  /** 403 MISSING_PERMISSION: the permissions the route needs */
+  required?: string[] | null
+  /** 422 PASSWORD_POLICY: what is wrong with the new password */
+  problems?: string[] | null
+  /** otp/send 503 EMAIL_UNAVAILABLE / NO_EMAIL_ON_FILE: the second-factor methods still on offer */
+  methods?: string[] | null
 }
 
 /** Protocol / transport error (distinct from decision reason codes). */
@@ -750,6 +787,17 @@ export interface EdgeEventsHandlers {
   /** `event: rendered` */
   onRendered?: (e: RenderedEvent) => void
   onStatus?: (status: 'connecting' | 'open' | 'error') => void
+  /**
+   * The stream ended for an auth reason and will NOT reconnect: HTTP 401/403 or the edge's final
+   * `event: auth` (session expired / revoked / events:read lost). 401 / session-gone also signs the UI out.
+   */
+  onAuthClosed?: (info: { status: number | null; reason: string | null }) => void
+}
+
+export interface SetModeOptions {
+  reason?: string
+  /** 1..240 minutes */
+  max_minutes?: number
 }
 
 /** The kiosk talks to the edge only through this interface (real HTTP or in-browser mock). */
@@ -769,7 +817,13 @@ export interface EdgeApi {
   getHealth(): Promise<HealthResponse>
   // admin (X-Admin-Token)
   getMetrics(token: string): Promise<MetricsResponse>
-  setMode(token: string, force: ForceMode): Promise<unknown>
+  /** POST /v1/admin/mode (mode:switch): a forced OFFLINE auto-reverts after max_minutes (1..240, default 60) */
+  setMode(token: string, force: ForceMode, opts?: SetModeOptions): Promise<unknown>
+  /**
+   * GET /v1/admin/mode/detail (store:read): the full mode status. Public GET /v1/mode carries only mode, state,
+   * reason, forced, forced_until, kiosk_id, sync_queue_depth, cache_state, template_cache.count, demo_clock.
+   */
+  getModeDetail(token: string): Promise<ModeResponse>
   getStore(token: string): Promise<unknown>
   triggerSync(token: string): Promise<unknown>
   setEvalContext(token: string, ctx: EvalContext): Promise<unknown>
@@ -797,4 +851,34 @@ export interface EdgeApi {
   /** POST /v1/admin/bundle/refresh - pull + verify + install the newest cloud bundle now. */
   refreshBundle(token: string): Promise<BundleRefresh>
   subscribeEvents(token: string, handlers: EdgeEventsHandlers): () => void
+  // ---- authentication (design v2 §C/§F). `token` = the fgs_ session token (or an fgk_ key / legacy token).
+  /** GET /v1/auth/status (public) */
+  authStatus(): Promise<AuthStatus>
+  /** POST /v1/auth/login - 401 reason MFA_REQUIRED carries extra.mfa_ticket; 429 extra.retry_after_s */
+  login(req: LoginRequest): Promise<LoginResult>
+  /** POST /v1/auth/logout (204) */
+  logout(token: string): Promise<void>
+  /** GET /v1/auth/me */
+  me(token: string): Promise<AuthMe>
+  /** POST /v1/auth/password (204); 422 reason PASSWORD_POLICY extra.problems */
+  changePassword(token: string, req: PasswordChange): Promise<void>
+  /** POST /v1/auth/mfa/enroll {current_password} (required; 403 REAUTH_REQUIRED) -> secret + otpauth URI, shown once */
+  mfaEnroll(token: string, currentPassword: string): Promise<MfaEnrolment>
+  /** POST /v1/auth/mfa/confirm (204) */
+  mfaConfirm(token: string, totpCode: string): Promise<void>
+  /** POST /v1/auth/activity (204): the user is active (debounced by the auth layer) */
+  noteActivity(token: string): Promise<void>
+  // ---- staff:manage
+  listStaff(token: string): Promise<StaffAccount[]>
+  createStaff(token: string, req: StaffCreate): Promise<StaffAccount | null>
+  updateStaff(token: string, staffId: string, req: StaffUpdate): Promise<StaffAccount | null>
+  resetStaffPassword(token: string, staffId: string, req: StaffPasswordReset): Promise<void>
+  unlockStaff(token: string, staffId: string, req: Reauth): Promise<void>
+  listApiKeys(token: string): Promise<ApiKeyInfo[]>
+  createApiKey(token: string, req: ApiKeyCreate): Promise<ApiKeyCreated>
+  revokeApiKey(token: string, keyId: string, req: Reauth): Promise<void>
+  /** GET /v1/admin/roles (staff:manage) */
+  listRoles(token: string): Promise<RolesCatalog>
+  /** GET /v1/admin/auth/audit (audit:read), newest first */
+  listAuthAudit(token: string, q?: AuditQuery): Promise<AuthAuditPage>
 }

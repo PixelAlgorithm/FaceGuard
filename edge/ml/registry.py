@@ -1,4 +1,9 @@
-"""Pinned model files (same pins as scripts/fetch_models.sh; provenance in edge/ml/MODELS.md)."""
+"""Pinned model files (same pins as scripts/fetch_models.sh; provenance in edge/ml/MODELS.md).
+
+`verified_path` checks a file at startup; `verified_bytes` reads a pinned file ONCE and checks the
+SHA-256 of exactly those bytes, which `edge.ml.onnx.make_session` then hands to ONNX Runtime, so the
+model that runs is the model that was hashed (no swap between check and load, audit EM-13).
+"""
 
 from __future__ import annotations
 
@@ -70,6 +75,22 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def pin_for(path: Path) -> ModelFile | None:
+    """The pin whose filename matches `path` (pinned files are identified by name), else None."""
+    return next((m for m in MODEL_FILES.values() if m.filename == path.name), None)
+
+
+def verified_bytes(path: Path) -> bytes:
+    """Read `path` once; if it is a pinned model, raise ValueError unless sha256(bytes) == pin."""
+    data = path.read_bytes()
+    spec = pin_for(path)
+    if spec is not None:
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != spec.sha256:
+            raise ValueError(f"{path} sha256 {digest} != pinned {spec.sha256}")
+    return data
 
 
 def verified_path(models_dir: Path, key: str) -> Path:

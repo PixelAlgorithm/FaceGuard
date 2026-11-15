@@ -3,7 +3,7 @@
 Every row is a pytest case: initial decisions in `edge/policy/tests/test_cases.py`, step-up continuations in
 `test_stepup.py`, RL rows in `test_ratelimit.py`, matrix rows in `test_matrix.py`, properties in
 `test_invariants.py`, flash advisory rows in `test_flash_advisory.py`, unit rows in `test_signal_units.py`,
-X/D/Y rows in `edge/offline/tests/` (cloud side of Y rows in `cloud/tests/`).
+X/D/Y rows in `edge/offline/tests/` (cloud side of Y rows in `cloud/tests/`). H rows (§6b, v1.5 audit fixes) in `edge/policy/tests/test_pf_*.py`, each row naming its test.
 Semantics: `docs/DECISION_POLICY.md` policy `2026-11-14.3` (matrix row ids MO*, A*, N*, F*, E*, I*, R*
 referenced below; rate limiter §9.7). These IDs are the canonical test IDs used by `docs/BUILD_PLAN.md`
 gates and the pad-evaluation skill.
@@ -25,7 +25,7 @@ Engine functions under test are pure: feed signal results/scores, not images.
 | t0 / now | `2026-11-14T10:05:00+05:30` (Saturday) = `04:35:00Z` |
 | bundle | v42 content, valid signature (= the last valid bundle, LVB). **Stamps:** unless a case says `fixed stamps`, the fixture signs at `now` like `scripts/sign_bundle.py`: `issued_at` = now − 5 min, `expires_at` = issued_at + 12 h, override `valid_until` = expires_at + 24 h (`fallback.staff_override.valid_after_expiry_h`) → FRESH at any t0. `fixed stamps` = the example file as-is: `issued_at` `2026-11-14T02:30:00Z` (08:00 IST) / `expires_at` `2026-11-14T14:30:00Z` (effective expiry 20:00 IST), and override `valid_until` as in the file (`2026-11-15T14:30:00Z`) |
 | online bundle refresh | last successful refresh 5 min before now (≤ `online_max_bundle_age_min` 30 → online-usable, MO1) |
-| override list | the list of the last bundle that verified (= v42's OVR-001..003) |
+| override list | the list of the last bundle that verified (= v42's OVR-001..003). These are the **publicly documented fixture codes** (`48213907`, `75530182`, `19064425`). The vectors run at engine / verifier level: `FallbackVerifier` reads the raw verified bundle (`ctx.lvb`, `edge/policy/tests/test_stepup.py` `Flow`). The running edge instead hands the verifier `BundleStore.decision_bundle`, which **drops documented codes unless `DEMO_MODE=1`** (EO-10, `edge/offline/tests/test_os_bundle.py::test_EO10_documented_codes_never_reach_the_decision_bundle_without_demo_mode` / `::test_EO10_demo_mode_keeps_them`). Rows marked ‡ therefore hold end to end only with `DEMO_MODE=1` or with fresh codes from `POST /v1/admin/access/codes/rotate` |
 | quality | 5 frames, all pass (luma 120, lapvar 150, yaw 5°, 1 face), `recapture_count` 0 |
 | camera | label `"FaceTime HD Camera"`, frame interval 33 ms monotonic; fixture pins `injection.unknown_label_is_unsure: true` (shipped false; Q09 vs Q25) |
 | PAD `P_live` per frame | `[0.95, 0.93, 0.94, 0.92, 0.96]` (mean 0.94) |
@@ -62,11 +62,11 @@ Methods shorthands: `on` = {TOTP, CARD, EMAIL_OTP, STAFF_OVERRIDE}; `onH` = {TOT
 | Q10 | B; 5 prior L05 spoof DENYs on this kiosk at t = 0, 10, 20, 30, 40 (lockout until 45); this attempt at t = 42 | DENY | RATE_LIMITED | NONE, `retry_after_s` 3 (= ceil(lockout_until − t); the engine vector injects 40 s left → 40) | A1 |
 | Q11 | B; PAD model raises exception | DENY | SYSTEM_ERROR | CONTACT_DESK | A5 |
 | Q12 | OB; luma 40 all frames | STEP_UP | QUALITY_LOW_LIGHT, OFFLINE_MODE | RECAPTURE | A2 |
-| Q13 | Q05 → STAFF_OVERRIDE `48213907` (desk staff manual review) | ALLOW | ACCESS_OK, FALLBACK_OK | OPEN_DOOR; `resolved_codes` = {QUALITY_LOW_LIGHT}; log `user_id` null, `fallback` {STAFF_OVERRIDE, s_guard01, OVR-001}; code consumed | R1 |
+| Q13 ‡ | Q05 → STAFF_OVERRIDE `48213907` (desk staff manual review) | ALLOW | ACCESS_OK, FALLBACK_OK | OPEN_DOOR; `resolved_codes` = {QUALITY_LOW_LIGHT}; log `user_id` null, `fallback` {STAFF_OVERRIDE, s_guard01, OVR-001}; code consumed | R1 |
 | Q14 | Q05 → valid TOTP for `u_3c4d` (TOTP not in stf) | STEP_UP | QUALITY_LOW_LIGHT, FALLBACK_FAILED | SECOND_FACTOR, attempts_left 0 | R8 |
 | Q15 | B; kiosk `KIOSK_SRV_01` (SERVER_ROOM, high); luma 40; `recapture_count` 2 | DENY | QUALITY_LOW_LIGHT | CONTACT_DESK | A6 |
 | Q16 | OB; luma 40; `recapture_count` 2 (LIBRARY) | STEP_UP | QUALITY_LOW_LIGHT, OFFLINE_MODE, OFFLINE_FALLBACK_REQUIRED | steps [SECOND_FACTOR], methods stf | A3 |
-| Q17 | Q16 → STAFF_OVERRIDE `48213907` | ALLOW | ACCESS_OK, FALLBACK_OK, OFFLINE_MODE | OPEN_DOOR; `resolved_codes` = {QUALITY_LOW_LIGHT}; `user_id` null; `staff_id` s_guard01 | R1 |
+| Q17 ‡ | Q16 → STAFF_OVERRIDE `48213907` | ALLOW | ACCESS_OK, FALLBACK_OK, OFFLINE_MODE | OPEN_DOOR; `resolved_codes` = {QUALITY_LOW_LIGHT}; `user_id` null; `staff_id` s_guard01 | R1 |
 | Q18 | OB; `auto_allow_max_risk: low`; kiosk `KIOSK_LAB_01` (medium → treated high); luma 40; `recapture_count` 2 | DENY | QUALITY_LOW_LIGHT, OFFLINE_MODE | CONTACT_DESK | A6 |
 | Q19 | B; luma 40; `recapture_count` 2; camera label `"OBS Virtual Camera"` | DENY | INJECTION_VIRTUAL_CAMERA | NONE (injection checked before the manual-review step-up) | A4 |
 | Q20 | OB; kiosk `KIOSK_SRV_01`; luma 40; `recapture_count` 2 | DENY | QUALITY_LOW_LIGHT, OFFLINE_MODE | CONTACT_DESK | A6 |
@@ -289,8 +289,8 @@ Online EMAIL_OTP (SES via cloud; `POST /v1/attempt/{id}/otp/send` then `/fallbac
 | O06 | O04 → valid TOTP for `u_7a8b` | ALLOW | ACCESS_OK, FALLBACK_OK, OFFLINE_MODE | OPEN_DOOR; log `fallback.method` = TOTP | R1 |
 | O07 | O04 → wrong TOTP twice | DENY | FALLBACK_FAILED, OFFLINE_MODE | NONE | R9 |
 | O08 | O06 then a new attempt reusing the same TOTP time-step | STEP_UP (then DENY on 2nd reuse) | …, FALLBACK_FAILED | replay rejected | R8/R9 |
-| O09 | O04 → STAFF_OVERRIDE `48213907` | ALLOW | ACCESS_OK, FALLBACK_OK, OFFLINE_MODE | OPEN_DOOR; log `staff_id` s_guard01, `code_id` OVR-001; code consumed | R1 |
-| O10 | new attempt → STAFF_OVERRIDE `48213907` again | STEP_UP | …, FALLBACK_FAILED | consumed code rejected | R8 |
+| O09 ‡ | O04 → STAFF_OVERRIDE `48213907` | ALLOW | ACCESS_OK, FALLBACK_OK, OFFLINE_MODE | OPEN_DOOR; log `staff_id` s_guard01, `code_id` OVR-001; code consumed | R1 |
+| O10 ‡ | new attempt → STAFF_OVERRIDE `48213907` again | STEP_UP | …, FALLBACK_FAILED | consumed code rejected | R8 |
 | O11 | OB; Priya / LIB / 07:50 (GRACE) | STEP_UP | SCHEDULE_GRACE_WINDOW, OFFLINE_MODE, OFFLINE_FALLBACK_REQUIRED | steps [SECOND_FACTOR], methods off | F3 |
 | O12 | O11 → CARD `HID-CARD-1002` | ALLOW | ACCESS_OK, FALLBACK_OK, OFFLINE_MODE | OPEN_DOOR | R1 |
 | O13 | OB; PAD as L03 (also unsure under 0.85 bar) | STEP_UP | LIVENESS_UNSURE, OFFLINE_MODE, OFFLINE_FALLBACK_REQUIRED | steps [CHALLENGE, SECOND_FACTOR], methods off | F5 |
@@ -301,7 +301,7 @@ Online EMAIL_OTP (SES via cloud; `POST /v1/attempt/{id}/otp/send` then `/fallbac
 | O18 | OB; Kiran / MAIN / Sat 09:00 | DENY | SCHEDULE_REVOKED, OFFLINE_MODE | CONTACT_DESK | F4 |
 | O19 | OB; `fixed stamps`; now = t0 = Sat 14 Nov 21:00 IST (15:30Z > effective expiry 14:30Z); Priya / MAIN | STEP_UP | SCHEDULE_EXPIRED_CACHE, OFFLINE_MODE, OFFLINE_FALLBACK_REQUIRED | steps [SECOND_FACTOR], methods stf | E1 |
 | O20 | O19 → TOTP valid | STEP_UP | …, FALLBACK_FAILED | TOTP not in stf | R8 |
-| O21 | O19 → STAFF_OVERRIDE `75530182` | ALLOW | ACCESS_OK, FALLBACK_OK, OFFLINE_MODE | OPEN_DOOR | R1 |
+| O21 ‡ | O19 → STAFF_OVERRIDE `75530182` | ALLOW | ACCESS_OK, FALLBACK_OK, OFFLINE_MODE | OPEN_DOOR | R1 |
 | O22 | OB; `fixed stamps`; now 21:00 (expired); Kiran / MAIN | DENY | SCHEDULE_REVOKED, SCHEDULE_EXPIRED_CACHE, OFFLINE_MODE | CONTACT_DESK | E2 |
 | O23 | OB; `fixed stamps`; now = t0 = Sat 14 Nov 20:45 IST (15:15Z, expired); Rahul / SRV (stale IN_WINDOW 09:00–21:00, high) | STEP_UP | SCHEDULE_EXPIRED_CACHE, OFFLINE_MODE, OFFLINE_HIGH_RISK_ZONE, OFFLINE_FALLBACK_REQUIRED | methods stf | E1 |
 | O24 | OB; **no last valid bundle**: the only bundle (boot file) was tampered (one window edited) and never verified | DENY | SCHEDULE_BUNDLE_INVALID, OFFLINE_MODE | CONTACT_DESK; response `zone` `"UNKNOWN"`, `schedule_result` null, `mode` OFFLINE | I1a |
@@ -309,7 +309,7 @@ Online EMAIL_OTP (SES via cloud; `POST /v1/attempt/{id}/otp/send` then `/fallbac
 | O26 | OB; `fixed stamps` (LVB present); kiosk clock `2026-11-13T20:00:00Z` (< issued_at − 300 s, clock rollback) | STEP_UP | SCHEDULE_BUNDLE_INVALID, OFFLINE_MODE, OFFLINE_FALLBACK_REQUIRED | methods stf | I1b |
 | O27 | OB; no LVB (tampered) + L05 phone spoof | DENY | SPOOF_DEVICE_DETECTED, OFFLINE_MODE | NONE (BIO_FAIL first) | I3 |
 | O28 | OB; template cache age 80 h (> 72 h) | DENY | NOT_ENROLLED, OFFLINE_MODE | CONTACT_DESK | F8 |
-| O29 | OB; STAFF_OVERRIDE wrong code 3× in a row (across attempts) | — | — | override locked 300 s; 4th try rejected without hash check | §7.2 |
+| O29 | O04 (Rahul / SRV, offline); STAFF_OVERRIDE with `staff_id` **`s_guard01` (known to the bundle)**: wrong `11111111`, wrong `22222222` (attempt 1 → DENY FALLBACK_FAILED), new attempt wrong `33333333` (3rd consecutive → `s_guard01` locked 300 s), then the correct `48213907` 1 s later | STEP_UP | FALLBACK_LOCKED, OFFLINE_MODE, OFFLINE_HIGH_RISK_ZONE, OFFLINE_FALLBACK_REQUIRED | SECOND_FACTOR, methods offH, `attempts_left` 0 (unchanged: not counted), `retry_after_s` 299; rejected **without a hash check**; a fresh attempt after the 300 s lock → ALLOW. An unknown or missing `staff_id` never starts this per-staff lock (only the device backstop, H12). `test_stepup.py::test_O29_staff_override_lockout_without_hash_check` | R12 |
 
 Stale online bundle and mode resolution (DECISION_POLICY §5.1, §9.0):
 
@@ -349,6 +349,40 @@ schedule not evaluated). O49 pins that.
 | ID | Base + deltas | Decision | reason_codes | next_action | Row |
 |---|---|---|---|---|---|
 | O49 | OB; Kiran / MAIN / Sat 09:00; template cache built from v42 (u_a3b4 excluded as revoked) → local top1 < 0.30 | DENY | NOT_ENROLLED, OFFLINE_MODE | CONTACT_DESK | F8 |
+
+### 6b. Hardening vectors (v1.5, audit fixes)
+
+Each row names the test that proves it. "schedule" / "verifier" rows test one function (`evaluate_schedule`,
+`FallbackVerifier.verify`) and list its result instead of a DecisionResponse. Exact `reason_codes` sets on
+engine rows were checked against `evaluate()` output on 2026-11-15. Where the test itself asserts less, for
+example "not ALLOW + MATCH_AMBIGUOUS present", the row says so.
+
+| ID | Base + deltas | Decision / result | reason_codes | next_action / detail | Row · test |
+|---|---|---|---|---|---|
+| H01 | schedule; contractor `u_9c0d` gets `extra_windows` LAB_BLOCK FRI 22:00–02:00; Fri 20 Nov is a LAB_BLOCK holiday (contractors not exempt); t0 Fri 20 Nov 23:00 and Sat 21 Nov 01:00 IST | HOLIDAY both times (01:00 was IN_WINDOW before F02) | — | a holiday on the start day also closes the part after midnight | F02 · `test_pf_schedule.py::test_F02_holiday_on_the_start_day_closes_the_tail_after_midnight` |
+| H02 | H01 window; t0 Sat 28 Nov 01:00 IST (Fri 27 Nov is a normal day) | IN_WINDOW | — | a normal crossing window still crosses midnight | F02 · `test_pf_schedule.py::test_F02_same_window_on_a_normal_friday_still_crosses_midnight` |
+| H03 | schedule; held revocation for Priya `revoked_at` 04:35:00Z; edge t0 = 04:33:00Z (edge clock 120 s behind the cloud) | strict (slack 0, the cloud re-evaluation): not REVOKED; `revocation_slack_s` = 300 (live edge): REVOKED | — | slack = `cache.clock_rollback_tolerance_s` | F03 · `test_pf_schedule.py::test_F03_received_revocation_counts_although_the_edge_clock_is_behind` |
+| H04 | OB; Priya / LIB / Sat 10:00; held revocation dated t0 + 120 s | DENY | SCHEDULE_REVOKED, OFFLINE_MODE | CONTACT_DESK (the test asserts DENY + `SCHEDULE_REVOKED`) | F03 → F4 · `test_pf_schedule.py::test_F03_live_engine_applies_the_revocation_slack` |
+| H05 | OB; LVB present but `issued_at` = now + 2 h (clock rollback, cache INVALID); no revocation for Priya | STEP_UP | SCHEDULE_BUNDLE_INVALID, OFFLINE_MODE, OFFLINE_FALLBACK_REQUIRED | steps [SECOND_FACTOR], methods stf | I1b · `test_pf_schedule.py::test_F04_clock_rollback_still_denies_a_revoked_candidate` |
+| H06 | H05 + a held revocation for Priya with any `revoked_at` (2026-12-31, or null) | DENY | SCHEDULE_REVOKED, SCHEDULE_BUNDLE_INVALID, OFFLINE_MODE | CONTACT_DESK | I4 (F04) · same test |
+| H07 | B; local frames top1 = [`u_3c4d` 0.72, `u_1a2b` 0.70 ×3, `u_3c4d` 0.72] (first = last, but the middle names another user at ≥ `deny_below_cosine` 0.30) | STEP_UP | MATCH_AMBIGUOUS | SECOND_FACTOR, methods on (the test asserts not ALLOW + `MATCH_AMBIGUOUS`) | M01 · `test_pf_identity.py::test_M01_mixed_identity_burst_is_ambiguous_not_allow[B]` |
+| H08 | H07 frames with OB | STEP_UP | MATCH_AMBIGUOUS, OFFLINE_MODE, OFFLINE_FALLBACK_REQUIRED | SECOND_FACTOR, methods off | M01 · same test `[OB]` |
+| H09 | OB; frames 2–4 have no match (top1 none) | ALLOW | ACCESS_OK, OFFLINE_MODE | OPEN_DOOR | M01 · `test_pf_identity.py::test_M01_unmatched_middle_frames_still_allow` |
+| H10 | OB; frame 3 top1 `u_1a2b` 0.20 (< 0.30) | ALLOW | ACCESS_OK, OFFLINE_MODE | OPEN_DOOR | M01 · `test_pf_identity.py::test_M01_low_scoring_other_user_below_the_deny_bar_does_not_break_consistency` |
+| H11 | OB (runtime); the revocation overlay is lost (`state_lost`, e.g. a quarantined `revocations.enc`) | STEP_UP | OFFLINE_MODE, OFFLINE_FALLBACK_REQUIRED | SECOND_FACTOR, methods off; `GET /v1/admin/mode/detail` `revocations_state_lost` true. Online the same rule gives STEP_UP {OFFLINE_FALLBACK_REQUIRED}, methods on (engine output; no dedicated test) | EO-08 · `test_pf_runtime.py::test_EO08_lost_revocation_overlay_never_auto_allows` |
+| H12 | verifier, OFFLINE; 10 STAFF_OVERRIDE failures within 5 min, unknown (`s_unknown`) or missing staff ids; then the correct `48213907` / `s_guard01` 2 s later | rejected "staff override locked" | — | device backstop: every override locked 300 s, alert `ALERT_FALLBACK_LOCKOUT` `STAFF_OVERRIDE_DEVICE`; accepted again at +302 s | F05 · `test_pf_fallback_limits.py::test_F05_device_backstop_locks_every_override_after_10_failures_in_5_min` |
+| H13 | verifier; 3 wrong codes for `s_nobody` + 3 wrong codes without `staff_id`; then `48213907` / `s_guard01` | accepted | — | anonymous guesses never lock a named guard (backstop only) | F05 · `test_pf_fallback_limits.py::test_F05_anonymous_guesses_do_not_lock_out_a_named_guard` |
+| H14 | verifier; 10 failures 40 s apart (6 min) | correct code accepted at +401 s | — | the backstop window (300 s) expires; slow failures do not lock | F05 · `test_pf_fallback_limits.py::test_backstop_window_expires_slow_failures_do_not_lock` |
+| H15 | verifier, persisted state (`fallback_state.sqlite`); 3 wrong codes for `s_guard01`; "restart" (new state object on the same file); correct code at +30 s, then at +301 s | rejected (locked, `locked_until` set), then accepted | — | locks survive a restart (real UTC) | SC2-D9 · `test_pf_fallback_limits.py::test_D9_override_lockout_survives_a_restart`, runtime `test_pf_runtime.py::test_D9_lockout_survives_a_runtime_restart` |
+| H16 | verifier; a per-staff lock set 1 day in the future, then the real clock steps back one day | still rejected, accepted at +301 s | — | a lock is clamped to at most `lockout_s` from now | — · `test_pf_fallback_limits.py::test_lock_is_clamped_when_the_real_clock_steps_backwards` |
+| H17 | verifier; one failure row of `fallback_state.sqlite` overwritten with garbage | correct code rejected | — | a tampered row reads as locked | — · `test_pf_fallback_limits.py::test_tampered_failure_row_reads_as_locked` |
+| H18 | verifier; 5 wrong TOTP codes for `u_3c4d`; then the valid TOTP (persisted state reopened) | rejected, `locked_until` set | — | per-user TOTP limit 5 → 300 s, checked without verifying the code; `u_5e6f` is not locked | F06 · `test_pf_fallback_limits.py::test_F06_totp_per_user_failure_limit_persists_and_locks_unchecked` |
+| H19 | verifier; 5 wrong cards for `u_3c4d`; then `HID-CARD-1002`, and again at +301 s | rejected (locked), then accepted | — | per-user CARD limit 5 → 300 s | F06 · `test_pf_fallback_limits.py::test_F06_card_per_user_failure_limit` |
+| H20 | verifier; bundle `consumed_code_ids` = [`OVR-001`]; submit `48213907` / `s_guard01` | rejected, counted as a failure | — | a code consumed at any kiosk never matches; the runtime tick persists the ids (`test_pf_runtime.py::test_D8_tick_persists_consumed_code_ids_from_the_bundle`) | SC2-D8 · `test_pf_fallback_limits.py::test_D8_code_listed_in_consumed_code_ids_is_rejected_and_counted` |
+| H21 | verifier; bundle adds `OVR-NEW` (`s_guard09`, 10-digit `0123456789`); submit it; submit legacy 8-digit `48213907` / `s_guard01`; submit 9-digit `482139071` | accepted; accepted; rejected | — | `code_length` 10, `legacy_code_lengths` [8] | EO-11 · `test_pf_fallback_limits.py::test_EO11_ten_digit_codes_and_legacy_eight_digit_codes_are_accepted` |
+| H22 | verifier; `OVR-NEW` with signed scope `zones` [LIBRARY], `kiosk_ids` [KIOSK_LIB_01]; submit at SERVER_ROOM / KIOSK_LIB_01, LIBRARY / KIOSK_SRV_01, LIBRARY / KIOSK_LIB_01 | rejected; rejected; accepted | — | outside its scope a code never matches | F09 · `test_pf_fallback_limits.py::test_F09_code_scope_restricts_zones_and_kiosks` |
+
+H12–H22 use the fixture code `48213907` at verifier level (raw bundle, see the baseline note ‡).
 
 ### 6a. Rate limiter (A1, DECISION_POLICY §9.7) — all attempts at `KIOSK_LIB_01`
 

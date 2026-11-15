@@ -7,6 +7,8 @@
  * Offline, only people already in the installed bundle can enrol. Right column: enrolled users
  * (GET /v1/admin/users) with DPDP erasure (DELETE /v1/enroll/{user_id}; cloud deleted | queued).
  * The camera starts only after consent and takes the one-capturing-tab lock.
+ * RBAC (design v2 §B/§F): behind a LoginGate requiring enrol:write. Schedule writes need access:edit (the
+ * enroller role lacks it: "Ask an admin to add <user_id> to the schedule"); erasure needs enrol:erase.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import QRCode from 'qrcode'
@@ -16,10 +18,12 @@ import type { FrameAnalysis } from '../capture/engine'
 import { canvasToJpeg } from '../capture/imageStats'
 import { GUIDANCE_TEXT, assessQuality, type Guidance } from '../capture/quality'
 import { sleep } from '../capture/time'
-import { EDGE_URL, MOCK_ENABLED, UI, getAdminToken, setAdminToken } from '../config'
+import { EDGE_URL, MOCK_ENABLED, UI } from '../config'
+import { useAuth } from '../shared/auth/context'
+import { PERM, needsText } from '../shared/auth/permissions'
 import { usePoll } from '../admin/usePoll'
 import { ERASE_CLOUD_TEXT, REASON_HINT, ROLE_SOURCE_TEXT, errorText, useAccessDirectory, type Identity } from '../shared/accessDirectory'
-import { displayError, registerPlan } from '../shared/accessRules'
+import { askAdminText, displayError, gatePlan, registerPlan } from '../shared/accessRules'
 import { CaptureLock, useLockState } from '../shared/captureLock'
 import { toast } from '../shared/toast'
 import { USER_ID_HINT, USER_ID_RE } from '../shared/userId'
@@ -94,7 +98,6 @@ export default function RegisterApp() {
   const [step, setStep] = useState<Step>('consent')
   const [consent, setConsent] = useState(false)
   const [declined, setDeclined] = useState(false)
-  const [token, setToken] = useState(getAdminToken)
   const [form, setForm] = useState<Form>(EMPTY_FORM)
   /** display name last filled in from the schedule (cleared again when the id changes to an unknown one) */
   const autoName = useRef('')
@@ -109,9 +112,22 @@ export default function RegisterApp() {
   const [listMsg, setListMsg] = useState<string | null>(null)
   const [guidance, setGuidance] = useState<Guidance>('NO_FACE')
 
+  const auth = useAuth()
+  const token = auth.token
+  const can = {
+    enrolWrite: Boolean(token) && auth.can(PERM.enrolWrite),
+    enrolErase: Boolean(token) && auth.can(PERM.enrolErase),
+    accessEdit: Boolean(token) && auth.can(PERM.accessEdit),
+  }
+
   const health = usePoll<HealthResponse>(() => api.getHealth(), 10000, true, 'register-health')
   // Signed-schedule users (role source of truth) + this edge's enrolments.
-  const dir = useAccessDirectory(token, 'register')
+  const dir = useAccessDirectory(token, 'register', {
+    accessRead: auth.can(PERM.accessRead),
+    enrolRead: auth.can(PERM.enrolRead),
+    accessEdit: can.accessEdit,
+    bundleRefresh: auth.can(PERM.bundleRefresh),
+  })
   const users: EnrolledUser[] = useMemo(() => dir.enrolled?.users ?? [], [dir.enrolled])
   const identities = dir.identities
 
@@ -149,7 +165,9 @@ export default function RegisterApp() {
   const roleSource = existing ? ROLE_SOURCE_TEXT(existing.source, dir.bundleVersion) : ROLE_SOURCE_TEXT('schedule', dir.bundleVersion)
   const erased = existing?.status === 'ERASED'
   /** what Register will do (R-A / R-B); null while the schedule list is not loaded (the edge then decides) */
-  const plan = dir.access && idOk ? registerPlan(existing?.row ?? null, dir.canEdit, role, form.display_name) : null
+  /** schedule writes possible right now; without access:edit the real connectivity decides OFFLINE vs "ask an admin" */
+  const writable = can.accessEdit ? dir.canEdit : !dir.offline
+  const plan = dir.access && idOk ? gatePlan(registerPlan(existing?.row ?? null, writable, role, form.display_name), can.accessEdit) : null
   const blocked = plan?.kind === 'blocked'
   const registerLabel = erased || outcome?.reason === 'ERASED_IN_BUNDLE' ? 'Re-admit and enrol' : 'Register'
 
@@ -296,7 +314,7 @@ export default function RegisterApp() {
     const o = await registerPerson(
       token,
       existing,
-      { online: dir.canEdit, listLoaded: !!dir.access },
+      { online: writable, listLoaded: !!dir.access, canEditAccess: can.accessEdit },
       {
         userId: form.user_id,
         display: form.display_name,
@@ -342,6 +360,7 @@ export default function RegisterApp() {
   }
 
   const erase = async (u: EnrolledUser) => {
+    if (!can.enrolErase) return
     if (!window.confirm(`Erase ${u.user_id} (${u.display_name})? This removes the face template, TOTP secret and card hash from this edge (DPDP erasure).`)) return
     setListMsg(null)
     try {
@@ -362,24 +381,15 @@ export default function RegisterApp() {
 
   return (
     <div className="min-h-full bg-kiosk font-sans text-white">
-      <OpHeader title="Register a person" current="/register" />
+      <OpHeader title="Register a person" current="/register" bundleVersion={dir.bundleVersion} />
       <main className="grid gap-5 p-5 xl:grid-cols-[minmax(0,7fr)_minmax(0,4fr)]">
         <section className="flex min-w-0 flex-col gap-4" aria-label="Registration">
           <div className="flex flex-wrap items-end gap-3 rounded-xl bg-white/5 p-3">
-            <label className="flex min-w-60 flex-1 flex-col gap-1">
-              <span className="text-xs text-white/60">Admin token (X-Admin-Token, ADMIN_TOKEN in the project .env)</span>
-              <input
-                className={inputCls}
-                type="password"
-                autoComplete="off"
-                placeholder="paste admin token"
-                value={token}
-                onChange={(e) => {
-                  setToken(e.target.value.trim())
-                  setAdminToken(e.target.value.trim())
-                }}
-              />
-            </label>
+            <p className="min-w-60 flex-1 text-sm text-white/70">
+              {can.accessEdit
+                ? 'Your account can add people to the signed schedule and enrol them.'
+                : `Your account can enrol people already in the signed schedule (${needsText(PERM.accessEdit)} to add or change someone).`}
+            </p>
             <p className={`text-sm ${hl.ok ? 'text-white/70' : 'text-red-300'}`}>
               {hl.text} · {MOCK_ENABLED ? 'mock edge' : EDGE_URL}
             </p>
@@ -474,8 +484,8 @@ export default function RegisterApp() {
                     </option>
                   ))}
                 </select>
-                {!token ? (
-                  <span className="text-xs text-amber-200">Enter the admin token above to load the signed schedule (roles shown now come from the demo source file).</span>
+                {!auth.can(PERM.accessRead) ? (
+                  <span className="text-xs text-amber-200">{needsText(PERM.accessRead)} to load the signed schedule (roles shown now come from the demo source file).</span>
                 ) : dir.accessError && !dir.access ? (
                   <span className="text-xs text-amber-200">Signed schedule list not available ({dir.accessError}); roles shown come from the demo source file.</span>
                 ) : null}
@@ -554,7 +564,9 @@ export default function RegisterApp() {
               ) : null}
               {plan?.kind === 'blocked' ? (
                 <p className="rounded-lg bg-red-600/25 px-3 py-2 text-sm text-red-50 md:col-span-2" role="alert">
-                  {plan.why === 'OFFLINE'
+                  {plan.why === 'NEEDS_ACCESS_EDIT'
+                    ? `${askAdminText(form.user_id)} Your account can enrol people who are already in the signed schedule (${needsText(PERM.accessEdit)} to add or change someone).`
+                    : plan.why === 'OFFLINE'
                     ? `${form.user_id} ${erased ? 'was erased and needs re-admission' : 'is not in this kiosk’s signed schedule'}: ${REASON_HINT.OFFLINE} People already in the installed bundle can still register offline.`
                     : plan.why === 'REVOKED'
                       ? REASON_HINT.USER_REVOKED
@@ -671,14 +683,14 @@ export default function RegisterApp() {
                   <Btn
                     big
                     tone="primary"
-                    disabled={shots.length < 3 || capturing || step === 'submitting' || !token || blocked}
+                    disabled={shots.length < 3 || capturing || step === 'submitting' || !can.enrolWrite || blocked}
                     onClick={() => void submit()}
-                    title={!token ? 'Enter the admin token first' : undefined}
+                    title={!can.enrolWrite ? needsText(PERM.enrolWrite) : undefined}
                   >
                     {step === 'submitting' ? 'Registering…' : registerLabel}
                   </Btn>
                 </div>
-                {!token ? <p className="text-xs text-amber-200">Enter the admin token above to register.</p> : null}
+                {!can.enrolWrite ? <p className="text-xs text-amber-200">{needsText(PERM.enrolWrite)} to register.</p> : null}
               </div>
             </div>
           ) : null}
@@ -752,7 +764,7 @@ export default function RegisterApp() {
                 <a href={`/operator${window.location.search}`} className="rounded-xl bg-[#2a78d6] px-6 py-3 text-lg font-semibold text-white hover:bg-[#256abf]">
                   Test recognition (operator console)
                 </a>
-                <a href={`/${window.location.search}`} className="rounded-xl bg-white/10 px-6 py-3 text-lg font-semibold ring-1 ring-white/25 hover:bg-white/20">
+                <a href={`/${window.location.search}`} target="_blank" rel="noreferrer" className="rounded-xl bg-white/10 px-6 py-3 text-lg font-semibold ring-1 ring-white/25 hover:bg-white/20">
                   Open the kiosk
                 </a>
                 <Btn big tone="ghost" onClick={restart}>
@@ -775,7 +787,7 @@ export default function RegisterApp() {
               </Btn>
             </span>
           </div>
-          {!token ? <p className="text-sm text-white/60">Enter the admin token to list and erase users.</p> : null}
+          {!auth.can(PERM.enrolRead) ? <p className="text-sm text-white/60">{needsText(PERM.enrolRead)} to list enrolled users.</p> : null}
           {dir.enrolledError && token ? <p className="text-sm text-red-300">{errorText(dir.enrolledError)}</p> : null}
           {listMsg ? <p className="text-sm text-white/80">{listMsg}</p> : null}
           {users.length ? (
@@ -797,7 +809,12 @@ export default function RegisterApp() {
                       {u.updated_at ? ` · ${new Date(u.updated_at).toLocaleString([], { hour12: false })}` : ''}
                     </p>
                   </div>
-                  <Btn tone="danger" onClick={() => void erase(u)}>
+                  <Btn
+                    tone="danger"
+                    onClick={() => void erase(u)}
+                    disabled={!can.enrolErase}
+                    title={can.enrolErase ? undefined : needsText(PERM.enrolErase)}
+                  >
                     Erase
                   </Btn>
                 </li>

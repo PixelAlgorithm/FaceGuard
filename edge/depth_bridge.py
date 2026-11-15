@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import secrets
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -84,6 +85,10 @@ class DepthBridge:
         self._stored: dict[tuple[str, str], _Stored] = {}
         self._arrived: dict[tuple[str, str], asyncio.Event] = {}
         self._issued: dict[tuple[str, str], DepthRequest] = {}
+        # EAE-15: every key's first-seen time (GC of keys that never got an upload) and one lock for the maps,
+        # which submit() mutates from a worker thread while the event loop iterates them
+        self._born: dict[tuple[str, str], float] = {}
+        self._maps = threading.Lock()
         self.last_seen_device_at: float | None = None
         self.last_rejected_token_at: float | None = None  # last depth call refused for a bad X-Depth-Token
         self._poll_log_at: dict[int, float] = {}  # status -> monotonic time of the last logged failure
@@ -128,16 +133,27 @@ class DepthBridge:
         return True
 
     def _event(self, key: tuple[str, str]) -> asyncio.Event:
-        if key not in self._arrived:
-            self._arrived[key] = asyncio.Event()
-        return self._arrived[key]
+        with self._maps:
+            ev = self._arrived.get(key)
+            if ev is None:
+                ev = self._arrived[key] = asyncio.Event()
+                self._born.setdefault(key, time.monotonic())
+            return ev
 
-    def _gc(self) -> None:
-        now = time.monotonic()
-        for key in [k for k, v in self._stored.items() if now - v.at > DEPTH_TTL_S]:
+    def _forget(self, key: tuple[str, str]) -> None:
+        with self._maps:
             self._stored.pop(key, None)
             self._arrived.pop(key, None)
             self._issued.pop(key, None)
+            self._born.pop(key, None)
+
+    def _gc(self) -> None:
+        now = time.monotonic()
+        with self._maps:
+            stale = {k for k, v in self._stored.items() if now - v.at > DEPTH_TTL_S}
+            stale |= {k for k, t in self._born.items() if now - t > DEPTH_TTL_S and k not in self._stored}
+        for key in stale:
+            self._forget(key)
         now_ms = int(time.time() * 1000)
         while self._pending and self._pending[0].deadline_ms < now_ms - 5000:
             self._pending.popleft()
@@ -152,9 +168,7 @@ class DepthBridge:
         deadline = int(time.time() * 1000) + span + CAPTURE_UPLOAD_MARGIN_MS + int(self.max_wait_ms)
         key = (attempt_id, phase)
         if phase == "CHALLENGE":  # a (re-)issued challenge invalidates any earlier CHALLENGE capture
-            self._stored.pop(key, None)
-            self._arrived.pop(key, None)
-            self._issued.pop(key, None)
+            self._forget(key)
             self._pending = deque(r for r in self._pending if (r.attempt_id, r.phase) != key)
         self._event(key)
         async with self._cond:
@@ -171,7 +185,8 @@ class DepthBridge:
                 for req in self._pending:
                     if not req.claimed and req.deadline_ms >= now_ms:
                         req.claimed = True
-                        self._issued[(req.attempt_id, req.phase)] = req
+                        with self._maps:
+                            self._issued[(req.attempt_id, req.phase)] = req
                         return req
                 remaining = end - time.monotonic()
                 if remaining <= 0:
@@ -195,13 +210,15 @@ class DepthBridge:
             meta["landmarks_norm"] = landmarks_norm
         neutral = None
         if meta["phase"] == "CHALLENGE":
-            stored = self._stored.get((meta["attempt_id"], "PASSIVE"))
+            with self._maps:
+                stored = self._stored.get((meta["attempt_id"], "PASSIVE"))
             neutral = stored.result if stored else None
         res = process_upload(json.dumps(meta), blobs, self.th, neutral=neutral)
         sig = DepthSignal(**{k: res.signal.get(k) for k in DepthSignal.model_fields if k in res.signal})
         log.info("depth %s/%s: available=%s m1=%s reason=%s %.1f ms", res.attempt_id, res.phase, sig.available,
                  sig.m1_mouth_residual_mm, res.diag.get("reason"), res.compute_ms)
-        self._stored[(res.attempt_id, res.phase)] = _Stored(signal=sig, result=res)
+        with self._maps:
+            self._stored[(res.attempt_id, res.phase)] = _Stored(signal=sig, result=res)
         return sig
 
     def mark_arrived(self, attempt_id: str, phase: str) -> None:
@@ -222,7 +239,6 @@ class DepthBridge:
         return stored.signal if stored else None
 
     def drop(self, attempt_id: str) -> None:
+        """Forget every depth map / nonce / event of an attempt (called when it reaches a terminal decision)."""
         for phase in ("PASSIVE", "CHALLENGE"):
-            self._stored.pop((attempt_id, phase), None)
-            self._arrived.pop((attempt_id, phase), None)
-            self._issued.pop((attempt_id, phase), None)
+            self._forget((attempt_id, phase))

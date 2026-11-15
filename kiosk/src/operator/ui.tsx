@@ -2,6 +2,7 @@
 import { useEffect, useRef, type ReactNode } from 'react'
 import type { VisionEngine } from '../capture/engine'
 import { MOCK_ENABLED } from '../config'
+import { SignedInBadge } from '../shared/auth/LoginGate'
 import { ModeBadge } from '../shared/ModeBadge'
 import { KIND_TAG, type VideoDevice } from './devices'
 import type { OperatorEngineState } from './opEngine'
@@ -16,17 +17,19 @@ const NAV: Array<{ href: string; label: string }> = [
 /** Keeps ?mock=1 etc. when moving between routes. */
 const withQuery = (href: string) => `${href}${window.location.search}`
 
-export function OpHeader({ title, current }: { title: string; current: string }) {
+export function OpHeader({ title, current, bundleVersion = null }: { title: string; current: string; bundleVersion?: number | string | null }) {
   return (
     <header className="flex flex-wrap items-center gap-3 border-b border-white/10 bg-black/60 px-5 py-3">
       <span className="text-lg font-bold tracking-wide">HID kiosk</span>
       <span className="text-lg text-white/60">· {title}</span>
-      <ModeBadge size="sm" showBundle />
+      <ModeBadge size="sm" showBundle bundleVersion={bundleVersion} />
       <nav className="ml-auto flex flex-wrap gap-1" aria-label="Kiosk pages">
         {NAV.map((n) => (
           <a
             key={n.href}
             href={withQuery(n.href)}
+            // the public kiosk opens in its own tab: a staff tab never turns into the public kiosk (audit KAO-02)
+            {...(n.href === '/' ? { target: '_blank', rel: 'noreferrer' } : {})}
             aria-current={n.href === current ? 'page' : undefined}
             className={`rounded-lg px-3 py-1.5 text-sm font-semibold ${
               n.href === current ? 'bg-white text-black' : 'text-white/80 ring-1 ring-white/20 hover:bg-white/10'
@@ -36,6 +39,7 @@ export function OpHeader({ title, current }: { title: string; current: string })
           </a>
         ))}
       </nav>
+      <SignedInBadge tone="dark" />
       {MOCK_ENABLED ? <span className="w-full text-xs text-fuchsia-300">Mock edge (?mock=1): decisions are simulated in the browser.</span> : null}
     </header>
   )

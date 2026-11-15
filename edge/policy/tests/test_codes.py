@@ -17,6 +17,7 @@ ADDED = {
     "MASK_CUE_SHAPE", "MASK_CUE_SPECTRAL", "SCHEDULE_HIGH_RISK_ZONE", "SCHEDULE_BUNDLE_INVALID",
     "RATE_LIMITED", "SYSTEM_ERROR",
     "RANDOM_CHALLENGE",  # round-2 lead decision R4
+    "FALLBACK_LOCKED",  # KF-03 (policy-fixes): locked second-factor method, not a counted failure
 }
 
 

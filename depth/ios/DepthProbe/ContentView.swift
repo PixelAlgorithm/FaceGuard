@@ -108,6 +108,15 @@ struct ContentView: View {
             }
             .navigationTitle("DepthProbe")
             .navigationBarTitleDisplayMode(.inline)
+            .alert("Apply pairing link?", isPresented: Binding(
+                get: { model.pendingConfigLink != nil },
+                set: { if !$0 { model.cancelPendingLink() } }
+            )) {
+                Button("Apply") { model.confirmPendingLink() }
+                Button("Cancel", role: .cancel) { model.cancelPendingLink() }
+            } message: {
+                Text(model.pendingLinkSummary())
+            }
         }
     }
 

@@ -10,6 +10,9 @@ once the attempt is final (ALLOW / DENY, or abandoned -> its last STEP_UP), so t
 two different records for one attempt (no false SYNC_CONFLICT).
 Retention: deleted on server ack; unsynced records older than max_retention_hours are purged and a
 tombstone {count, first_seq, last_seq, chain_head} is queued instead.
+Deletion evidence (EO-06): every seq that leaves the table legitimately (server ack or retention tombstone) is
+recorded in an authenticated (AES-GCM) range set; verify_chain() reports the first seq below next_seq that is
+neither present nor covered, so `DELETE FROM decision_log WHERE seq=3` (no key needed) is detected locally.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from typing import Any
 
 from edge.offline.bundle import canonical_json
 from edge.offline.crypto import DataCipher
+from edge.policy.lockouts import FailureRecord
 
 RECORD_FIELDS = (
     "attempt_id", "seq", "kiosk_id", "zone", "ts_utc", "user_id", "candidate_user_id", "decision",
@@ -122,6 +126,20 @@ class DecisionLog:
         cols = {r[1] for r in self._db.execute("PRAGMA table_info(decision_log)")}
         if "created_real" not in cols:  # migration: real-clock creation time drives the retention purge
             self._db.execute("ALTER TABLE decision_log ADD COLUMN created_real TEXT")
+        self.evidence_rebased = False  # True = the removal evidence had to be re-baselined (runtime alert)
+        with self._lock:
+            if self._evidence() is None:
+                self._baseline_evidence()
+
+    def _baseline_evidence(self) -> None:
+        """First open of a fresh log, or a log whose evidence is missing / unauthenticated (pre-upgrade file OR
+        tampering -- indistinguishable locally): every currently absent seq is taken as removed, and a non-fresh
+        log raises `evidence_rebased` so the runtime alerts (the cloud's gap check stays authoritative)."""
+        present = {r[0] for r in self._db.execute("SELECT seq FROM decision_log")}
+        next_seq = int(self._meta("next_seq", "1") or 1)
+        self.evidence_rebased = next_seq > 1 or self._meta(_RANGES_KEY) is not None
+        ranges = _add_seqs([], [q for q in range(1, next_seq) if q not in present])
+        self._save_evidence(ranges, next_seq, self._meta("chain_head") or genesis_hash(self.kiosk_id))
 
     def close(self) -> None:
         with self._lock:
@@ -138,6 +156,39 @@ class DecisionLog:
     def chain_head(self) -> str:
         with self._lock:
             return self._meta("chain_head") or genesis_hash(self.kiosk_id)
+
+    def fallback_epoch(self) -> str | None:
+        """Epoch of the fallback-state file this log last ran with (EO-12 reset detection)."""
+        with self._lock:
+            return self._meta("fallback_epoch")
+
+    def set_fallback_epoch(self, epoch: str) -> None:
+        with self._lock:
+            self._set_meta("fallback_epoch", str(epoch))
+
+    # ------------------------------------------------------------ deletion evidence (EO-06)
+    def _evidence(self) -> dict[str, Any] | None:
+        """Authenticated {ranges, next_seq, chain_head}: removed seqs + the authentic chain tip (detects tail
+        deletion with a rewritten plain next_seq / chain_head, EO-06). None = missing or tampered."""
+        raw = self._meta(_RANGES_KEY)
+        if raw is None:
+            return None
+        try:
+            data = json.loads(self._c.decrypt(bytes.fromhex(raw), _RANGES_AAD + self.kiosk_id.encode()))
+            return {"ranges": [[int(a), int(b)] for a, b in data["ranges"]], "next_seq": int(data["next_seq"]),
+                    "chain_head": str(data["chain_head"])}
+        except Exception:  # noqa: BLE001 - tag failure / garbage / old format = unauthenticated
+            return None
+
+    def _save_evidence(self, ranges: list[list[int]], next_seq: int, chain_head: str) -> None:
+        body = {"ranges": ranges, "next_seq": int(next_seq), "chain_head": chain_head}
+        blob = self._c.encrypt(json.dumps(body).encode(), _RANGES_AAD + self.kiosk_id.encode())
+        self._set_meta(_RANGES_KEY, blob.hex())
+
+    def _cover(self, seqs: Iterable[int]) -> None:
+        ev = self._evidence() or {"ranges": [], "next_seq": int(self._meta("next_seq", "1") or 1),
+                                  "chain_head": self.chain_head()}
+        self._save_evidence(_add_seqs(ev["ranges"], seqs), ev["next_seq"], ev["chain_head"])
 
     def _aad(self, seq: int | str, attempt_id: str) -> bytes:
         return f"{self.kiosk_id}|{seq}|{attempt_id}".encode()
@@ -196,6 +247,8 @@ class DecisionLog:
                 self._db.execute("DELETE FROM pending WHERE attempt_id=?", (rec["attempt_id"],))
                 self._set_meta("next_seq", str(seq + 1))
                 self._set_meta("chain_head", rec["record_hash"])
+                ev = self._evidence()
+                self._save_evidence(ev["ranges"] if ev else [], seq + 1, rec["record_hash"])
                 self._db.execute("COMMIT")
             except BaseException:
                 self._db.execute("ROLLBACK")
@@ -236,9 +289,21 @@ class DecisionLog:
         """Server acknowledged (accepted or duplicate): purge those records now."""
         ids = list(attempt_ids)
         with self._lock:
-            n = 0
-            for a in ids:
-                n += self._db.execute("DELETE FROM decision_log WHERE attempt_id=?", (a,)).rowcount
+            n, seqs = 0, []
+            self._db.execute("BEGIN IMMEDIATE")  # delete + evidence in one transaction (no false tamper on a crash)
+            try:
+                for a in ids:
+                    row = self._db.execute("SELECT seq FROM decision_log WHERE attempt_id=?", (a,)).fetchone()
+                    if row is None:
+                        continue
+                    n += self._db.execute("DELETE FROM decision_log WHERE seq=?", (row[0],)).rowcount
+                    seqs.append(int(row[0]))
+                if seqs:
+                    self._cover(seqs)
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
             return n
 
     def ack_tombstones(self, ids: Iterable[str]) -> int:
@@ -266,6 +331,7 @@ class DecisionLog:
                 self._db.executemany("DELETE FROM decision_log WHERE seq=?", [(s,) for s in seqs])
                 self._db.execute("INSERT OR REPLACE INTO tombstones(id, created_at, payload) VALUES(?,?,?)",
                                  (tid, iso_utc(now), self._enc(tomb, self._aad("tombstone", tid))))
+                self._cover(seqs)
                 self._db.execute("COMMIT")
             except BaseException:
                 self._db.execute("ROLLBACK")
@@ -282,11 +348,22 @@ class DecisionLog:
     def verify_chain(self) -> tuple[bool, int | None]:
         """Recompute every remaining record's hash and the links between consecutive records.
 
-        Returns (True, None) or (False, first_bad_seq). Deleted (acked) records leave gaps that only
-        the server - which holds them - can bridge."""
+        Returns (True, None) or (False, first_bad_seq). Acked / tombstoned records leave gaps that only the server
+        (which holds them) can bridge; any OTHER missing seq below next_seq is reported as the first bad seq
+        (EO-06: a deleted unsynced record)."""
         with self._lock:
             rows = self._db.execute(
                 "SELECT seq, attempt_id, payload, prev_hash, record_hash FROM decision_log ORDER BY seq").fetchall()
+            ev = self._evidence()
+            meta_next = int(self._meta("next_seq", "1") or 1)
+            meta_head = self._meta("chain_head") or genesis_hash(self.kiosk_id)
+        if ev is None:  # evidence missing / tampered since open
+            return False, (rows[0][0] if rows else max(1, meta_next - 1))
+        if ev["next_seq"] != meta_next or ev["chain_head"] != meta_head:  # rewritten tip (tail deletion)
+            return False, max(1, min(ev["next_seq"], meta_next) - 1)
+        missing = _first_uncovered(ev["next_seq"], {r[0] for r in rows}, ev["ranges"])
+        if missing is not None:
+            return False, missing
         prev_seq, prev_hash = None, None
         for seq, attempt_id, payload, row_prev, row_hash in rows:
             try:
@@ -304,11 +381,51 @@ class DecisionLog:
         return True, None
 
 
-class SqliteFallbackState:
-    """Device-wide fallback state (TOTP last accepted step per user, consumed override codes).
+_RANGES_KEY = "removal_evidence_v2"
+_RANGES_AAD = b"removed-ranges|"
 
-    One file per edge device (not per KIOSK_ID) so a consumed one-time code or a used TOTP step can
-    never be replayed after a kiosk switch. User ids / code ids are stored only as keyed pseudonyms."""
+
+def _add_seqs(ranges: list[list[int]], seqs: Iterable[int]) -> list[list[int]]:
+    """Merge seqs into a sorted list of inclusive [lo, hi] ranges (new list; inputs untouched)."""
+    points = sorted({int(q) for q in seqs})
+    merged = sorted([list(r) for r in ranges] + [[q, q] for q in points])
+    out: list[list[int]] = []
+    for lo, hi in merged:
+        if out and lo <= out[-1][1] + 1:
+            out[-1] = [out[-1][0], max(out[-1][1], hi)]
+        else:
+            out.append([lo, hi])
+    return out
+
+
+def _first_uncovered(next_seq: int, present: set[int], ranges: list[list[int]] | None) -> int | None:
+    """Smallest seq in [1, next_seq) that is neither present nor legitimately removed (None = complete)."""
+    if ranges is None:
+        return 1 if next_seq > 1 else None  # evidence missing or tampered: the whole history is unproven
+    expected = 1
+    for lo, hi in ranges:
+        for q in range(expected, min(lo, next_seq)):
+            if q not in present:
+                return q
+        expected = max(expected, hi + 1)
+    for q in range(expected, next_seq):
+        if q not in present:
+            return q
+    return None
+
+
+_LOCKED_FOREVER = datetime(9999, 1, 1, tzinfo=UTC)  # undecryptable failure row -> locked (lockouts.py clamps it)
+
+
+class SqliteFallbackState:
+    """Device-wide fallback state (TOTP last accepted step per user, consumed override codes, second-factor
+    failure counters / lockouts).
+
+    One file per edge device (not per KIOSK_ID) so a consumed one-time code, a used TOTP step or a lockout can
+    never be replayed / reset after a kiosk switch or a restart (SC2-D9, EO-12). User ids, staff ids and code ids
+    are stored only as keyed pseudonyms; failure records are AES-GCM encrypted (a tampered row reads as locked).
+    `epoch` = random id written once at creation: the runtime compares it with the decision log to detect a
+    deleted / replaced state file (EO-12) and re-seeds consumed codes and TOTP steps from the log."""
 
     def __init__(self, path: Path | str, data_key: str | bytes) -> None:
         self.path = str(path)
@@ -321,9 +438,16 @@ class SqliteFallbackState:
         self._db.execute("PRAGMA secure_delete = ON")
         self._db.executescript(
             "CREATE TABLE IF NOT EXISTS fb_totp(user_key TEXT PRIMARY KEY, step INTEGER NOT NULL);"
-            "CREATE TABLE IF NOT EXISTS fb_consumed(code_key TEXT PRIMARY KEY, consumed_at TEXT NOT NULL);")
-        self._failures = 0
-        self._locked_until: datetime | None = None
+            "CREATE TABLE IF NOT EXISTS fb_consumed(code_key TEXT PRIMARY KEY, consumed_at TEXT NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS fb_fail(scope_key TEXT PRIMARY KEY, payload BLOB NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS fb_meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);")
+        row = self._db.execute("SELECT v FROM fb_meta WHERE k='epoch'").fetchone()
+        self.created_new = row is None
+        if row is None:
+            self.epoch = os.urandom(16).hex()
+            self._db.execute("INSERT INTO fb_meta(k, v) VALUES('epoch', ?)", (self.epoch,))
+        else:
+            self.epoch = str(row[0])
 
     def _key(self, value: str) -> str:
         return self._c.pseudonym(value)
@@ -349,13 +473,72 @@ class SqliteFallbackState:
             self._db.execute("INSERT OR IGNORE INTO fb_consumed(code_key, consumed_at) VALUES(?,?)",
                              (self._key(code_id), iso_utc(at)))
 
-    def override_lock(self) -> tuple[int, datetime | None]:
-        return self._failures, self._locked_until
+    def failure_record(self, scope: str) -> FailureRecord | None:
+        key = self._key("fail:" + scope)
+        with self._lock:
+            row = self._db.execute("SELECT payload FROM fb_fail WHERE scope_key=?", (key,)).fetchone()
+        if row is None:
+            return None
+        try:
+            d = json.loads(self._c.decrypt(row[0], key.encode()))
+            times = tuple(t for t in (_parse_iso(x) for x in d.get("times") or []) if t is not None)
+            return FailureRecord(failures=int(d.get("failures") or 0), window_start=_parse_iso(d.get("window_start")),
+                                 locked_until=_parse_iso(d.get("locked_until")), times=times)
+        except Exception:  # noqa: BLE001 - tampered / foreign-key row: fail secure = locked
+            return FailureRecord(locked_until=_LOCKED_FOREVER)
+
+    def set_failure_record(self, scope: str, record: FailureRecord | None) -> None:
+        key = self._key("fail:" + scope)
+        with self._lock:
+            if record is None:
+                self._db.execute("DELETE FROM fb_fail WHERE scope_key=?", (key,))
+                return
+            body = {"failures": int(record.failures),
+                    "window_start": iso_utc(record.window_start) if record.window_start else None,
+                    "locked_until": iso_utc(record.locked_until) if record.locked_until else None,
+                    "times": [record_time(t) for t in record.times]}
+            self._db.execute(
+                "INSERT INTO fb_fail(scope_key, payload) VALUES(?,?) "
+                "ON CONFLICT(scope_key) DO UPDATE SET payload=excluded.payload",
+                (key, self._c.encrypt(json.dumps(body).encode(), key.encode())))
 
     def purge_totp_before(self, step: int) -> int:
         """Replay protection only matters inside the +-window: older last-steps can never collide again."""
         with self._lock:
             return self._db.execute("DELETE FROM fb_totp WHERE step < ?", (int(step),)).rowcount
 
-    def set_override_lock(self, failures: int, locked_until: datetime | None) -> None:
-        self._failures, self._locked_until = failures, locked_until
+    def close(self) -> None:
+        with self._lock:
+            self._db.close()
+
+
+def record_time(t: datetime) -> str:
+    """Failure-time stamp with microseconds (sliding windows need sub-second order)."""
+    return t.astimezone(UTC).isoformat()
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return datetime.fromisoformat(value)  # 3.11 parses a trailing Z
+
+
+def reseed_fallback_state(state: Any, log: DecisionLog, at: datetime) -> dict[str, int]:
+    """EO-12 recovery: re-mark every override code and TOTP step recorded in the (unsynced) decision log as used,
+    so deleting fallback_state.sqlite cannot make a consumed code / used step valid again. Synced records are gone
+    locally; the cloud retires their codes through the signed bundle's consumed_code_ids (SC2-D8). Tighten-only."""
+    codes = steps = 0
+    for rec in log.records() + log.pending():
+        fb = rec.get("fallback") if isinstance(rec, Mapping) else None
+        if not isinstance(fb, Mapping) or rec.get("decision") != "ALLOW":
+            continue
+        cid, step, uid = fb.get("code_id"), fb.get("totp_step"), rec.get("user_id")
+        if isinstance(cid, str) and cid and not state.is_code_consumed(cid):
+            state.consume_code(cid, at)
+            codes += 1
+        if isinstance(step, int) and isinstance(uid, str) and uid:
+            last = state.totp_last_step(uid)
+            if last is None or step > last:
+                state.set_totp_last_step(uid, step)
+                steps += 1
+    return {"codes": codes, "totp_steps": steps}

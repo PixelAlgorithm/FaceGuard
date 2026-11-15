@@ -21,7 +21,7 @@ class EraseCloud:
     """Wraps the offline FakeCloud: answers DELETE /v1/enroll/{user_id} with a scripted status."""
 
     def __init__(self, inner, statuses: dict[str, int | None] | None = None) -> None:
-        self.inner, self.statuses, self.deletes = inner, statuses or {}, []
+        self.inner, self.statuses, self.deletes, self.queries = inner, statuses or {}, [], []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         p = request.url.path
@@ -31,9 +31,14 @@ class EraseCloud:
                 raise httpx.ConnectError("cloud down", request=request)
             uid = p.rsplit("/", 1)[1]
             self.deletes.append(uid)
+            self.queries.append(request.url.query.decode())
             status = self.statuses.get(uid, 200)
             if status is None:
                 raise httpx.ReadTimeout("timeout", request=request)
+            if status == 404:  # EAE-12: the cloud's "nothing held" answer (any other 404 stays queued)
+                return httpx.Response(404, json={"error": {"code": "NOT_FOUND", "reason": "NOT_ENROLLED"}})
+            if status == 4040:  # a bare 404 (e.g. wrong route / proxy): never proof of erasure
+                return httpx.Response(404, text="not found")
             return httpx.Response(status, json={"user_id": uid, "erased": status == 200})
         return self.inner(request)
 
@@ -54,7 +59,7 @@ def test_store_round_trip_encrypted_owner_only(tmp_path):
     s = PendingErasures(path, TEST_DATA_KEY)
     t0 = RT_CLOCK()
     first = s.add("u_3c4d", t0)
-    assert first == {"user_id": "u_3c4d", "queued_at": iso_utc(t0)}
+    assert first == {"user_id": "u_3c4d", "queued_at": iso_utc(t0), "actor": None}
     s.add("u_3c4d", t0.replace(year=2027))  # idempotent: the first queued_at is kept
     s.add("u_1a2b", t0)
     assert [e["user_id"] for e in s.items()] == ["u_1a2b", "u_3c4d"]
@@ -63,7 +68,7 @@ def test_store_round_trip_encrypted_owner_only(tmp_path):
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
     again = PendingErasures(path, TEST_DATA_KEY)
     assert again.items() == s.items()
-    assert set(again.items()[0]) == {"user_id", "queued_at"}  # minimum fields only
+    assert set(again.items()[0]) == {"user_id", "queued_at", "actor"}  # minimum fields only (V2 D: + actor)
     assert again.remove("u_3c4d") is True and again.remove("u_3c4d") is False
     assert [e["user_id"] for e in PendingErasures(path, TEST_DATA_KEY).items()] == ["u_1a2b"]
 
@@ -86,7 +91,7 @@ def test_store_without_a_path_is_in_memory(tmp_path):
 def test_queue_is_listed_and_survives_a_restart(make_rt, tmp_path):
     rt = make_rt()
     out = rt.queue_cloud_erasure("u_3c4d")
-    assert set(out) == {"user_id", "queued_at"} and out["user_id"] == "u_3c4d"
+    assert set(out) == {"user_id", "queued_at", "actor"} and out["user_id"] == "u_3c4d" and out["actor"] is None
     assert out["queued_at"].startswith("2026-11-14T04:35") and out["queued_at"].endswith("Z")  # real clock, UTC
     assert [e["user_id"] for e in rt.pending_cloud_erasures()] == ["u_3c4d"]
     rt.stop()
@@ -163,3 +168,46 @@ def test_queue_rejects_invalid_user_ids(make_rt):
     with pytest.raises(ValueError):
         rt.queue_cloud_erasure("../v1/admin")
     assert rt.pending_cloud_erasures() == []
+
+
+# ---------------------------------------------------------------- policy-fixes: actor (V2 D), 404 rule, EO-08
+def test_actor_is_persisted_validated_and_sent_signed(erase_rt, tmp_path):
+    rt, ec = erase_rt()
+    out = rt.queue_cloud_erasure("u_3c4d", actor="staff:s_guard01")
+    assert out["actor"] == "staff:s_guard01"
+    with pytest.raises(ValueError):
+        rt.queue_cloud_erasure("u_1a2b", actor="admin; DROP")
+    assert [e["actor"] for e in rt.pending_cloud_erasures()] == ["staff:s_guard01"]
+    rt.sync_now()
+    assert rt.pending_cloud_erasures() == [] and ec.queries == ["actor=staff%3As_guard01"]
+
+
+def test_bare_404_is_not_proof_of_erasure(erase_rt):
+    rt, _ec = erase_rt({"u_3c4d": 4040})
+    rt.queue_cloud_erasure("u_3c4d")
+    rt.sync_now()
+    assert [e["user_id"] for e in rt.pending_cloud_erasures()] == ["u_3c4d"]
+
+
+def test_corrupt_queue_file_is_quarantined_not_fatal(tmp_path):
+    path = tmp_path / "pending_erasures.enc"
+    path.write_bytes(b"")  # power loss mid-write
+    q = PendingErasures(path, TEST_DATA_KEY)
+    assert q.items() == [] and q.corrupt is not None and q.corrupt.exists()
+    q.add("u_3c4d", RT_CLOCK())
+    assert [e["user_id"] for e in PendingErasures(path, TEST_DATA_KEY).items()] == ["u_3c4d"]
+
+
+def test_pending_enrolments_refuse_biometric_payloads(tmp_path):
+    from edge.offline.erasures import PendingEnrolments
+
+    q = PendingEnrolments(tmp_path / "pending_enrolments.enc", TEST_DATA_KEY)
+    rec = {"user_id": "u_3c4d", "actor": "key:abcd1234", "at": "2026-11-14T04:35:00Z", "template_count": 3,
+           "model": "buffalo_l", "kiosk_id": "KIOSK_MAIN_01"}
+    assert q.add(rec) == rec
+    for bad in ({**rec, "images": ["..."]}, {**rec, "embedding": [0.1]}, {**rec, "user_id": "x"}, {**rec, "zz": 1}):
+        with pytest.raises(ValueError):
+            q.add(bad)
+    raw = (tmp_path / "pending_enrolments.enc").read_bytes()
+    assert b"u_3c4d" not in raw
+    assert PendingEnrolments(tmp_path / "pending_enrolments.enc", TEST_DATA_KEY).items() == [rec]

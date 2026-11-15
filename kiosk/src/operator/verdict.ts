@@ -8,6 +8,7 @@ import rawThresholds from 'virtual:thresholds'
 import type { Decision, DecisionResponse } from '../api/types'
 import { DEMO_USERS } from '../shared/demoUsers'
 import type { EdgeUser } from './edgeRaw'
+import { resolveRole as resolveRoleFrom, type RoleSource } from './role'
 
 type Obj = Record<string, unknown>
 const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -132,24 +133,11 @@ export const VERDICT_STYLE: Record<Verdict, { title: string; tail: string; sub: 
   DENIED: { title: 'DENIED', tail: '', sub: 'DENY', cls: 'bg-deny text-deny-ink', chip: 'bg-deny text-deny-ink' },
 }
 
-export type RoleSource = 'edge response' | 'enrolled users' | 'schedule bundle'
+export type { RoleSource } from './role'
 
-/**
- * candidate.role (edge: signed bundle) > demo schedule source > role stored with the template (enrolment
- * meta, informational: it never decides access) > unknown. Display only.
- */
-export function resolveRole(
-  userId: string | null,
-  rawRole: string | null,
-  users: EdgeUser[] | null,
-): { role: string | null; source: RoleSource | null } {
-  if (rawRole) return { role: rawRole, source: 'edge response' }
-  if (!userId) return { role: null, source: null }
-  const bundle = DEMO_USERS.find((u) => u.user_id === userId)?.role
-  if (bundle) return { role: bundle, source: 'schedule bundle' }
-  const enrolled = users?.find((u) => u.user_id === userId)?.role
-  if (enrolled) return { role: enrolled, source: 'enrolled users' }
-  return { role: null, source: null }
+/** Role next to a verdict (operator/role.ts, audit KAO-11). The demo file is used only when no user list loaded. */
+export function resolveRole(userId: string | null, rawRole: string | null, users: EdgeUser[] | null): { role: string | null; source: RoleSource | null } {
+  return resolveRoleFrom(userId, rawRole, users, DEMO_USERS)
 }
 
 export function nextActionText(d: DecisionResponse): string {

@@ -5,9 +5,10 @@
   3. same content correctly re-signed as version V-1 (lower) -> expect 409 INVALID_STATE
   4. GET /v1/schedule/<kiosk> again -> ETag still "V"
 
-    cloud/.venv/bin/python -m cloud.tools.smoke_upload --base https://<api>.execute-api.us-east-1.amazonaws.com
+    cloud/.venv/bin/python -m cloud.tools.smoke_upload --live --base https://<api-id>.execute-api.us-east-1.amazonaws.com
 
-Keys come from env / project .env and are never printed (curl lines use $CLOUD_API_KEY / $ADMIN_TOKEN).
+Keys come from env / project .env and are never printed (curl lines use $CLOUD_API_KEY / $FG_CLOUD_ADMIN_KEY).
+A non-local --base needs --live; the admin PUTs need FG_CLOUD_ADMIN_KEY (schedule:write).
 """
 
 from __future__ import annotations
@@ -15,10 +16,18 @@ from __future__ import annotations
 import argparse
 import copy
 import os
+import re
 import sys
 
 from cloud.app.config import PROJECT_ROOT, load_dotenv
+from cloud.tools import targets
 from cloud.tools.cloudclient import CloudClient, load_keys
+
+
+def etag_version(etag: str | None) -> int | None:
+    """bundle_version from an ETag: `"v<version>-<issued_at epoch>"` (RBAC design v2 §E) or legacy `"<version>"`."""
+    m = re.fullmatch(r'(?:W/)?"v?(\d+)(?:-\d+)?"', (etag or "").strip())
+    return int(m.group(1)) if m else None
 
 
 def _resign(doc: dict, key: bytes, key_id: str) -> dict:
@@ -31,11 +40,13 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base", required=True)
     ap.add_argument("--kiosk", default="KIOSK_MAIN_01")
+    targets.add_live_flag(ap)
     a = ap.parse_args(argv)
+    targets.require_target(a.base, live=a.live)
     env = dict(os.environ)
     load_dotenv(PROJECT_ROOT / ".env", env)
     bundle_key = env["SCHEDULE_BUNDLE_HMAC_KEY"].encode("utf-8")
-    c = CloudClient(a.base, a.kiosk, load_keys())
+    c = CloudClient(a.base, a.kiosk, load_keys(a.kiosk))
     path = f"/v1/admin/schedule/{a.kiosk}"
     ok = True
 
@@ -62,8 +73,8 @@ def main(argv: list[str]) -> int:
     ok &= r.status_code == 409 and err.get("code") == "INVALID_STATE"
 
     r, _ = c.request("GET", f"/v1/schedule/{a.kiosk}")
-    print(f"4. GET /v1/schedule/{a.kiosk} -> HTTP {r.status_code} ETag {r.headers.get('etag')} (expect \"{v}\")")
-    ok &= r.status_code == 200 and r.headers.get("etag") == f'"{v}"'
+    print(f"4. GET /v1/schedule/{a.kiosk} -> HTTP {r.status_code} ETag {r.headers.get('etag')} (expect version {v})")
+    ok &= r.status_code == 200 and etag_version(r.headers.get("etag")) == v
     print("\nSMOKE (upload refusals)", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
