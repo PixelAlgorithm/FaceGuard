@@ -5,7 +5,7 @@ import { epochNow } from '../../capture/time'
 import { useModeStatus } from '../../shared/modeStore'
 import type { DecisionViewModel } from '../controller'
 import { AlertIcon, CheckIcon, CrossIcon } from '../components/Icons'
-import { reasonText } from '../reasons'
+import { operatorDetail, reasonText } from '../reasons'
 
 const TONE = {
   allow: { bg: 'bg-allow', ink: 'text-allow-ink', sub: 'text-white/90', chip: 'bg-black/25', Icon: CheckIcon },
@@ -46,6 +46,7 @@ export function DecisionScreen({
   const cloudSlow = r.mode === 'OFFLINE' && badge?.mode === 'ONLINE' && badge.state === 'ONLINE'
   const t = TONE[copy.tone]
   const showDetail = THRESHOLDS.ui.showDetailedReasons
+  const op = operatorDetail(r)
   // Prefer the edge's display_message when it adds information beyond the mapped reason text.
   const dm = r.display_message?.trim() ?? ''
   const same = (a: string, b: string) => a.toLowerCase().includes(b.toLowerCase()) || b.toLowerCase().includes(a.toLowerCase())
@@ -96,7 +97,7 @@ export function DecisionScreen({
         <div className={`absolute inset-x-[3vw] bottom-[2.4vh] rounded-xl ${t.chip} px-4 py-2 text-left text-[clamp(11px,1.5vh,17px)]`}>
           <div className="flex flex-wrap items-center gap-2">
             <span className="font-bold uppercase opacity-80">Operator detail</span>
-            {r.reason_codes.map((c) => (
+            {op.codes.map((c) => (
               <span key={c} title={reasonText(c, r.decision)} className="rounded bg-black/30 px-2 py-0.5 font-mono font-semibold text-white">
                 {c}
               </span>
@@ -109,7 +110,7 @@ export function DecisionScreen({
             ))}
           </div>
           <div className="mt-1 font-mono opacity-85">
-            {r.mode} · stage {r.stage ?? '–'} · {r.bio_result ?? '–'} · schedule {r.schedule_result ?? '–'} · next{' '}
+            {r.mode} · stage {r.stage ?? '–'} · {r.bio_result ?? '–'} · schedule {op.scheduleResult ?? '–'} · next{' '}
             {r.next_action.type}
             {r.next_action.steps.length ? ` [${r.next_action.steps.join(' → ')}]` : ''} · {r.attempt_id}
           </div>

@@ -5,6 +5,8 @@
  * its zone ("enforced today"). Edits / revoke / restore / re-admit go through AccessEditor (ONLINE only);
  * offline the list is the installed bundle, read-only.
  */
+import { useAuth } from '../../shared/auth/context'
+import { PERM, needsText } from '../../shared/auth/permissions'
 import { useMemo, useState } from 'react'
 import { DAY_CODES, getApi, type AccessUser, type DayCode } from '../../api'
 import { refreshMode } from '../../shared/modeStore'
@@ -46,7 +48,14 @@ const NOW_TEXT: Record<string, string> = {
 
 export function UsersAccessPanel({ token }: { token: string }) {
   const api = getApi()
-  const dir = useAccessDirectory(token, 'users-tab')
+  const { can } = useAuth()
+  const dir = useAccessDirectory(token, 'users-tab', {
+    accessRead: can(PERM.accessRead),
+    enrolRead: can(PERM.enrolRead),
+    // the editor needs a writable schedule for edits (access:edit) and for revocations (access:revoke)
+    accessEdit: can(PERM.accessEdit) || can(PERM.accessRevoke),
+    bundleRefresh: can(PERM.bundleRefresh),
+  })
   const [editing, setEditing] = useState<{ user: AccessUser | null } | null>(null)
   const [filter, setFilter] = useState('')
   const [refreshing, setRefreshing] = useState(false)
@@ -87,10 +96,10 @@ export function UsersAccessPanel({ token }: { token: string }) {
     }
   }
 
-  if (!token) {
+  if (!token || !can(PERM.accessRead)) {
     return (
       <Card title="Users & access">
-        <p className="text-sm text-[#8f1d1d]">Enter the admin token (top right) to load the campus schedule.</p>
+        <p className="text-sm text-[#8a6d00]">{needsText(PERM.accessRead)} to load the campus schedule.</p>
       </Card>
     )
   }
@@ -124,8 +133,8 @@ export function UsersAccessPanel({ token }: { token: string }) {
           </button>
           <button
             type="button"
-            disabled={!dir.canEdit || !access}
-            title={dir.editBlockedReason ?? undefined}
+            disabled={!dir.canEdit || !access || !can(PERM.accessEdit)}
+            title={!can(PERM.accessEdit) ? needsText(PERM.accessEdit) : (dir.editBlockedReason ?? undefined)}
             onClick={() => setEditing({ user: null })}
             className="rounded-lg bg-[#2a78d6] px-3 py-1 text-sm font-semibold text-white hover:bg-[#256abf] disabled:opacity-50"
           >

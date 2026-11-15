@@ -292,7 +292,7 @@ export type RegisterPlan =
   /** must PUT access first (new person, role / name change, or ERASED re-admission), then enrol */
   | { kind: 'put-then-enrol'; readmit: boolean; create: boolean }
   /** cannot proceed: explain why */
-  | { kind: 'blocked'; why: 'OFFLINE' | 'REVOKED' | 'NOT_AT_THIS_KIOSK' | 'NO_ROLE' }
+  | { kind: 'blocked'; why: 'OFFLINE' | 'REVOKED' | 'NOT_AT_THIS_KIOSK' | 'NO_ROLE' | 'NEEDS_ACCESS_EDIT' }
 
 /**
  * What registering `userId` needs (R-A / R-B). `user` is the Users & Access row (null = unknown everywhere).
@@ -317,6 +317,20 @@ export function registerPlan(
   if (!online) return { kind: 'blocked', why: 'OFFLINE' }
   if (!wantRole) return { kind: 'blocked', why: 'NO_ROLE' }
   return { kind: 'put-then-enrol', readmit: erased, create: !known }
+}
+
+/**
+ * RBAC gate on a registration plan (design v2 §B): a schedule write (put-then-enrol) needs access:edit, which
+ * the enroller role does not hold. Without it the plan is blocked NEEDS_ACCESS_EDIT, so /register asks for an
+ * admin instead of sending a PUT the edge would refuse with 403. Other plans pass through unchanged.
+ */
+export function gatePlan(plan: RegisterPlan, canEditAccess: boolean): RegisterPlan {
+  return plan.kind === 'put-then-enrol' && !canEditAccess ? { kind: 'blocked', why: 'NEEDS_ACCESS_EDIT' } : plan
+}
+
+/** The sentence /register shows to a user without access:edit. */
+export function askAdminText(userId: string): string {
+  return `Ask an admin to add ${userId || 'this person'} to the schedule.`
 }
 
 /**

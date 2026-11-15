@@ -80,7 +80,29 @@ import {
   type RenderedReport,
   type SessionStartRequest,
   type SessionStartResponse,
+  type SetModeOptions,
 } from './types'
+import type {
+  ApiKeyCreate,
+  ApiKeyCreated,
+  ApiKeyInfo,
+  AuditQuery,
+  AuthAuditPage,
+  AuthMe,
+  AuthStatus,
+  LoginRequest,
+  LoginResult,
+  MfaEnrolment,
+  PasswordChange,
+  Principal,
+  Reauth,
+  RolesCatalog,
+  StaffAccount,
+  StaffCreate,
+  StaffPasswordReset,
+  StaffUpdate,
+} from './authTypes'
+import { MockAuth } from './mockAuth'
 
 const CHANNEL = 'hid-mock-events'
 
@@ -491,6 +513,7 @@ function simulatedLatency(mode: Mode): LatencyMs {
 export class MockEdgeApi implements EdgeApi {
   readonly kind = 'mock' as const
   readonly baseUrl = 'mock://edge'
+  private auth = new MockAuth()
   private attempts = new Map<string, MockAttempt>()
   private channel: BroadcastChannel | null =
     typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel(CHANNEL) : null
@@ -958,8 +981,8 @@ export class MockEdgeApi implements EdgeApi {
 
   // ------------------------------------------------ mode / health
 
-  async getMode(): Promise<ModeResponse> {
-    await sleep(randInt(2, 8))
+  /** Full status (GET /v1/admin/mode/detail on the edge). */
+  private fullMode(): ModeResponse {
     const s = updateShared(tickSync)
     const m = computeMode(s)
     return {
@@ -967,6 +990,8 @@ export class MockEdgeApi implements EdgeApi {
       state: m.state,
       since: s.since,
       forced: s.forced === 'OFFLINE',
+      forced_until: null,
+      cache_state: 'FRESH',
       last_cloud_ok_at: s.lastCloudOkAt,
       reason: m.reason,
       schedule_bundle: {
@@ -993,9 +1018,37 @@ export class MockEdgeApi implements EdgeApi {
       policy_bars: { pad_pass: 0.8, flash_enforce: false, moire_enforce: true, m2_rgb_enforce: true, rekognition: true, random_rate: 0.15, mock: true },
     }
   }
+  /** Public GET /v1/mode: the subset the edge publishes without a credential (design v2, edge-app). */
+  async getMode(): Promise<ModeResponse> {
+    await sleep(randInt(2, 8))
+    const f = this.fullMode()
+    return {
+      ...f,
+      since: null,
+      last_cloud_ok_at: null,
+      schedule_bundle: f.schedule_bundle ? { ...f.schedule_bundle, version: null, expires_at: null, signature_valid: null, issued_at: null } : null,
+      revocation_seq: null,
+      template_cache: f.template_cache ? { count: f.template_cache.count, model: null } : null,
+      cloud_match: f.cloud_match ? { enabled: null, degraded: f.cloud_match.degraded, recent: null, misses: null, last_miss_at: null, last_ok_at: null } : null,
+      random_challenge: null,
+      zone: null,
+      policy_version: null,
+      rate_limit: null,
+      last_sync: null,
+      server_flags: [],
+      policy_bars: null,
+    }
+  }
+
+  async getModeDetail(token: string): Promise<ModeResponse> {
+    this.requirePerm(token, 'store:read', 'GET', '/v1/admin/mode/detail')
+    await sleep(randInt(2, 8))
+    return this.fullMode()
+  }
+
 
   async setRandomChallenge(token: string, mode: RandomChallengeMode): Promise<unknown> {
-    this.requireToken(token)
+    this.requirePerm(token, 'challenge:control', 'POST', '/v1/admin/random-challenge')
     updateShared((s) => {
       s.randomChallenge = mode
     })
@@ -1008,12 +1061,105 @@ export class MockEdgeApi implements EdgeApi {
 
   // ------------------------------------------------ admin
 
-  private requireToken(token: string): void {
-    if (!token.trim()) throw new ApiError('UNAUTHORIZED', 401, 'X-Admin-Token required (mock accepts any non-empty token)')
+  /** Simulated edge RBAC: the same 401 / 403 MISSING_PERMISSION the real edge returns (mockAuth.ts). */
+  private requirePerm(token: string, perm: string, method: string, path: string): Principal {
+    return this.auth.authenticate(token, path, perm, { write: method !== 'GET' })
+  }
+
+  /** codes:rotate = own staff_id only (403 STAFF_ID_NOT_OWN); codes:rotate_any = any; keys -> NO_STAFF_IDENTITY. */
+  private requireRotate(token: string, staffId: string): void {
+    const p = this.auth.authenticate(token, '/v1/admin/access/codes/rotate', null, { write: true })
+    if (p.permissions.includes('codes:rotate_any')) return
+    if (!p.permissions.includes('codes:rotate')) {
+      throw new ApiError('FORBIDDEN', 403, 'missing permission codes:rotate', null, { reason: 'MISSING_PERMISSION', required: ['codes:rotate'] })
+    }
+    if (p.kind !== 'staff') throw new ApiError('FORBIDDEN', 403, 'codes need a staff identity', null, { reason: 'NO_STAFF_IDENTITY' })
+    if (p.staff_id !== staffId) throw new ApiError('FORBIDDEN', 403, `you may only rotate your own codes (${p.staff_id ?? '?'})`, null, { reason: 'STAFF_ID_NOT_OWN' })
+  }
+
+  // ------------------------------------------------ auth (SIMULATED, mockAuth.ts)
+
+  async authStatus(): Promise<AuthStatus> {
+    await sleep(randInt(20, 60))
+    return this.auth.status()
+  }
+
+  async login(req: LoginRequest): Promise<LoginResult> {
+    await sleep(randInt(150, 300)) // the edge runs a scrypt KDF here
+    return this.auth.login(req)
+  }
+
+  async logout(token: string): Promise<void> {
+    this.auth.logout(token)
+  }
+
+  async me(token: string): Promise<AuthMe> {
+    await sleep(randInt(20, 60))
+    return this.auth.me(token)
+  }
+
+  async changePassword(token: string, req: PasswordChange): Promise<void> {
+    await sleep(randInt(150, 300))
+    this.auth.changePassword(token, req)
+  }
+
+  async mfaEnroll(token: string, currentPassword: string): Promise<MfaEnrolment> {
+    return this.auth.mfaEnroll(token, currentPassword)
+  }
+
+  async mfaConfirm(token: string, totpCode: string): Promise<void> {
+    this.auth.mfaConfirm(token, totpCode)
+  }
+
+  async noteActivity(token: string): Promise<void> {
+    this.auth.activity(token)
+  }
+
+  async listStaff(token: string): Promise<StaffAccount[]> {
+    await sleep(randInt(20, 80))
+    return this.auth.listStaff(token)
+  }
+
+  async createStaff(token: string, req: StaffCreate): Promise<StaffAccount | null> {
+    await sleep(randInt(150, 300))
+    return this.auth.createStaff(token, req)
+  }
+
+  async updateStaff(token: string, staffId: string, req: StaffUpdate): Promise<StaffAccount | null> {
+    return this.auth.updateStaff(token, staffId, req)
+  }
+
+  async resetStaffPassword(token: string, staffId: string, req: StaffPasswordReset): Promise<void> {
+    await sleep(randInt(150, 300))
+    this.auth.resetPassword(token, staffId, req)
+  }
+
+  async unlockStaff(token: string, staffId: string, req: Reauth): Promise<void> {
+    this.auth.unlock(token, staffId, req)
+  }
+
+  async listApiKeys(token: string): Promise<ApiKeyInfo[]> {
+    return this.auth.listApiKeys(token)
+  }
+
+  async createApiKey(token: string, req: ApiKeyCreate): Promise<ApiKeyCreated> {
+    return this.auth.createApiKey(token, req)
+  }
+
+  async revokeApiKey(token: string, keyId: string, req: Reauth): Promise<void> {
+    this.auth.revokeApiKey(token, keyId, req)
+  }
+
+  async listRoles(token: string): Promise<RolesCatalog> {
+    return this.auth.roles(token)
+  }
+
+  async listAuthAudit(token: string, q?: AuditQuery): Promise<AuthAuditPage> {
+    return this.auth.auditPage(token, q)
   }
 
   async getMetrics(token: string): Promise<MetricsResponse> {
-    this.requireToken(token)
+    this.requirePerm(token, 'metrics:read', 'GET', '/v1/metrics')
     const s = updateShared(tickSync)
     const h = s.history
     // Like the edge: latency from each attempt's FIRST (frames) decision; counts/labels from its FINAL decision.
@@ -1061,18 +1207,18 @@ export class MockEdgeApi implements EdgeApi {
     }
   }
 
-  async setMode(token: string, force: ForceMode): Promise<unknown> {
-    this.requireToken(token)
+  async setMode(token: string, force: ForceMode, _opts?: SetModeOptions): Promise<unknown> {
+    this.requirePerm(token, 'mode:switch', 'POST', '/v1/admin/mode')
     updateShared((s) => {
       s.forced = force
       if (force === 'AUTO' && s.queue.length > 0) s.syncStartedAt = Date.now()
       tickSync(s)
     })
-    return this.getMode()
+    return this.fullMode()
   }
 
   async getStore(token: string): Promise<unknown> {
-    this.requireToken(token)
+    this.requirePerm(token, 'store:read', 'GET', '/v1/admin/store')
     const s = updateShared(tickSync)
     return {
       table: 'decision_log',
@@ -1084,7 +1230,7 @@ export class MockEdgeApi implements EdgeApi {
   }
 
   async triggerSync(token: string): Promise<unknown> {
-    this.requireToken(token)
+    this.requirePerm(token, 'sync:run', 'POST', '/v1/admin/sync')
     const before = loadMockShared()
     if (computeMode({ ...before, queue: [] }).mode === 'OFFLINE') {
       throw new ApiError('CLOUD_UNAVAILABLE', 503, 'Cloud unreachable – cannot sync while offline')
@@ -1100,7 +1246,7 @@ export class MockEdgeApi implements EdgeApi {
   }
 
   async setEvalContext(token: string, ctx: EvalContext): Promise<unknown> {
-    this.requireToken(token)
+    this.requirePerm(token, 'eval:admin', 'POST', '/v1/admin/eval/context')
     updateShared((s) => {
       s.evalContext = ctx
     })
@@ -1108,7 +1254,7 @@ export class MockEdgeApi implements EdgeApi {
   }
 
   async clearEvalContext(token: string): Promise<unknown> {
-    this.requireToken(token)
+    this.requirePerm(token, 'eval:admin', 'DELETE', '/v1/admin/eval/context')
     updateShared((s) => {
       s.evalContext = null
     })
@@ -1116,7 +1262,7 @@ export class MockEdgeApi implements EdgeApi {
   }
 
   async resetRateLimit(token: string): Promise<unknown> {
-    this.requireToken(token)
+    this.requirePerm(token, 'ratelimit:reset', 'POST', '/v1/admin/rate-limit/reset')
     updateShared((s) => {
       s.denyTimes = []
       s.lockedUntil = 0
@@ -1125,7 +1271,7 @@ export class MockEdgeApi implements EdgeApi {
   }
 
   async setDemoClock(token: string, req: DemoClockRequest): Promise<DemoClockStatus> {
-    this.requireToken(token)
+    this.requirePerm(token, 'demo:clock', 'POST', '/v1/admin/clock')
     if ('reset' in req) {
       updateShared((s) => {
         s.clockOffsetMs = null
@@ -1144,20 +1290,20 @@ export class MockEdgeApi implements EdgeApi {
   }
 
   async getAttemptSignals(token: string, attemptId: string): Promise<unknown> {
-    this.requireToken(token)
+    this.requirePerm(token, 'attempt:signals', 'GET', '/v1/admin/attempt/{id}/signals')
     const att = this.attempts.get(attemptId)
     if (!att) throw new ApiError('ATTEMPT_NOT_FOUND', 404, 'unknown attempt (mock keeps attempts per tab)', attemptId)
     return { attempt_id: attemptId, mock: true, signals: { flash: { amplitude: null, r: att.scores.flash_r ?? null, note: 'mock' }, scores: att.scores } }
   }
 
   async enroll(token: string, frames: Blob[], meta: EnrollMeta): Promise<EnrollResponse> {
-    this.requireToken(token)
+    this.requirePerm(token, 'enrol:write', 'POST', '/v1/enroll')
     await sleep(randInt(400, 900))
     return parseEnroll(mockEnroll(this.offlineNow(), meta, frames.length))
   }
 
   async deleteEnrollment(token: string, userId: string): Promise<EraseResponse> {
-    this.requireToken(token)
+    this.requirePerm(token, 'enrol:erase', 'DELETE', '/v1/enroll/{id}')
     await sleep(randInt(50, 200))
     return parseErase(mockErase(this.offlineNow(), userId))
   }
@@ -1170,45 +1316,52 @@ export class MockEdgeApi implements EdgeApi {
 
   // Every mock result goes through the same strict contract parsers as the real edge's responses.
   async listEnrolledUsers(token: string): Promise<EnrolledUsersResponse> {
-    this.requireToken(token)
+    this.requirePerm(token, 'enrol:read', 'GET', '/v1/admin/users')
     await sleep(randInt(5, 20))
     return parseEnrolledUsers(mockListEnrolled())
   }
 
   async listAccessUsers(token: string): Promise<AccessUsersResponse> {
-    this.requireToken(token)
+    this.requirePerm(token, 'access:read', 'GET', '/v1/admin/access/users')
     await sleep(randInt(30, 120))
     const s = loadMockShared()
     return parseAccessUsers(mockListAccess(this.offlineNow(), Date.now() + (s.clockOffsetMs ?? 0)))
   }
 
   async putAccessUser(token: string, userId: string, req: AccessUpdate): Promise<AccessUpdateResult> {
-    this.requireToken(token)
+    this.requirePerm(token, 'access:edit', 'PUT', '/v1/admin/access/users/{id}')
     await sleep(randInt(150, 400))
     return parseAccessUpdate(mockPutAccess(this.offlineNow(), userId, req))
   }
 
   async revokeAccessUser(token: string, userId: string, req: RevokeRequest): Promise<RevokeResult> {
-    this.requireToken(token)
+    this.requirePerm(token, 'access:revoke', 'POST', '/v1/admin/access/users/{id}/revoke')
     await sleep(randInt(150, 400))
     return parseRevoke(mockRevoke(this.offlineNow(), userId, req))
   }
 
   async rotateStaffCodes(token: string, req: RotateCodesRequest): Promise<RotateCodesResult> {
-    this.requireToken(token)
+    this.requireRotate(token, req.staff_id)
     await sleep(randInt(150, 400))
     return parseRotate(mockRotateCodes(this.offlineNow(), req))
   }
 
   async refreshBundle(token: string): Promise<BundleRefresh> {
-    this.requireToken(token)
+    this.requirePerm(token, 'bundle:refresh', 'POST', '/v1/admin/bundle/refresh')
     await sleep(randInt(50, 150))
     return parseRefresh(mockRefreshBundle(this.offlineNow()))
   }
 
   subscribeEvents(token: string, handlers: EdgeEventsHandlers): () => void {
-    if (!token.trim()) {
-      handlers.onStatus?.('error')
+    try {
+      this.requirePerm(token, 'events:read', 'GET', '/v1/events')
+    } catch (e) {
+      const status = e instanceof ApiError ? e.status : null
+      const reason = e instanceof ApiError ? e.reason : null
+      queueMicrotask(() => {
+        handlers.onStatus?.('error')
+        handlers.onAuthClosed?.({ status, reason })
+      })
       return () => undefined
     }
     handlers.onStatus?.('open')

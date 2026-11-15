@@ -6,6 +6,7 @@ import {
   CHALLENGE_ACTIONS,
   FALLBACK_METHODS,
   RANDOM_CHALLENGE_MODES,
+  type CacheState,
   type ChallengeAction,
   type ChallengeSpec,
   type Decision,
@@ -16,14 +17,16 @@ import {
   type NextAction,
   type NextActionType,
   type RandomChallengeMode,
-} from './types'
-import { parseDemoClock } from './access'
+} from './types.ts'
+import { parseDemoClock } from './access.ts'
 
 type Obj = Record<string, unknown>
 
 const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v)
 const asStr = (v: unknown): string | null => (typeof v === 'string' ? v : null)
 const asNum = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+const CACHE_STATES: readonly string[] = ['FRESH', 'EXPIRED', 'INVALID']
+const asCache = (v: unknown): CacheState | null => (typeof v === 'string' && CACHE_STATES.includes(v) ? (v as CacheState) : null)
 const asStrList = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [])
 
 /** "2026-11-14T21:30:05+05:30" or "21:30" -> "21:30" (the local wall time, as sent by the edge). */
@@ -150,7 +153,9 @@ function demoClock(clock: Record<string, unknown>): ModeDemoClock {
 
 export function normalizeMode(raw: unknown): ModeResponse {
   const o = isObj(raw) ? raw : {}
-  const mode = o.mode === 'OFFLINE' ? 'OFFLINE' : 'ONLINE'
+  // Fail-safe (audit KAO-09): only an explicit ONLINE is ONLINE; a missing / unknown mode is shown OFFLINE.
+  const known = o.mode === 'ONLINE' || o.mode === 'OFFLINE'
+  const mode = o.mode === 'ONLINE' ? 'ONLINE' : 'OFFLINE'
   const st = asStr(o.state)
   const state = st === 'ONLINE' || st === 'OFFLINE' || st === 'SYNCING' ? st : mode
   const bundle = isObj(o.schedule_bundle) ? o.schedule_bundle : null
@@ -161,8 +166,10 @@ export function normalizeMode(raw: unknown): ModeResponse {
     state,
     since: asStr(o.since),
     forced: o.forced === true,
+    forced_until: asStr(o.forced_until),
+    cache_state: asCache(o.cache_state) ?? (bundle ? asCache(bundle.cache_state) : null),
     last_cloud_ok_at: asStr(o.last_cloud_ok_at),
-    reason: asStr(o.reason),
+    reason: known ? asStr(o.reason) : 'mode_unknown',
     schedule_bundle: bundle
       ? {
           version: asNum(bundle.version) ?? asStr(bundle.version),
@@ -176,7 +183,7 @@ export function normalizeMode(raw: unknown): ModeResponse {
     template_cache: cache
       ? { count: asNum(cache.count) ?? asNum(cache.entitled_users), model: asStr(cache.model) }
       : null,
-    sync_queue_depth: asNum(o.sync_queue_depth) ?? 0,
+    sync_queue_depth: asNum(o.sync_queue_depth),
     demo_clock: clock ? demoClock(clock) : null,
     cloud_match: isObj(o.cloud_match)
       ? {

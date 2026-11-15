@@ -112,8 +112,9 @@ export async function runOperatorAttempt(args: {
       kiosk_id: args.kioskId,
       claimed_user_id: null,
       client: {
-        camera_label: engine.camera.label,
-        user_agent: navigator.userAgent,
+        // edge validates <= 256 characters (edge-app F10)
+        camera_label: engine.camera.label.slice(0, 256),
+        user_agent: navigator.userAgent.slice(0, 256),
         screen: { width: window.screen.width, height: window.screen.height, refresh_hz: engine.refreshHz },
       },
       flash_enabled: flashWanted,

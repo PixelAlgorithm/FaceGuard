@@ -28,6 +28,7 @@ import {
   type DemoClockStatus,
   type EnrolledUser,
   type EnrolledUsersResponse,
+  type EnrollCloudCall,
   type EnrollResponse,
   type EraseResponse,
   type RevokeResult,
@@ -324,7 +325,6 @@ export const parseRefresh = (raw: unknown): BundleRefresh => parseBundleRefresh(
 export function parseEnroll(raw: unknown): EnrollResponse {
   const r = new R(raw, 'enroll')
   const cloud = r.objN('cloud')
-  if (cloud && !cloud.has('body')) fail('enroll.cloud.body', 'present', undefined)
   return {
     user_id: r.str('user_id'),
     template_version: r.int('template_version'),
@@ -336,7 +336,7 @@ export function parseEnroll(raw: unknown): EnrollResponse {
     frames_used: r.int('frames_used'),
     frames_rejected: r.list('frames_rejected', (x, p) => (isObj(x) ? x : fail(p, 'an object', x))),
     min_pairwise_cosine: r.numN('min_pairwise_cosine'),
-    cloud: cloud ? { status: cloud.int('status'), body: cloud.o.body } : null,
+    cloud: cloud ? parseEnrollCloud(cloud) : null,
     schedule_role: r.strN('schedule_role'),
     schedule_display: r.strN('schedule_display'),
     role_requested: r.strN('role_requested'),
@@ -345,6 +345,16 @@ export function parseEnroll(raw: unknown): EnrollResponse {
     reinstated_after_erasure: r.bool('reinstated_after_erasure'),
     warnings: r.strs('warnings'),
   }
+}
+
+/**
+ * enroll.cloud: {status, body} when the cloud answered; {status: null, error} on a transport failure
+ * (audit KAO-04: the local enrolment IS committed and the shown-once TOTP URI must not be lost).
+ */
+function parseEnrollCloud(cloud: R): EnrollCloudCall {
+  if (cloud.o.status === null) return { status: null, error: cloud.str('error') }
+  if (!cloud.has('body')) fail('enroll.cloud.body', 'present', undefined)
+  return { status: cloud.int('status'), body: cloud.o.body }
 }
 
 /** DELETE /v1/enroll/{user_id} */
@@ -417,6 +427,8 @@ export function parseDemoClock(raw: unknown, p = 'demo_clock'): DemoClockStatus 
  * Edge error body {error:{code, message, attempt_id, reason?, cloud_status?, cloud_code?, retry_after_s?,
  * installed_version?, bundle_version?, details?}} -> ApiError. FastAPI's default {detail} shape is mapped too.
  */
+const strArr = (v: unknown): string[] | null => (Array.isArray(v) && v.every((x) => typeof x === 'string') ? [...(v as string[])] : null)
+
 export function apiErrorFromBody(status: number, body: unknown): ApiError {
   const err = isObj(body) && isObj(body.error) ? body.error : null
   if (err) {
@@ -430,6 +442,10 @@ export function apiErrorFromBody(status: number, body: unknown): ApiError {
       installed_version: n('installed_version'),
       bundle_version: n('bundle_version'),
       details: err.details,
+      mfa_ticket: s('mfa_ticket'),
+      required: strArr(err.required),
+      problems: strArr(err.problems),
+      methods: strArr(err.methods),
     }
     return new ApiError(s('code') ?? `HTTP_${status}`, status, s('message') ?? `HTTP ${status}`, s('attempt_id'), extra)
   }

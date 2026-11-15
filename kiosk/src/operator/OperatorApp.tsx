@@ -2,7 +2,9 @@
  * /operator: verdict console. OBSERVER by default: every decision of the kiosk tab arrives on the live feed
  * (GET /v1/events) and is shown at a glance: PASS / SUSPICIOUS / DENIED, per-signal chips (scores.signals),
  * decision time, key scores against the policy bars, reason codes, name + role, plus the raw per-attempt
- * signals (GET /v1/admin/attempt/{id}/signals, admin token). No camera is opened in observer mode.
+ * signals (GET /v1/admin/attempt/{id}/signals, attempt:signals). No camera is opened in observer mode.
+ * RBAC (design v2 §F): the page sits behind a LoginGate requiring events:read; every poll / subscription is
+ * enabled only by `token && can(perm)` (users list: enrol:read, signals: attempt:signals).
  *
  * Capturing here is opt-in (toggle) and takes the one-capturing-tab lock (shared/captureLock.ts) that the
  * kiosk tab also holds, so a face in front of both cameras no longer produces two attempts. Nothing on this
@@ -13,13 +15,15 @@ import { getApi } from '../api'
 import { asApiError, type DecisionResponse } from '../api/types'
 import type { FrameAnalysis } from '../capture/engine'
 import { GUIDANCE_TEXT, assessQuality, type Guidance } from '../capture/quality'
-import { KIOSK_IDS, THRESHOLDS, UI, getAdminToken, getKioskId, setAdminToken } from '../config'
+import { KIOSK_IDS, THRESHOLDS, UI, getKioskId } from '../config'
+import { useAuth } from '../shared/auth/context'
+import { PERM, needsText } from '../shared/auth/permissions'
 import { usePoll } from '../admin/usePoll'
 import { CaptureLock, holderText, useLockHolder, useLockState } from '../shared/captureLock'
 import { useModeStatus } from '../shared/modeStore'
 import { runOperatorAttempt } from './attempt'
 import { readPreferredCamera, useVideoDevices, writePreferredCamera } from './devices'
-import { getModeRaw, getUsers, subscribeLive } from './edgeRaw'
+import { getModeDetailRaw, getUsers, subscribeLive } from './edgeRaw'
 import { useOperatorEngine } from './opEngine'
 import { Btn, CameraPicker, OpHeader, Preview, inputCls } from './ui'
 import { VerdictChip, VerdictPanel, type VerdictEntry } from './VerdictPanel'
@@ -36,11 +40,18 @@ const MAX_ENTRIES = 30
 /** policy_bars per mode as last reported by GET /v1/mode (filled by the poller, read when a verdict lands). */
 const barsByMode: Record<string, PolicyBars> = {}
 
-async function fetchModeWithBars(): Promise<Record<string, unknown>> {
-  const raw = await getModeRaw()
+async function fetchModeWithBars(token: string, canStoreRead: boolean): Promise<Record<string, unknown>> {
+  const raw = await getModeDetailRaw(token, canStoreRead)
   const b = barsFromMode(raw)
   if (b?.mode) barsByMode[b.mode] = b
   return raw
+}
+
+function bundleVersionOf(raw: Record<string, unknown> | null): number | string | null {
+  const b = raw?.schedule_bundle
+  if (!b || typeof b !== 'object') return null
+  const v = (b as { version?: unknown }).version
+  return typeof v === 'number' || typeof v === 'string' ? v : null
 }
 
 const PHASE_TEXT: Record<Phase, string> = {
@@ -83,14 +94,18 @@ export default function OperatorApp() {
   const [flashOn, setFlashOn] = useState(true)
   const [autoRearm, setAutoRearm] = useState(true)
   const [showKiosk, setShowKiosk] = useState(true)
-  const [token, setToken] = useState(getAdminToken)
+  const auth = useAuth()
+  const token = auth.token
+  const canEvents = Boolean(token) && auth.can(PERM.eventsRead)
+  const canUsers = Boolean(token) && auth.can(PERM.enrolRead)
+  const canSignals = Boolean(token) && auth.can(PERM.attemptSignals)
   const [phase, setPhaseState] = useState<Phase>('idle')
   const [guidance, setGuidance] = useState<Guidance>('NO_FACE')
   const [progress, setProgress] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [entries, setEntries] = useState<VerdictEntry[]>([])
   const [pinned, setPinned] = useState<string | null>(null)
-  const [live, setLive] = useState<'connecting' | 'open' | 'error'>('connecting')
+  const [liveRaw, setLive] = useState<'connecting' | 'open' | 'error'>('connecting')
 
   // Refs read by the per-frame listener and async attempt code (no re-subscribe per render).
   const phaseRef = useRef<Phase>('idle')
@@ -100,10 +115,10 @@ export default function OperatorApp() {
   const beaconSent = useRef(new Set<string>())
   const entriesRef = useRef<VerdictEntry[]>([])
   const fillRef = useRef<HTMLDivElement>(null)
-  const settings = useRef({ kioskId, flashOn, autoRearm, showKiosk, capturing, token })
+  const settings = useRef({ kioskId, flashOn, autoRearm, showKiosk, capturing, token, canSignals })
   useEffect(() => {
-    settings.current = { kioskId, flashOn, autoRearm, showKiosk, capturing, token }
-  }, [kioskId, flashOn, autoRearm, showKiosk, capturing, token])
+    settings.current = { kioskId, flashOn, autoRearm, showKiosk, capturing, token, canSignals }
+  }, [kioskId, flashOn, autoRearm, showKiosk, capturing, token, canSignals])
   useEffect(() => {
     entriesRef.current = entries
   }, [entries])
@@ -120,8 +135,11 @@ export default function OperatorApp() {
   }, [engine, refreshDevices])
 
   // ---------------------------------------------------------------- policy bars + users (role fallback)
-  const modeRaw = usePoll(fetchModeWithBars, 5000, true, 'operator-mode-raw')
+  const canStoreRead = Boolean(token) && auth.can(PERM.storeRead)
+  const modeRaw = usePoll(() => fetchModeWithBars(token, canStoreRead), 5000, true, `operator-mode-raw:${canStoreRead ? token : 'public'}`)
   const latestBars: PolicyBars = useMemo(() => (modeRaw.data ? barsFromMode(modeRaw.data) : null) ?? fallbackBars(), [modeRaw.data])
+  /** installed bundle version from GET /v1/admin/mode/detail (store:read); the public /v1/mode has none (KA-03) */
+  const detailBundleVersion = bundleVersionOf(modeRaw.data)
   const latestBarsRef = useRef(latestBars)
   useEffect(() => {
     latestBarsRef.current = latestBars
@@ -129,7 +147,7 @@ export default function OperatorApp() {
   /** Bars of the mode the decision was made in (offline bars are stricter), else the latest reported. */
   const barsFor = useCallback((mode: string) => barsByMode[mode] ?? latestBarsRef.current, [])
 
-  const usersPoll = usePoll(() => getUsers(token), 30000, Boolean(token), `operator-users:${token}`)
+  const usersPoll = usePoll(() => getUsers(token), 30000, canUsers, `operator-users:${token}`)
   /** the only kiosk_id the edge serves in session/start (others are refused with 409) */
   const servedKiosk = useModeStatus().mode?.kiosk_id ?? null
   const users = usersPoll.data?.users ?? null
@@ -173,12 +191,12 @@ export default function OperatorApp() {
     [barsFor],
   )
 
-  // Raw per-attempt signals (observer view). Needs the admin token; failures only annotate the entry.
+  // Raw per-attempt signals (observer view). Needs attempt:signals; failures only annotate the entry.
   const signalsSeq = useRef(new Map<string, number>())
   const fetchSignals = useCallback(
     (attemptId: string) => {
       const tok = settings.current.token
-      if (!tok || !attemptId) return
+      if (!tok || !settings.current.canSignals || !attemptId) return
       const seq = (signalsSeq.current.get(attemptId) ?? 0) + 1
       signalsSeq.current.set(attemptId, seq)
       const apply = (patch: Partial<VerdictEntry>) => {
@@ -193,10 +211,15 @@ export default function OperatorApp() {
     [api],
   )
 
-  // Live feed: decisions from the kiosk tab (and our own, de-duplicated by attempt_id).
-  useEffect(
-    () =>
-      subscribeLive(getAdminToken(), {
+  /** shown status: no events:read = never connected */
+  const live = canEvents ? liveRaw : 'error'
+  // Live feed: decisions from the kiosk tab (and our own, de-duplicated by attempt_id). Re-subscribes when the
+  // session token changes (KAO-10); never connects without events:read; stops for good on 401/403 / event: auth.
+  const [feedClosedFor, setFeedClosedFor] = useState<{ token: string; why: string } | null>(null)
+  const feedClosed = feedClosedFor?.token === token ? feedClosedFor.why : null
+  useEffect(() => {
+    if (!canEvents) return undefined
+    return subscribeLive(token, {
         onDecision: (d, raw) => {
           if (!d.attempt_id || pendingIds.current.has(d.attempt_id)) return
           const known = entriesRef.current.some((e) => e.attemptId === d.attempt_id)
@@ -212,9 +235,9 @@ export default function OperatorApp() {
           setEntries((list) => list.map((e) => (e.attemptId === id && e.clientMs === null ? { ...e, clientMs } : e)))
         },
         onStatus: setLive,
-      }),
-    [upsert, fetchSignals],
-  )
+        onAuthClosed: ({ status, reason }) => setFeedClosedFor({ token, why: reason ?? (status !== null ? `HTTP ${status}` : 'closed') }),
+      })
+  }, [token, canEvents, upsert, fetchSignals])
 
   // ---------------------------------------------------------------- flash paint (direct DOM, same rAF as the timestamps)
   const paint = useCallback((color: string | null) => {
@@ -388,7 +411,7 @@ export default function OperatorApp() {
 
   return (
     <div className="min-h-full bg-kiosk font-sans text-white">
-      <OpHeader title="Operator console" current="/operator" />
+      <OpHeader title="Operator console" current="/operator" bundleVersion={detailBundleVersion} />
       <main className="grid gap-5 p-5 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]">
         <section className="flex flex-col gap-3" aria-label="Observer and capture controls">
           <div className={`rounded-xl p-3 ${captureOn ? 'bg-sky-900/40 ring-1 ring-sky-400/40' : 'bg-white/5'}`}>
@@ -452,20 +475,11 @@ export default function OperatorApp() {
           ) : null}
           {error ? <p className="rounded-lg bg-red-600/25 px-3 py-2 text-sm text-red-100">{error}</p> : null}
           <div className="grid gap-2 rounded-xl bg-white/5 p-3 text-sm sm:grid-cols-2">
-            <label className="flex flex-col gap-1 sm:col-span-2">
-              <span className="text-xs text-white/60">Admin token (raw signals per attempt + role lookup)</span>
-              <input
-                className={inputCls}
-                type="password"
-                autoComplete="off"
-                value={token}
-                placeholder="X-Admin-Token"
-                onChange={(e) => {
-                  setToken(e.target.value.trim())
-                  setAdminToken(e.target.value.trim())
-                }}
-              />
-            </label>
+            <p className="text-xs text-white/60 sm:col-span-2">
+              Live feed {canEvents ? live : needsText(PERM.eventsRead)}
+              {feedClosed ? ` · stopped (${feedClosed})` : ''} · signals {canSignals ? 'on' : needsText(PERM.attemptSignals)} · roles{' '}
+              {canUsers ? 'from the installed bundle' : needsText(PERM.enrolRead)}
+            </p>
             {captureOn ? (
               <>
                 <label className="flex flex-col gap-1 sm:col-span-2">

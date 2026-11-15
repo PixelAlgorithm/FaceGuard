@@ -11,6 +11,8 @@ import { DAY_CODES, type AccessUpdate, type AccessUser, type AccessUsersResponse
 import { windowsText } from '../../shared/accessHours'
 import { applyAccess, errorText, notifyAccessChanged, versionText, type ApplyOutcome } from '../../shared/accessDirectory'
 import { REVOKE_REASON_RE, accessUpdateErrors, hoursFor, hoursText, windowError } from '../../shared/accessRules'
+import { useAuth } from '../../shared/auth/context'
+import { PERM, needsText } from '../../shared/auth/permissions'
 import { toast } from '../../shared/toast'
 
 type Preset = 'default' | 'allday' | 'custom'
@@ -77,6 +79,12 @@ export function AccessEditor({
   onClose: () => void
 }) {
   const api = getApi()
+  const { can, principal } = useAuth()
+  // the edge derives the real actor from the session; this value is informational (design v2 §D)
+  const actor = principal?.actor_id ?? 'control-panel'
+  // `canEdit` = the schedule is writable here (online, list loaded); each action also needs its own permission
+  const mayEdit = can(PERM.accessEdit)
+  const mayRevoke = can(PERM.accessRevoke)
   const adding = user === null
   const kioskZone = access.zone ?? ''
   const zones = useMemo(() => Object.keys(access.zones).sort((a, b) => (a === kioskZone ? -1 : b === kioskZone ? 1 : a.localeCompare(b))), [access, kioskZone])
@@ -115,7 +123,7 @@ export function AccessEditor({
   const id = adding ? userId : (user?.user_id ?? '')
 
   /** body with only the changed fields (absent = unchanged); role is always sent (contract) */
-  const body: AccessUpdate = { role, actor: 'control-panel' }
+  const body: AccessUpdate = { role, actor }
   if (creating || display.trim() !== (user?.display ?? '')) body.display = display.trim()
   if (creating || !sameJson(zonesAdd, user?.zones_add ?? [])) body.zones_add = zonesAdd
   if (creating ? Object.keys(extraWindows).length > 0 : !sameJson(extraWindows, user?.extra_windows ?? {})) body.extra_windows = extraWindows
@@ -160,24 +168,24 @@ export function AccessEditor({
   }
 
   const submit = () => {
-    if (errors.length || !canEdit || busy) return
+    if (errors.length || !canEdit || !mayEdit || busy) return
     if (user?.role && user.role !== role && !window.confirm(`Change ${id} from ${user.role} to ${role}? Their access hours change on every kiosk that installs the new bundle.`)) return
     void put(body, creating ? `Added ${id}` : `Updated ${id}`)
   }
 
   const revoke = async () => {
-    if (!user || !canEdit || busy) return
+    if (!user || !canEdit || !mayRevoke || busy) return
     if (!REVOKE_REASON_RE.test(revokeReason) || revokeReason === 'ERASED') return
     if (!window.confirm(`Revoke ${user.user_id} (${user.display}) now, reason ${revokeReason}? Every kiosk then DENIES them (SCHEDULE_REVOKED), online and offline. “Restore” undoes it.`)) return
     setBusy(true)
     setOutcome(null)
     try {
-      const r = await api.revokeAccessUser(token, user.user_id, { reason: revokeReason, actor: 'control-panel' })
+      const r = await api.revokeAccessUser(token, user.user_id, { reason: revokeReason, actor })
       const applied = r.bundle.applied === true
       const at = r.revoked_at ? ` at ${new Date(r.revoked_at).toLocaleString([], { hour12: false })}` : ''
       const text = applied
         ? `${r.user_id} revoked (${r.reason})${at} · bundle ${versionText(r.cloud_bundle_version)} installed on this kiosk.`
-        : `${r.user_id} revocation (${r.reason}) sent to the cloud${at} · bundle ${versionText(r.cloud_bundle_version)}: NOT yet installed here, so this kiosk still treats ${r.user_id} as ${r.user?.status ?? 'before'}. Use “Refresh edge bundle” to apply it now.`
+        : `${r.user_id} revocation (${r.reason}) sent to the cloud${at} · bundle ${versionText(r.cloud_bundle_version)}: the new bundle is NOT installed here yet. The revocation itself reaches this kiosk with the next revocation-feed pull (edge heartbeat, a few seconds); use “Refresh edge bundle” to install the bundle now.`
       setOutcome({ ok: true, text, warnings: r.warnings })
       if (applied) toast.success(text)
       else toast.error(text)
@@ -193,16 +201,17 @@ export function AccessEditor({
   }
 
   const restore = () => {
-    if (!user || !canEdit || busy || !consent) return
-    void put({ role, consent: true, restore: true, actor: 'control-panel' }, `Restored ${user.user_id}`)
+    if (!user || !canEdit || !mayEdit || busy || !consent) return
+    void put({ role, consent: true, restore: true, actor }, `Restored ${user.user_id}`)
   }
 
   const readmit = () => {
-    if (!user || !canEdit || busy || !consent || errors.some((e) => e.startsWith('display'))) return
-    void put({ role, display: display.trim(), consent: true, actor: 'control-panel' }, `Re-admitted ${user.user_id}`)
+    if (!user || !canEdit || !mayEdit || busy || !consent || errors.some((e) => e.startsWith('display'))) return
+    void put({ role, display: display.trim(), consent: true, actor }, `Re-admitted ${user.user_id}`)
   }
 
-  const disabled = !canEdit || busy
+  const disabled = !canEdit || !mayEdit || busy
+  const revokeDisabled = !canEdit || !mayRevoke || busy
 
   return (
     <section className="rounded-xl border-2 border-[#2a78d6]/40 bg-white p-4" aria-label={adding ? 'Add person' : `Edit ${user?.user_id}`}>
@@ -485,18 +494,26 @@ export function AccessEditor({
         ) : null}
         {status === 'ACTIVE' ? (
           <span className="inline-flex items-center gap-1">
-            <select className={`${field} py-1 text-xs`} value={revokeReason} disabled={disabled} onChange={(e) => setRevokeReason(e.target.value)} aria-label="Revoke reason">
+            <select className={`${field} py-1 text-xs`} value={revokeReason} disabled={revokeDisabled} onChange={(e) => setRevokeReason(e.target.value)} aria-label="Revoke reason">
               {REVOKE_REASONS.map((r) => (
                 <option key={r} value={r}>
                   {r}
                 </option>
               ))}
             </select>
-            <button type="button" disabled={disabled} onClick={() => void revoke()} className="rounded-lg bg-[#d03b3b] px-3 py-1.5 text-sm font-semibold text-white disabled:opacity-50">
+            <button
+              type="button"
+              disabled={revokeDisabled}
+              title={mayRevoke ? undefined : needsText(PERM.accessRevoke)}
+              onClick={() => void revoke()}
+              className="rounded-lg bg-[#d03b3b] px-3 py-1.5 text-sm font-semibold text-white disabled:opacity-50"
+            >
               Revoke now
             </button>
+            {!mayRevoke ? <span className="text-xs text-[#8a6d00]">{needsText(PERM.accessRevoke)}</span> : null}
           </span>
         ) : null}
+        {!mayEdit ? <span className="text-xs text-[#8a6d00]">{needsText(PERM.accessEdit)} to change roles, hours or validity</span> : null}
         <span className="text-xs text-[#898781]">Writes go to the cloud master schedule → re-signed bundle → installed on this edge.</span>
       </div>
     </section>

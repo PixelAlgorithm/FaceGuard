@@ -1,6 +1,10 @@
 /** Live decision feed from GET /v1/events (SSE): every reason code, scores, latency, kiosk decision time. */
 import { useEffect, useState } from 'react'
 import { getApi, type DecisionResponse, type RenderedEvent } from '../../api'
+import { authErrorText } from '../../shared/auth/authErrorText'
+import { useAuth } from '../../shared/auth/context'
+import { NeedsPermission } from '../../shared/auth/LoginGate'
+import { PERM } from '../../shared/auth/permissions'
 import { DecisionChip } from '../DecisionChip'
 import { Card } from '../ui'
 
@@ -22,6 +26,7 @@ function pickNum(o: unknown, path: string[]): number | null {
 
 /** GET /v1/admin/attempt/{id}/signals: flash amplitude / correlation / lag for this attempt (target amplitude >= 5). */
 function SignalsButton({ token, attemptId }: { token: string; attemptId: string }) {
+  const { can } = useAuth()
   const [state, setState] = useState<{ busy: boolean; body: unknown; error: string | null; open: boolean }>({
     busy: false,
     body: null,
@@ -34,13 +39,14 @@ function SignalsButton({ token, attemptId }: { token: string; attemptId: string 
       const body = await getApi().getAttemptSignals(token, attemptId)
       setState({ busy: false, body, error: null, open: true })
     } catch (e) {
-      setState({ busy: false, body: null, error: e instanceof Error ? e.message : String(e), open: true })
+      setState({ busy: false, body: null, error: authErrorText(e), open: true })
     }
   }
   const b = state.body
   const amp = pickNum(b, ['signals', 'flash', 'amplitude']) ?? pickNum(b, ['flash', 'amplitude'])
   const r = pickNum(b, ['signals', 'flash', 'r']) ?? pickNum(b, ['signals', 'flash', 'ncc']) ?? pickNum(b, ['flash', 'r'])
   const lag = pickNum(b, ['signals', 'flash', 'lag_frames']) ?? pickNum(b, ['signals', 'flash', 'lag_ms'])
+  if (!can(PERM.attemptSignals)) return <NeedsPermission perm={PERM.attemptSignals} />
   return (
     <span className="inline-flex flex-wrap items-center gap-1.5">
       <button type="button" onClick={load} disabled={state.busy} className="rounded px-1.5 py-0.5 text-[11px] ring-1 ring-black/15">
@@ -75,11 +81,13 @@ function fmtScore(v: unknown): string {
 export function LiveFeed({ token }: { token: string }) {
   const [rows, setRows] = useState<Row[]>([])
   const [status, setStatus] = useState<'connecting' | 'open' | 'error'>('connecting')
+  const [closed, setClosed] = useState<string | null>(null)
 
   useEffect(() => {
     let seq = 0
     const unsubscribe = getApi().subscribeEvents(token, {
       onStatus: setStatus,
+      onAuthClosed: ({ status: http, reason }) => setClosed(reason ?? (http ? `HTTP ${http}` : 'auth')),
       onDecision: (d, evalCtx) => {
         seq += 1
         const row: Row = { key: `${d.attempt_id}-${seq}-${Date.now()}`, at: Date.now(), d, evalCtx, clientMs: null }
@@ -112,7 +120,7 @@ export function LiveFeed({ token }: { token: string }) {
       actions={
         <span className="flex items-center gap-3 text-xs">
           <span className={status === 'open' ? 'text-[#006300]' : status === 'error' ? 'text-[#d03b3b]' : 'text-[#898781]'}>
-            ● {status === 'open' ? 'live' : status === 'error' ? 'disconnected – retrying' : 'connecting'}
+            ● {closed ? `stopped (${closed})` : status === 'open' ? 'live' : status === 'error' ? 'disconnected – retrying' : 'connecting'}
           </span>
           <button type="button" onClick={() => setRows([])} className="rounded px-2 py-0.5 ring-1 ring-black/15">
             Clear

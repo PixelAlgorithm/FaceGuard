@@ -47,6 +47,7 @@ export const CANONICAL_CODE_ORDER: readonly string[] = [
   'CHALLENGE_FAILED',
   'FALLBACK_OK',
   'FALLBACK_FAILED',
+  'FALLBACK_LOCKED',
   // final / any
   'ACCESS_OK',
   'SYSTEM_ERROR',

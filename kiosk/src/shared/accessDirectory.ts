@@ -56,12 +56,12 @@ export interface AccessDirectory {
   /** roles of the schedule (master online, bundle offline); [] until the list loads */
   roles: string[]
   bundleVersion: number | string | null
-  /** schedule writes are possible right now (admin token, edge reachable, ONLINE, list not read-only) */
+  /** schedule writes are possible right now (access:edit, edge reachable, ONLINE, list not read-only) */
   canEdit: boolean
   /** why not, for the UI */
   editBlockedReason: string | null
   /**
-   * POST /v1/admin/bundle/refresh may be tried (admin token, edge reachable, mode not forced). Deliberately NOT
+   * POST /v1/admin/bundle/refresh may be tried (bundle:refresh, edge reachable, mode not forced). Deliberately NOT
    * gated on ONLINE or read_only: the edge answers NOT_CONFIGURED / CLOUD_ERROR / OFFLINE itself, and that
    * answer is shown as-is.
    */
@@ -93,7 +93,8 @@ export function buildIdentities(access: AccessUsersResponse | null, enrolled: En
       })
     }
   } else {
-    // No schedule list (no token / edge without the access routes): the demo schedule source file, display only.
+    // No schedule list (not signed in / no access:read / edge without the access routes): the demo schedule
+    // source file, display only.
     for (const u of DEMO_USERS) {
       map.set(u.user_id, {
         user_id: u.user_id,
@@ -148,7 +149,7 @@ const READ_ONLY_TEXT: Record<ReadOnlyCode, string> = {
   NOT_CONFIGURED: 'This edge has no cloud configured (CLOUD_API_URL / cloud admin token): the schedule is read-only here.',
   CLOUD_ERROR: 'The cloud did not answer: the schedule is read-only until it does (try Reload).',
   ENDPOINT_NOT_DEPLOYED: 'The live cloud build does not have the access routes yet (cloud redeploy pending): the schedule is read-only.',
-  CLOUD_ADMIN_TOKEN: "The cloud refused this edge's admin token (CLOUD_ADMIN_TOKEN in the edge .env, not the token you typed): read-only.",
+  CLOUD_ADMIN_TOKEN: "The cloud refused this edge's cloud credential (CLOUD_EDGE_PROXY_KEY / CLOUD_ADMIN_TOKEN in the edge .env, not your sign-in): read-only.",
 }
 
 export function readOnlyText(access: AccessUsersResponse): string {
@@ -156,19 +157,39 @@ export function readOnlyText(access: AccessUsersResponse): string {
   return access.read_only_reason ? `${base} (${access.read_only_reason})` : base
 }
 
-export function useAccessDirectory(token: string, key = 'dir'): AccessDirectory {
+/**
+ * What the signed-in principal may do here (design v2 §F: every poll / button is gated by can(perm)). Omitted:
+ * everything is allowed whenever a token is present (legacy callers; the edge still enforces each route).
+ */
+export interface DirectoryGates {
+  accessRead: boolean
+  enrolRead: boolean
+  accessEdit: boolean
+  bundleRefresh: boolean
+}
+
+const NEEDS = (perm: string) => `Needs ${perm}.`
+
+export function useAccessDirectory(token: string, key = 'dir', gates?: DirectoryGates): AccessDirectory {
   const api = getApi()
   const { mode, reachable } = useModeStatus()
-  const access = usePoll(() => api.listAccessUsers(token), 15000, Boolean(token), `${key}-access:${token}`)
-  const enrolled = usePoll(() => api.listEnrolledUsers(token), 15000, Boolean(token), `${key}-enrolled:${token}`)
+  const g: DirectoryGates = gates ?? { accessRead: true, enrolRead: true, accessEdit: true, bundleRefresh: true }
+  const readAccess = Boolean(token) && g.accessRead
+  const readEnrolled = Boolean(token) && g.enrolRead
+  const access = usePoll(() => api.listAccessUsers(token), 15000, readAccess, `${key}-access:${token}`)
+  const enrolled = usePoll(() => api.listEnrolledUsers(token), 15000, readEnrolled, `${key}-enrolled:${token}`)
   const enrolledUsers = enrolled.data?.users
   const identities = useMemo(() => buildIdentities(access.data, enrolledUsers ?? []), [access.data, enrolledUsers])
   const roles = useMemo(() => access.data?.roles ?? [], [access.data])
   // ONLINE requirement of the edge (§3.18): mode ONLINE, or connectivity up with a stale bundle.
   const online = reachable && !!mode && !mode.forced && (mode.mode === 'ONLINE' || mode.reason === 'bundle_stale')
   const editBlockedReason = !token
-    ? 'Enter the admin token first.'
-    : !reachable
+    ? 'Sign in first.'
+    : !g.accessEdit
+      ? NEEDS('access:edit')
+      : !g.accessRead
+        ? NEEDS('access:read')
+        : !reachable
       ? 'The edge is not reachable.'
       : access.error && !access.data
         ? `The access list did not load: ${access.error}`
@@ -180,8 +201,10 @@ export function useAccessDirectory(token: string, key = 'dir'): AccessDirectory 
               ? 'Loading the schedule…'
               : null
   const refreshBlockedReason = !token
-    ? 'Enter the admin token first.'
-    : !reachable
+    ? 'Sign in first.'
+    : !g.bundleRefresh
+      ? NEEDS('bundle:refresh')
+      : !reachable
       ? 'The edge is not reachable.'
       : mode?.forced
         ? 'The kiosk is forced OFFLINE (demo toggle): set the mode back to AUTO to pull a bundle.'
@@ -204,7 +227,8 @@ export function useAccessDirectory(token: string, key = 'dir'): AccessDirectory 
     enrolledError: enrolled.error,
     identities,
     roles,
-    bundleVersion: access.data?.bundle.version ?? mode?.schedule_bundle?.version ?? null,
+    // the access list (access:read) carries the version; the public /v1/mode no longer does (KA-03)
+    bundleVersion: access.data?.bundle.version ?? null,
     canEdit: editBlockedReason === null,
     editBlockedReason,
     canRefreshBundle: refreshBlockedReason === null,
@@ -308,7 +332,7 @@ export const REASON_HINT: Record<string, string> = {
   NOT_CONFIGURED: 'This edge has no cloud configured (CLOUD_API_URL / cloud admin token).',
   CLOUD_ERROR: 'The cloud did not answer. Try again in a moment.',
   ENDPOINT_NOT_DEPLOYED: 'The live cloud does not have this route yet: cloud redeploy pending.',
-  CLOUD_ADMIN_TOKEN: "The cloud refused this edge's admin token (CLOUD_ADMIN_TOKEN in the edge .env), not the token you typed.",
+  CLOUD_ADMIN_TOKEN: "The cloud refused this edge's cloud credential (CLOUD_EDGE_PROXY_KEY / CLOUD_ADMIN_TOKEN in the edge .env), not your sign-in.",
   UNKNOWN_ROLE: 'That role is not in the campus schedule.',
   UNKNOWN_ZONE: 'A zone is not in the campus schedule.',
   DISPLAY_REQUIRED: 'A display name is needed to add a new person.',
@@ -327,12 +351,22 @@ export const REASON_HINT: Record<string, string> = {
   NOT_ENROLLED: 'This person is not enrolled on this edge.',
   NOT_DEMO_MODE: 'The demo clock needs DEMO_MODE=1 on the edge.',
   CODES_UNAVAILABLE: 'The cloud cannot mint codes right now.',
+  // enrol / erase errors (edge-app hardening)
+  ERASED_PENDING_READMIT: 'This person was erased and is not re-admitted yet. Use “Re-admit and enrol” (fresh consent, ONLINE).',
+  CLOUD_REFUSED_REENROLMENT: 'The cloud refused this re-enrolment, so nothing was stored. Erase the person first, then re-admit with fresh consent.',
+  POLICY_RUNTIME_UNAVAILABLE: 'The edge decision engine is not ready, so enrolment is refused. Try again in a moment.',
+  LOCAL_WRITE_FAILED: 'The edge could not save the template on this laptop. Nothing was enrolled: try again, then ask the operator to check the edge disk.',
+  ERASURE_PENDING: 'An erasure for this person is still pending: wait for the next sync, then register again.',
+  CLOUD_BODY_CAP: 'The photos are too large for the cloud upload: retake them.',
+  LOCAL_ERASE_FAILED: 'The edge could not erase the local data. Nothing was confirmed: try Erase again, then ask the operator to check the edge.',
+  PAYLOAD_TOO_LARGE: 'The request was too large for the edge: retake the photos.',
+  ORIGIN_NOT_ALLOWED: 'The edge refused this page’s origin (EDGE_CORS_ORIGINS on the edge must list it).',
 }
 
 const CODE_HINT: Record<string, string> = {
   CLOUD_UNAVAILABLE: 'The cloud is not reachable; this needs ONLINE.',
-  UNAUTHORIZED: 'Admin token missing or wrong (ADMIN_TOKEN in the project .env).',
-  FORBIDDEN: 'Not allowed with this admin token.',
+  UNAUTHORIZED: 'Not signed in, or the session expired: sign in again.',
+  FORBIDDEN: 'Your account does not have the permission for this.',
   NOT_FOUND: 'This edge does not have that route (edge restart pending?).',
   VALIDATION_ERROR: 'The edge rejected the values.',
   MODELS_UNAVAILABLE: 'The edge models / PAD self-test are not ready, so enrolment is refused.',
@@ -344,6 +378,6 @@ export function errorText(e: unknown): string {
   const err = asApiError(e)
   if (!err) return e instanceof Error ? e.message : String(e)
   if (err.isUnreachable) return `The edge is not reachable (${err.code}).`
-  const hint = (err.reason && REASON_HINT[err.reason]) || CODE_HINT[err.code] || ''
+  const hint = (err.reason && REASON_HINT[err.reason]) || REASON_HINT[err.code] || CODE_HINT[err.code] || ''
   return `${hint ? `${hint} ` : ''}[${err.code}${err.reason ? ` ${err.reason}` : ''}] ${err.message}`
 }

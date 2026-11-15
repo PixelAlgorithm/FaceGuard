@@ -39,6 +39,7 @@ export const REASON_TEXT: Record<string, ReasonCopy> = {
   OFFLINE_FALLBACK_REQUIRED: { text: 'Offline: enter a code or tap your card' },
   FALLBACK_OK: { text: 'Verified' },
   FALLBACK_FAILED: { text: 'Verification failed', stepUp: 'Code not accepted – please try again' },
+  FALLBACK_LOCKED: { text: 'This method is temporarily locked – please use another method or ask the desk' },
   // added codes (closed list)
   ACCESS_OK: { text: 'Identity and access verified' },
   QUALITY_POSE: { text: 'Please face the camera' },
@@ -177,4 +178,22 @@ export function describeDecision(d: DecisionResponse): DecisionCopy {
     nextHint,
     generic: false,
   }
+}
+
+export interface OperatorDetail {
+  /** reason codes safe to list on the public screen's operator strip */
+  codes: string[]
+  /** schedule_result, or null when it must not be shown */
+  scheduleResult: string | null
+}
+
+/**
+ * What the public screen's operator strip (ui.show_detailed_reasons) may show. DECISION_POLICY §10 / audit
+ * KF-05 / policy F13: no schedule detail to a person whose identity is unconfirmed (BIO_UNSURE, or the generic
+ * message), even with the demo flag on; otherwise the public kiosk becomes an entitlement oracle.
+ */
+export function operatorDetail(d: DecisionResponse): OperatorDetail {
+  const unconfirmed = d.bio_result === 'BIO_UNSURE' || describeDecision(d).generic
+  if (!unconfirmed) return { codes: d.reason_codes, scheduleResult: d.schedule_result }
+  return { codes: d.reason_codes.filter((c) => !c.startsWith('SCHEDULE_')), scheduleResult: null }
 }
