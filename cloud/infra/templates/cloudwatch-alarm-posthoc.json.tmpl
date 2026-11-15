@@ -1,0 +1,26 @@
+{
+  "AlarmName": "${HID_PREFIX}-post-hoc-revoked",
+  "AlarmDescription": "An offline ALLOW was granted to a user whose revocation was already effective (SC2.6 ALERT_REVOKED_USER_ADMITTED).",
+  "Namespace": "HIDKiosk",
+  "MetricName": "SyncAlerts",
+  "Dimensions": [
+    {
+      "Name": "Service",
+      "Value": "hid-cloud"
+    },
+    {
+      "Name": "Alert",
+      "Value": "ALERT_REVOKED_USER_ADMITTED"
+    },
+    {
+      "Name": "Synthetic",
+      "Value": "false"
+    }
+  ],
+  "Statistic": "Sum",
+  "Period": 60,
+  "EvaluationPeriods": 1,
+  "Threshold": 1,
+  "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+  "TreatMissingData": "notBreaching"
+}

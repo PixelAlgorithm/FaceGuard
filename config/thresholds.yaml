@@ -1,0 +1,255 @@
+# config/thresholds.yaml — every numeric threshold used by the policy engine.
+# Source of truth for semantics: docs/DECISION_POLICY.md. Never hard-code these in logic.
+# Loading: base values = ONLINE. OFFLINE = deep_merge(base, offline.overrides).
+# All values marked [cal] are starting points and MUST be recalibrated on our own captures
+# (dev split) before the eval run; record the calibrated values + data in eval/results/.
+
+policy_version: "2026-11-14.3"      # must match docs/DECISION_POLICY.md header
+timezone: "Asia/Kolkata"            # schedule evaluation; logs store UTC ISO-8601
+
+# ---------------------------------------------------------------- latency budgets (ms)
+latency_budget_ms:
+  total_decision: 2000              # face lock -> decision shown (ALLOW path), p95 target
+  face_lock_and_quality: 300        # browser, MediaPipe
+  capture_flash: 700                # colour-flash capture window (= liveness.flash.duration_ms)
+  upload_and_edge_inference: 500    # liveness + local match in parallel
+  fusion_and_response: 50
+  rekognition_timeout: 700          # no-probe path (cloud match starts after the frames): exceeded -> OFFLINE (P7)
+  rekognition_probe_deadline: 1500  # early cloud probe (POST /v1/attempt/{id}/probe at face lock): total budget
+                                    # measured FROM PROBE START; the frames wait max(0, 1500 - elapsed) ms, then
+                                    # the attempt is OFFLINE (P7). Probe result used only if its local top-1 user
+                                    # == the frames' top-1 and cosine(probe, best frame) >= match.local.allow_min_cosine
+  depth_max_wait: 150               # wait for depth result after last RGB frame; else depth NOT_AVAILABLE
+  t0_max_lag: 10000                 # runtime re-bases the client face-lock t0 onto the edge clock, lag clamped
+                                    # to [0, 10 s] (client cannot pick its schedule time; demo clock applies)
+  # step-up path is reported as a separate "verification time" metric (no budget on the 2 s path)
+
+# ---------------------------------------------------------------- quality gate (per frame)
+quality:
+  frames_per_attempt: 5
+  min_usable_frames: 3              # fewer usable frames -> attempt fails quality
+  min_face_width_px: 112
+  min_interocular_px: 60            # ~63 px in Eyeblink8
+  max_abs_yaw_deg: 25
+  max_abs_pitch_deg: 20
+  max_abs_roll_deg: 20
+  min_luma_mean: 60                 # face ROI mean Y (0-255); below -> QUALITY_LOW_LIGHT  [cal]
+  max_luma_mean: 210                # above -> QUALITY_LOW_LIGHT (over-exposed)            [cal]
+  max_overexposed_fraction: 0.15    # fraction of ROI pixels Y>=250 (backlight)             [cal]
+  min_laplacian_var: 80             # 112x112 grey crop; below -> QUALITY_BLUR             [cal]
+  secondary_face_min_rel_size: 0.5  # 2nd face area >= 0.5x main face -> MULTIPLE_FACES
+  max_recaptures: 2                 # then STEP_UP SECOND_FACTOR stepup.methods.quality_exhausted = manual staff
+                                    # review (R2); DENY + CONTACT_DESK in a high-risk zone
+
+# ---------------------------------------------------------------- injection
+injection:
+  virtual_camera_label_patterns: ["obs", "virtual", "manycam", "snap camera", "xsplit", "droidcam", "epoccam", "camtwist", "mmhmm"]
+  known_good_label_patterns: ["facetime", "integrated", "webcam", "usb", "hd camera", "iphone", "continuity",
+                              "macbook", "built-in", "studio display"]   # macOS 13+ names the built-in camera "MacBook ... Camera"
+  unknown_label_is_unsure: false    # operator 2026-11-14 "step-up only when suspicious": an unknown (non-virtual) label
+                                    # alone no longer steps up; virtual-camera labels / client flag / timing still DENY
+  min_frame_interval_ms: 15         # timestamps must be monotonic and within [min,max]
+  max_frame_interval_ms: 400
+
+# ---------------------------------------------------------------- liveness
+liveness:
+  pad:                              # P_live = mean(MiniFASNetV2 @2.7x, MiniFASNetV1SE @4.0x), 80x80
+    real_class_index: 1             # VERIFY on a real face before trusting (CLAUDE.md §6)
+    pass_min: 0.80                  # frame counts as live if P_live >= pass_min
+    min_pass_frames: 3              # PASS needs >= 3 live frames (of 3-5 usable)
+    fail_max: 0.30                  # frame counts as spoof if P_live <= fail_max; FAIL if strict majority
+    strong_live: 0.90               # mean P_live for the flash ambient-light exception
+  device_detector:                  # COCO: 67 cell phone, 63 laptop, 62 tv
+    classes: [62, 63, 67]
+    fail_conf: 0.40                 # box conf >= 0.40 containing face -> SPOOF_DEVICE_DETECTED
+    unsure_conf: 0.25               # [0.25, 0.40) overlapping face -> LIVENESS_UNSURE
+    face_containment: 0.80          # fraction of face box inside device box
+  moire:
+    unsure_score: 0.40              # FFT peak score on face ROI, 0-1                        [cal]
+    fail_score: 0.70                # >= fail_score -> SPOOF_MOIRE only if corroborated      [cal]
+    require_corroboration: true     # fail needs PAD != PASS or flash != PASS; else LIVENESS_UNSURE
+    enforce: true                   # false = ADVISORY: measured + reported (scores.moire, signals ADVISORY_<zone>),
+                                    # no decision effect. Kept ON 2026-11-14 (user: "add them back dont remove").
+                                    # Lead proposal: advisory until dev-split calibration on genuine vs phone-replay
+                                    # captures (eval) - never ship an uncalibrated veto. Missing moire stays UNSURE.
+  flash:
+    enabled: true
+    colours_min: 3
+    colours_max: 3                  # round-2 R17
+    duration_ms: 700                # operator speed request 2026-11-14 (was 1000); re-validate the flash at 700 ms
+                                    # before setting enforce: true; back to 1000 ms if r_frames degrades.
+                                    # 3 colours / 0.7 s = 2.86 changes/s <= max_changes_per_s 3 (photosensitivity)
+    max_changes_per_s: 3            # photosensitivity limit; gentle tint transitions
+    pass_min_r: 0.70                # chroma correlation with nonce sequence
+    fail_max_r: 0.30                # r < 0.30 (with sufficient amplitude) -> SPOOF_FLASH_MISMATCH
+    min_amplitude: 2.0              # mean |dRGB| in face ROI (0-255); below -> WEAK (UNSURE)
+                                    # [cal: operator webcam, n=3 genuine, 2026-11-14] was 4.0 (genuine 2.1-8.5)
+    lag_min_frames: 0
+    lag_max_frames: 8               # outside -> FAIL (replay lag)
+                                    # [cal: operator webcam, n=3 genuine, 2026-11-14] was 3 (genuine 3.75-7.0)
+    lag_max_std_frames: 1.5         # [cal: operator webcam, n=3 genuine, 2026-11-14] was 1.0 (genuine 0.65-1.05)
+    ambient_exception_enabled: true # WEAK flash + PAD PASS + mean P_live >= strong_live -> PASS (online only)
+    enforce: false                  # ADVISORY (2026-11-14): measured + reported, no decision effect until kiosk flash timing is re-validated; set true to enforce
+  depth:                            # optional iPhone TrueDepth via the DepthProbe app (docs/IPHONE_SETUP.md); thresholds [est]
+    enabled: false
+    require_absolute_depth_for_d4: true
+    d0_valid_fail_below: 0.40       # -> QUALITY_DEPTH_INVALID (recapture)
+    d0_valid_pass_min: 0.60         # [0.40,0.60) -> LIVENESS_UNSURE
+    d1_plane_rms_fail_mm: 3.0       # < 3 -> SPOOF_FLAT_DEPTH
+    d1_plane_rms_pass_mm: 6.0       # > 6 -> PASS (real faces ~8-15)
+    d2_quad_rms_fail_mm: 2.0        # bent print
+    d2_quad_rms_pass_mm: 4.0
+    d3_nose_relief_fail_mm: 8.0
+    d3_nose_relief_pass_mm: 15.0
+    d4_ipd_min_mm: 45.0             # outside -> SPOOF_DEPTH_SCALE
+    d4_ipd_max_mm: 80.0
+  mask:
+    strong_cue_deny_count: 2        # >= 2 strong cues -> DENY; >= 1 any cue -> STEP_UP (CHALLENGE)
+    m1_mouth_residual_min_mm: 4.0   # real: mouth/cheek residual > 4 mm ...
+    m1_forehead_residual_max_mm: 2.0 # ... while forehead < 2 mm; blendshape moved + depth rigid -> DENY MASK_CUE_RIGID
+    m2_ring_score_weak: 0.50        # RGB eye-hole/outline Laplacian ring                     [cal]
+    m2_ring_score_strong: 0.75
+    m2_depth_step_strong_mm: 10.0
+    m3_template_rms_weak_mm: 6.0    # vs enrolled 64x64 depth template (same person ~2-4 mm)
+    m3_template_rms_strong_mm: 8.0
+    spectral_enabled: false         # optional MASK_CUE_SPECTRAL
+    spectral_skin_weak_max: 0.40
+    spectral_skin_strong_max: 0.20
+    m2_rgb_enforce: true            # false = ADVISORY RGB ring (M2): scores.mask.m2_ring + advisory_cues, never a mask
+                                    # code. Kept ON 2026-11-14 (user: "add them back dont remove"); genuine spectacle
+                                    # frames score 0.35-0.80. Lead proposal: advisory until dev-split calibration on
+                                    # genuine vs mask captures (eval). Depth M2 step, M1 and M3 always enforced.
+
+# ---------------------------------------------------------------- identity match
+match:
+  local:                            # uniface / buffalo_l ArcFace, cosine similarity
+    allow_min_cosine: 0.50          # [cal] set to 99.8th pct of impostor scores (FAR 0.2%)
+    deny_below_cosine: 0.30         # top1 < 0.30 -> NOT_ENROLLED; [0.30, allow) -> MATCH_LOW
+    min_margin_top1_top2: 0.10      # top1 - top2 < margin -> MATCH_AMBIGUOUS
+    calibration_target_far: 0.002
+    calibration_impostor_percentile: 99.8
+    require_same_identity_first_last_frame: true
+  rekognition:                      # SearchUsersByImage (online only)
+    enabled: true                   # false (sandbox IAM denies it): online identity = local matcher, offline bars
+    user_match_threshold: 80        # API parameter
+    quality_filter: "AUTO"
+    allow_min_similarity: 99.0
+    deny_below_similarity: 80.0     # no match or < 80 -> NOT_ENROLLED
+    runner_up_max_similarity: 80.0  # runner-up >= 80 -> MATCH_AMBIGUOUS
+  cross_check_local_conflict: true  # local top1 != rekognition user and local >= conflict min -> MATCH_AMBIGUOUS
+
+identity:
+  cross_check_conflict_min_cosine: 0.50  # own key (not allow_min_cosine) so raising allow never relaxes it (P06)
+
+# ---------------------------------------------------------------- step-up challenge
+challenge:
+  steps: 2                          # 1 deformation (mandatory) + 1 secondary, random order
+  deformation_actions: ["SMILE", "OPEN_MOUTH"]   # PUFF_CHEEKS removed 2026-11-14 at user request (still mouth movement, policy 3.4)
+  secondary_actions: ["BLINK", "TURN_LEFT", "TURN_RIGHT"]   # never blink-only
+  baseline_ms: 200                  # neutral blendshape baseline after face lock
+  min_reaction_ms: 150              # response earlier than this -> hard fail (pre-recorded)
+  step_window_ms: 1500              # report suggests ~1000; widened for usability, tighten if BPCER allows
+  deformation_rise_min: 0.45        # blendshape rise above baseline
+  smile_abs_min: 0.50               # mouthSmileLeft/Right mean
+  jaw_open_abs_min: 0.40
+  cheek_puff_abs_min: 0.40
+  blink_close_min: 0.50
+  blink_open_max: 0.20
+  turn_yaw_min_deg: 15
+  min_identity_cosine: 0.30         # last challenge frame vs candidate template
+  landmark_shift_min: 0.0           # deformation needs correlated cheek/nasolabial shift > this  [cal]
+  random_rate: 0.15                 # BIO_PASS that would ALLOW -> random CHALLENGE (RANDOM_CHALLENGE); offline 0.30. Restored 2026-11-14 at user request ("i want that blink")
+                                    # demo: POST /v1/admin/random-challenge {"mode":"FORCE_NEXT"} (one attempt) / {"mode":"OFF"} / {"mode":"AUTO"};
+                                    # or {"mode":"FORCE"} (every would-be ALLOW until AUTO/OFF); edge/schemas.py RandomChallengeRequest accepts AUTO/FORCE/FORCE_NEXT/OFF
+  soft_fail_retries: 1              # no response in window -> 1 retry, then DENY
+  session_ttl_s: 120
+  face_liveness_min_confidence: 80  # optional Rekognition Face Liveness (online step-up only)
+
+stepup:
+  max_attempts_per_step: 2          # second factor: 2 tries, then DENY FALLBACK_FAILED
+  session_ttl_s: 120
+  methods:
+    online_default:    ["TOTP", "CARD", "EMAIL_OTP", "STAFF_OVERRIDE"]
+    online_high_risk:  ["TOTP", "CARD", "EMAIL_OTP"]
+    offline_default:   ["TOTP", "CARD", "STAFF_OVERRIDE"]
+    offline_high_risk: ["TOTP", "STAFF_OVERRIDE"]
+    cache_untrusted:   ["STAFF_OVERRIDE"]   # bundle EXPIRED or INVALID
+    quality_exhausted: ["STAFF_OVERRIDE"]   # A3: recaptures exhausted, low/medium zone -> desk staff review
+  attempts_left_semantics: "retries_after"   # DECISION_POLICY §7 / API.md: further failures tolerated after
+                                             # this submission (1 -> 0 = last try); lead final 2026-11-14.
+                                             # "including_next" = submissions left incl. the next (2 -> 1)
+
+# ---------------------------------------------------------------- schedule (SC1)
+schedule:
+  grace_minutes: 15                 # +/- around window edges -> GRACE_WINDOW -> STEP_UP
+  grace_minutes_high_risk: 0        # no grace for high-risk zones
+  high_risk_requires_stepup_online: true
+  online_max_bundle_age_min: 30     # online but bundle not confirmed by the cloud within 30 min -> attempt OFFLINE (P7)
+
+rate_limit:
+  enabled: true                     # false = eval/demo profile only: no counting, no blocking
+  counted_code_prefixes: ["SPOOF_", "MASK_CUE_", "INJECTION_"]   # DECISION_POLICY §9.7 (P11) ...
+  counted_codes: ["CHALLENGE_FAILED", "FALLBACK_FAILED"]        # ... except DENYs carrying a SCHEDULE_* code
+  max_failures: 5                   # attack-evidence DENYs per kiosk ...
+  window_s: 180                     # ... within 3 min ...
+  lockout_s: 5                      # ... -> RATE_LIMITED for 5 s (operator request 2026-11-14; was 60)
+
+# ---------------------------------------------------------------- connectivity / cache (SC2)
+connectivity:
+  health_path: "/v1/health"         # GET {CLOUD_API_URL}/v1/health
+  heartbeat_interval_s: 5
+  heartbeat_timeout_ms: 2000       # DECISION_POLICY §8.1 / SC2.1 / test X09
+  misses_to_offline: 3
+  successes_to_online: 3            # -> SYNCING; ONLINE only after sync + refresh
+  require_sync_before_online: true
+  status_poll_ms: 2000              # kiosk badge polls GET /v1/mode
+
+cache:
+  bundle_max_staleness_hours: 12    # effective expiry = min(expires_at, issued_at + 12 h)
+  bundle_refresh_interval_min: 15   # while online
+  template_cache_max_age_hours: 72
+  clock_rollback_tolerance_s: 300   # now < issued_at - 300 s -> bundle INVALID
+
+offline_store:
+  max_retention_hours: 24           # unsynced records purged -> tombstone
+  purge_after_sync_ack: true
+  score_decimals: 2
+
+sync:
+  batch_size: 50                    # POST /v1/sync items max_length 50 (docs/API.md 4.4)
+  backoff_initial_s: 1
+  backoff_max_s: 60
+  backoff_jitter: 0.2
+  clock_skew_alert_s: 120
+  spoof_burst_count: 3              # server alert: >= 3 SPOOF/INJECTION DENY ...
+  spoof_burst_window_min: 10        # ... within 10 min
+
+fallback:
+  totp:   {algorithm: "SHA1", digits: 6, period_s: 30, window_steps: 1}
+  email_otp: {digits: 6, ttl_s: 300, enabled: true}         # online only (SES); false -> never offered
+  staff_override: {code_length: 8, pbkdf2_iterations: 100000, max_failures: 3, lockout_s: 300,
+                   valid_after_expiry_h: 24}   # per-code valid_until = bundle expires_at + 24 h (R7)
+  card:   {hash: "HMAC-SHA256", pepper_env: "CARD_ID_PEPPER"}
+
+ui:
+  show_detailed_reasons: true       # demo; production shows first code only
+
+# ---------------------------------------------------------------- OFFLINE overrides (deep-merged)
+offline:
+  auto_allow_max_risk: "medium"     # zones above this risk never auto-ALLOW offline
+  match_offline_delta: 0.05         # applied to the CALIBRATED local allow threshold
+  overrides:
+    liveness:
+      pad:
+        pass_min: 0.85              # +0.05
+      flash:
+        pass_min_r: 0.75            # +0.05
+        ambient_exception_enabled: false
+    match:
+      local:
+        allow_min_cosine: 0.55      # = calibrated allow + match_offline_delta (recompute after calibration)
+        min_margin_top1_top2: 0.15  # +0.05
+    challenge:
+      random_rate: 0.30             # more random challenges offline
+  # Invariants NOT configurable (enforced in code): UNSURE never auto-ALLOWs offline;
+  # high-risk never auto-ALLOWs offline; stale bundle never auto-ALLOWs; deny thresholds unchanged.

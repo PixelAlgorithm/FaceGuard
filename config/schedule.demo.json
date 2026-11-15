@@ -1,0 +1,729 @@
+{
+  "format_version": 1,
+  "bundle_version": 42,
+  "issued_at": "2026-11-14T02:30:00Z",
+  "expires_at": "2026-11-14T14:30:00Z",
+  "issuer": "hidhack-demo",
+  "timezone": "Asia/Kolkata",
+  "scope": {
+    "kiosk_ids": [
+      "KIOSK_MAIN_01",
+      "KIOSK_LIB_01",
+      "KIOSK_LAB_01",
+      "KIOSK_HOSTEL_01",
+      "KIOSK_SRV_01"
+    ],
+    "note": "DEMO bundle = config/schedule.example.json + the operator (u_prj1) and teammate placeholders. Sign with scripts/sign_bundle.py (re-stamps times, recomputes demo card hashes with CARD_ID_PEPPER)."
+  },
+  "revocations_version": 7,
+  "zones": {
+    "MAIN_GATE": {
+      "risk": "low",
+      "requires_explicit_grant": false
+    },
+    "LIBRARY": {
+      "risk": "low",
+      "requires_explicit_grant": false
+    },
+    "LAB_BLOCK": {
+      "risk": "medium",
+      "requires_explicit_grant": false
+    },
+    "HOSTEL": {
+      "risk": "medium",
+      "requires_explicit_grant": false
+    },
+    "SERVER_ROOM": {
+      "risk": "high",
+      "requires_explicit_grant": true
+    }
+  },
+  "kiosks": {
+    "KIOSK_MAIN_01": {
+      "zone": "MAIN_GATE",
+      "label": "Main gate turnstile"
+    },
+    "KIOSK_LIB_01": {
+      "zone": "LIBRARY",
+      "label": "Central library entrance"
+    },
+    "KIOSK_LAB_01": {
+      "zone": "LAB_BLOCK",
+      "label": "Lab block (CSE)"
+    },
+    "KIOSK_HOSTEL_01": {
+      "zone": "HOSTEL",
+      "label": "Hostel block A"
+    },
+    "KIOSK_SRV_01": {
+      "zone": "SERVER_ROOM",
+      "label": "Data centre door"
+    }
+  },
+  "roles": {
+    "student": {
+      "zones": [
+        "MAIN_GATE",
+        "LIBRARY",
+        "LAB_BLOCK"
+      ],
+      "windows": {
+        "MAIN_GATE": [
+          {
+            "days": [
+              "MON",
+              "TUE",
+              "WED",
+              "THU",
+              "FRI",
+              "SAT"
+            ],
+            "start": "06:00",
+            "end": "22:00"
+          },
+          {
+            "days": [
+              "SUN"
+            ],
+            "start": "08:00",
+            "end": "20:00"
+          }
+        ],
+        "LIBRARY": [
+          {
+            "days": [
+              "MON",
+              "TUE",
+              "WED",
+              "THU",
+              "FRI",
+              "SAT"
+            ],
+            "start": "08:00",
+            "end": "21:00"
+          },
+          {
+            "days": [
+              "SUN"
+            ],
+            "start": "10:00",
+            "end": "17:00"
+          }
+        ],
+        "LAB_BLOCK": [
+          {
+            "days": [
+              "MON",
+              "TUE",
+              "WED",
+              "THU",
+              "FRI"
+            ],
+            "start": "08:00",
+            "end": "18:00"
+          },
+          {
+            "days": [
+              "SAT"
+            ],
+            "start": "09:00",
+            "end": "13:00"
+          }
+        ],
+        "HOSTEL": [
+          {
+            "days": [
+              "MON",
+              "TUE",
+              "WED",
+              "THU",
+              "FRI",
+              "SAT",
+              "SUN"
+            ],
+            "start": "05:00",
+            "end": "23:00"
+          }
+        ]
+      },
+      "note": "HOSTEL windows apply only to residents granted HOSTEL via users[].zones_add."
+    },
+    "faculty": {
+      "zones": [
+        "MAIN_GATE",
+        "LIBRARY",
+        "LAB_BLOCK"
+      ],
+      "windows": {
+        "MAIN_GATE": [
+          {
+            "days": [
+              "MON",
+              "TUE",
+              "WED",
+              "THU",
+              "FRI",
+              "SAT",
+              "SUN"
+            ],
+            "start": "06:00",
+            "end": "23:00"
+          }
+        ],
+        "LIBRARY": [
+          {
+            "days": [
+              "MON",
+              "TUE",
+              "WED",
+              "THU",
+              "FRI",
+              "SAT"
+            ],
+            "start": "07:00",
+            "end": "22:00"
+          }
+        ],
+        "LAB_BLOCK": [
+          {
+            "days": [
+              "MON",
+              "TUE",
+              "WED",
+              "THU",
+              "FRI",
+              "SAT"
+            ],
+            "start": "07:00",
+            "end": "22:00"
+          }
+        ]
+      }
+    },
+    "staff": {
+      "zones": [
+        "MAIN_GATE",
+        "LIBRARY",
+        "LAB_BLOCK"
+      ],
+      "windows": {
+        "MAIN_GATE": [
+          {
+            "days": [
+              "MON",
+              "TUE",
+              "WED",
+              "THU",
+              "FRI",
+              "SAT",
+              "SUN"
+            ],
+            "start": "00:00",
+            "end": "24:00"
+          }
+        ],
+        "LIBRARY": [
+          {
+            "days": [
+              "MON",
+              "TUE",
+              "WED",
+              "THU",
+              "FRI",
+              "SAT"
+            ],
+            "start": "07:00",
+            "end": "21:00"
+          }
+        ],
+        "LAB_BLOCK": [
+          {
+            "days": [
+              "MON",
+              "TUE",
+              "WED",
+              "THU",
+              "FRI",
+              "SAT"
+            ],
+            "start": "07:00",
+            "end": "21:00"
+          }
+        ],
+        "SERVER_ROOM": [
+          {
+            "days": [
+              "MON",
+              "TUE",
+              "WED",
+              "THU",
+              "FRI"
+            ],
+            "start": "09:00",
+            "end": "18:00"
+          }
+        ]
+      },
+      "note": "SERVER_ROOM requires explicit grant (zones_add); windows apply only to granted staff."
+    },
+    "contractor": {
+      "zones": [
+        "MAIN_GATE",
+        "LAB_BLOCK"
+      ],
+      "windows": {
+        "MAIN_GATE": [
+          {
+            "days": [
+              "MON",
+              "TUE",
+              "WED",
+              "THU",
+              "FRI",
+              "SAT"
+            ],
+            "start": "08:00",
+            "end": "18:00"
+          }
+        ],
+        "LAB_BLOCK": [
+          {
+            "days": [
+              "MON",
+              "TUE",
+              "WED",
+              "THU",
+              "FRI"
+            ],
+            "start": "09:00",
+            "end": "17:00"
+          }
+        ]
+      }
+    },
+    "visitor": {
+      "zones": [],
+      "windows": {
+        "MAIN_GATE": [
+          {
+            "days": [
+              "MON",
+              "TUE",
+              "WED",
+              "THU",
+              "FRI",
+              "SAT",
+              "SUN"
+            ],
+            "start": "09:00",
+            "end": "18:00"
+          }
+        ],
+        "LIBRARY": [
+          {
+            "days": [
+              "MON",
+              "TUE",
+              "WED",
+              "THU",
+              "FRI",
+              "SAT",
+              "SUN"
+            ],
+            "start": "10:00",
+            "end": "17:00"
+          }
+        ],
+        "LAB_BLOCK": [
+          {
+            "days": [
+              "MON",
+              "TUE",
+              "WED",
+              "THU",
+              "FRI",
+              "SAT",
+              "SUN"
+            ],
+            "start": "09:00",
+            "end": "18:00"
+          }
+        ]
+      },
+      "note": "Visitors have no zones without an active visitor pass."
+    }
+  },
+  "exceptions": [
+    {
+      "id": "EXC-HACK-2026",
+      "name": "HID Hackathon 2026 (event) - lab block open late",
+      "date_from": "2026-11-14",
+      "date_to": "2026-11-14",
+      "roles": [
+        "student",
+        "faculty",
+        "staff"
+      ],
+      "zones": [
+        "LAB_BLOCK"
+      ],
+      "mode": "add",
+      "windows": [
+        {
+          "start": "08:00",
+          "end": "23:00"
+        }
+      ],
+      "overrides_holiday": false
+    },
+    {
+      "id": "EXC-SRV-HACK",
+      "name": "Hackathon infrastructure support - server room Saturday",
+      "date_from": "2026-11-14",
+      "date_to": "2026-11-14",
+      "roles": [
+        "staff"
+      ],
+      "zones": [
+        "SERVER_ROOM"
+      ],
+      "mode": "add",
+      "windows": [
+        {
+          "start": "09:00",
+          "end": "21:00"
+        }
+      ],
+      "overrides_holiday": false
+    },
+    {
+      "id": "EXC-EXAM-NOV26",
+      "name": "End-semester exam week - library extended hours",
+      "date_from": "2026-11-16",
+      "date_to": "2026-11-21",
+      "roles": [
+        "student"
+      ],
+      "zones": [
+        "LIBRARY"
+      ],
+      "mode": "replace",
+      "windows": [
+        {
+          "start": "06:00",
+          "end": "24:00"
+        }
+      ],
+      "overrides_holiday": false
+    },
+    {
+      "id": "EXC-LABS-CLOSED-EXAM",
+      "name": "End-semester exam week - labs closed to students",
+      "date_from": "2026-11-16",
+      "date_to": "2026-11-21",
+      "roles": [
+        "student"
+      ],
+      "zones": [
+        "LAB_BLOCK"
+      ],
+      "mode": "close",
+      "windows": [],
+      "overrides_holiday": false
+    }
+  ],
+  "holidays": [
+    {
+      "date": "2026-11-01",
+      "name": "Karnataka Rajyotsava",
+      "closed_zones": [
+        "LIBRARY",
+        "LAB_BLOCK"
+      ],
+      "exempt_roles": [
+        "staff"
+      ]
+    },
+    {
+      "date": "2026-11-20",
+      "name": "Campus Closure Day (maintenance, fictional)",
+      "closed_zones": [
+        "LAB_BLOCK"
+      ],
+      "exempt_roles": [
+        "staff"
+      ]
+    },
+    {
+      "date": "2026-12-25",
+      "name": "Christmas",
+      "closed_zones": [
+        "LIBRARY",
+        "LAB_BLOCK"
+      ],
+      "exempt_roles": [
+        "staff"
+      ]
+    }
+  ],
+  "visitor_passes": [
+    {
+      "pass_id": "VP-2026-1113",
+      "user_id": "u_e1f2",
+      "host_user_id": "u_5e6f",
+      "purpose": "Hackathon judge",
+      "valid_from": "2026-11-13T09:00:00+05:30",
+      "valid_until": "2026-11-14T18:00:00+05:30",
+      "zones": [
+        "MAIN_GATE",
+        "LAB_BLOCK"
+      ],
+      "windows": null
+    }
+  ],
+  "users": {
+    "u_1a2b": {
+      "display": "Aarav S.",
+      "role": "student",
+      "zones_add": [
+        "HOSTEL"
+      ],
+      "zones_remove": [],
+      "extra_windows": {},
+      "valid_from": null,
+      "valid_until": null,
+      "revoked": false,
+      "revoked_at": null,
+      "fallback": {
+        "totp_enrolled": true,
+        "card_id_hash": "058330675c106d9f06cd14d98a495ae3d5a87013ed14281c06913ea65f1ff519"
+      },
+      "note": "hostel resident"
+    },
+    "u_3c4d": {
+      "display": "Priya N.",
+      "role": "student",
+      "zones_add": [],
+      "zones_remove": [],
+      "extra_windows": {},
+      "valid_from": null,
+      "valid_until": null,
+      "revoked": false,
+      "revoked_at": null,
+      "fallback": {
+        "totp_enrolled": true,
+        "card_id_hash": "d321eef09d98d6f2d2be42376fe89fbbaefb6d942235f329687bd674b22f9cdd"
+      }
+    },
+    "u_5e6f": {
+      "display": "Dr. Meera I.",
+      "role": "faculty",
+      "zones_add": [],
+      "zones_remove": [],
+      "extra_windows": {},
+      "valid_from": null,
+      "valid_until": null,
+      "revoked": false,
+      "revoked_at": null,
+      "fallback": {
+        "totp_enrolled": true,
+        "card_id_hash": "83c4664d11d765c68d7229ad61012e7329d0708d889c87d3b9ee0123a29a3633"
+      }
+    },
+    "u_7a8b": {
+      "display": "Rahul V.",
+      "role": "staff",
+      "zones_add": [
+        "SERVER_ROOM"
+      ],
+      "zones_remove": [],
+      "extra_windows": {},
+      "valid_from": null,
+      "valid_until": null,
+      "revoked": false,
+      "revoked_at": null,
+      "fallback": {
+        "totp_enrolled": true,
+        "card_id_hash": "b744aaa8f910a5255d75ed3bafff434272fbfd028313ae797f7da8890d2914d2"
+      },
+      "note": "IT infrastructure; explicit SERVER_ROOM grant"
+    },
+    "u_9c0d": {
+      "display": "Suresh K.",
+      "role": "contractor",
+      "zones_add": [],
+      "zones_remove": [],
+      "extra_windows": {},
+      "valid_from": "2026-11-01T00:00:00+05:30",
+      "valid_until": "2026-11-30T23:59:59+05:30",
+      "revoked": false,
+      "revoked_at": null,
+      "fallback": {
+        "totp_enrolled": false,
+        "card_id_hash": "4d9271af8ff1e4b799f9439bbe53d92d622aa2a01a7e222881fa383e658df42d"
+      },
+      "note": "HVAC contract, November only"
+    },
+    "u_e1f2": {
+      "display": "Ananya R.",
+      "role": "visitor",
+      "zones_add": [],
+      "zones_remove": [],
+      "extra_windows": {},
+      "valid_from": null,
+      "valid_until": null,
+      "revoked": false,
+      "revoked_at": null,
+      "fallback": {
+        "totp_enrolled": false,
+        "card_id_hash": "60b00ba63bb88eec655954c3b29c1278acd32c721cb16237a50ccc2740845de8"
+      },
+      "note": "zones and validity come from visitor pass VP-2026-1113"
+    },
+    "u_a3b4": {
+      "display": "Kiran P.",
+      "role": "student",
+      "zones_add": [],
+      "zones_remove": [],
+      "extra_windows": {},
+      "valid_from": null,
+      "valid_until": null,
+      "revoked": true,
+      "revoked_at": "2026-11-10T04:30:00Z",
+      "fallback": {
+        "totp_enrolled": true,
+        "card_id_hash": "fe733896af40e9ef16dbd0a8336ef05045ef49a3c6dac16ffbdc43469b375509"
+      }
+    },
+    "u_c5d6": {
+      "display": "Neha G.",
+      "role": "staff",
+      "zones_add": [],
+      "zones_remove": [
+        "LAB_BLOCK"
+      ],
+      "extra_windows": {
+        "LIBRARY": [
+          {
+            "days": [
+              "SUN"
+            ],
+            "start": "07:00",
+            "end": "21:00"
+          }
+        ]
+      },
+      "valid_from": null,
+      "valid_until": null,
+      "revoked": false,
+      "revoked_at": null,
+      "fallback": {
+        "totp_enrolled": true,
+        "card_id_hash": "3b3670439e70e9b1c31f15bbb40dcf4fbc5e6690079aec76b126c1cf87750e3f"
+      },
+      "note": "library staff: Sunday duty override; no lab access"
+    },
+    "u_prj1": {
+      "display": "Prajwal M.",
+      "role": "student",
+      "zones_add": [
+        "SERVER_ROOM"
+      ],
+      "zones_remove": [],
+      "extra_windows": {
+        "SERVER_ROOM": [
+          {
+            "days": [
+              "MON",
+              "TUE",
+              "WED",
+              "THU",
+              "FRI",
+              "SAT",
+              "SUN"
+            ],
+            "start": "08:00",
+            "end": "22:00"
+          }
+        ]
+      },
+      "valid_from": null,
+      "valid_until": null,
+      "revoked": false,
+      "revoked_at": null,
+      "fallback": {
+        "totp_enrolled": true,
+        "card_id_hash": "RECOMPUTED-BY-sign_bundle.py"
+      },
+      "note": "operator / live demo subject; demo card HID-DEMO-0001"
+    },
+    "u_tm02": {
+      "display": "Team member 2",
+      "role": "student",
+      "zones_add": [],
+      "zones_remove": [],
+      "extra_windows": {},
+      "valid_from": null,
+      "valid_until": null,
+      "revoked": false,
+      "revoked_at": null,
+      "fallback": {
+        "totp_enrolled": true,
+        "card_id_hash": "RECOMPUTED-BY-sign_bundle.py"
+      },
+      "note": "teammate placeholder; demo card HID-DEMO-0002"
+    },
+    "u_tm03": {
+      "display": "Team member 3",
+      "role": "student",
+      "zones_add": [],
+      "zones_remove": [],
+      "extra_windows": {},
+      "valid_from": null,
+      "valid_until": null,
+      "revoked": false,
+      "revoked_at": null,
+      "fallback": {
+        "totp_enrolled": true,
+        "card_id_hash": "RECOMPUTED-BY-sign_bundle.py"
+      },
+      "note": "teammate placeholder; demo card HID-DEMO-0003"
+    },
+    "u_tm04": {
+      "display": "Team member 4",
+      "role": "student",
+      "zones_add": [],
+      "zones_remove": [],
+      "extra_windows": {},
+      "valid_from": null,
+      "valid_until": null,
+      "revoked": false,
+      "revoked_at": null,
+      "fallback": {
+        "totp_enrolled": true,
+        "card_id_hash": "RECOMPUTED-BY-sign_bundle.py"
+      },
+      "note": "teammate placeholder; demo card HID-DEMO-0004"
+    }
+  },
+  "revocations": [
+    {
+      "user_id": "u_a3b4",
+      "revoked_at": "2026-11-10T04:30:00Z",
+      "reason": "ADMIN"
+    }
+  ],
+  "override_codes": {
+    "kdf": "PBKDF2-HMAC-SHA256",
+    "iterations": 100000,
+    "codes": [],
+    "note": "Live demo source: NO override codes here. scripts/sign_bundle.py generates fresh one-time PBKDF2 codes at signing time (--min-codes, default 4) and writes their values only to edge/data/DEMO_CODES.txt (mode 600). The publicly documented OVR-001..003 exist only in config/schedule.example.json (test fixture) and are dropped from any bundle the script signs."
+  },
+  "card_id_hash_scheme": "HMAC-SHA256(key=CARD_ID_PEPPER, msg=card_id).hex(); demo pepper 'hidhack-demo-pepper', demo cards HID-CARD-1001..1008 (1001=u_1a2b, 1002=u_3c4d, 1003=u_5e6f, 1004=u_7a8b, 1005=u_9c0d, 1006=u_e1f2, 1007=u_a3b4, 1008=u_c5d6)",
+  "signature": {
+    "alg": "HMAC-SHA256",
+    "key_id": "demo-k1",
+    "value": "UNSIGNED-run-scripts/sign_bundle.py"
+  },
+  "demo_card_ids_note": "card_id_hash values are recomputed at signing time: HMAC-SHA256(CARD_ID_PEPPER, card_id) for HID-CARD-1001..1008 (see card_id_hash_scheme) and HID-DEMO-0001..0004 (u_prj1, u_tm02..u_tm04)"
+}

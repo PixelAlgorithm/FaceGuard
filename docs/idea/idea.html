@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Can You Spot a Spoof? Solution Proposal</title>
+<style>
+  @page {
+    size: A4;
+    margin: 17mm 16mm 18mm 16mm;
+    @bottom-left { content: "HID Hackathon 2026 | Can You Spot a Spoof?"; font: 7.5pt "Helvetica Neue", Arial, sans-serif; color: #6b7280; }
+    @bottom-right { content: "Page " counter(page) " of " counter(pages); font: 7.5pt "Helvetica Neue", Arial, sans-serif; color: #6b7280; }
+  }
+  @page :first {
+    margin: 0;
+    @bottom-left { content: none; }
+    @bottom-right { content: none; }
+  }
+  :root { --hid: #0033A0; --hid-dark: #002270; --hid-light: #e8eef9; --ink: #1f2937; --muted: #6b7280; --line: #d5dbe7;
+          --allow: #0f7b3f; --allow-bg: #e5f4ec; --step: #a15c00; --step-bg: #fdf1dc; --deny: #b42318; --deny-bg: #fde8e6; }
+  * { box-sizing: border-box; }
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body { font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; font-size: 9pt; line-height: 1.38; color: var(--ink); margin: 0; }
+  h1, h2, h3, h4 { color: var(--hid); margin: 0; line-height: 1.2; }
+  h2 { font-size: 15pt; font-weight: 700; padding-bottom: 5px; border-bottom: 2.5px solid var(--hid); margin: 0 0 10px; }
+  h2 .num { display: inline-block; background: var(--hid); color: #fff; font-size: 10.5pt; width: 22px; height: 22px; line-height: 22px; text-align: center; border-radius: 4px; margin-right: 8px; vertical-align: 2px; }
+  h3 { font-size: 11pt; margin: 10px 0 4px; }
+  h4 { font-size: 10pt; margin: 10px 0 4px; color: var(--hid-dark); }
+  p { margin: 0 0 7px; }
+  ul, ol { margin: 0 0 7px; padding-left: 18px; }
+  li { margin-bottom: 2.5px; }
+  code, .mono { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 8.4pt; background: #f1f4fa; padding: 0 3px; border-radius: 2px; }
+  section.page { break-before: page; }
+  .avoid { break-inside: avoid; }
+  table { width: 100%; border-collapse: collapse; margin: 5px 0 8px; font-size: 8.1pt; }
+  tr { break-inside: avoid; }
+  th { background: var(--hid); color: #fff; text-align: left; padding: 4px 6px; font-weight: 600; }
+  td { padding: 3.5px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:nth-child(even) td { background: #f7f9fd; }
+  table.compact td, table.compact th { padding: 3.5px 5px; }
+  section.dense table { font-size: 7.7pt; }
+  section.dense td, section.dense th { padding: 2.8px 5px; }
+  .tag { display: inline-block; font-weight: 700; font-size: 7.8pt; padding: 1px 6px; border-radius: 3px; letter-spacing: .2px; white-space: nowrap; }
+  .allow { background: var(--allow-bg); color: var(--allow); border: 1px solid #9fd3b5; }
+  .step  { background: var(--step-bg); color: var(--step); border: 1px solid #f0c27a; }
+  .deny  { background: var(--deny-bg); color: var(--deny); border: 1px solid #f2a59d; }
+  .neutral { background: var(--hid-light); color: var(--hid); border: 1px solid #b5c6ea; }
+  .callout { background: var(--hid-light); border-left: 4px solid var(--hid); padding: 8px 11px; margin: 8px 0 10px; border-radius: 0 4px 4px 0; break-inside: avoid; }
+  .callout.warn { background: #fff7e8; border-left-color: #d08700; }
+  .callout b.t { color: var(--hid); }
+  .est { font-size: 7.6pt; font-weight: 700; color: #a15c00; background: #fdf1dc; border: 1px solid #f0c27a; border-radius: 3px; padding: 0 4px; white-space: nowrap; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 9px; }
+  .card { border: 1px solid var(--line); border-top: 3px solid var(--hid); border-radius: 4px; padding: 8px 10px; background: #fff; break-inside: avoid; }
+  .card h4 { margin-top: 0; }
+  .small { font-size: 8.3pt; color: var(--muted); }
+  .kpi { text-align: center; border: 1px solid var(--line); border-radius: 4px; padding: 7px 4px; }
+  .kpi .v { font-size: 15pt; font-weight: 700; color: var(--hid); }
+  .kpi .l { font-size: 7.8pt; color: var(--muted); }
+  .flow { display: flex; align-items: stretch; gap: 0; margin: 8px 0 10px; break-inside: avoid; }
+  .flow .st { flex: 1; background: var(--hid-light); border: 1px solid #b5c6ea; border-radius: 4px; padding: 6px 7px; font-size: 8.2pt; }
+  .flow .st b { color: var(--hid); display: block; font-size: 8.8pt; margin-bottom: 2px; }
+  .flow .ar { width: 16px; display: flex; align-items: center; justify-content: center; color: var(--hid); font-weight: 700; }
+  figure { margin: 6px 0 10px; break-inside: avoid; }
+  figcaption { font-size: 8pt; color: var(--muted); text-align: center; margin-top: 3px; }
+
+  /* Cover */
+  .cover { height: 297mm; width: 210mm; position: relative; overflow: hidden; background: #fff; }
+  .cover .band { background: var(--hid); color: #fff; padding: 22mm 20mm 14mm; }
+  .cover .logo { display: inline-block; border: 2.5px solid #fff; font-weight: 900; font-size: 22pt; letter-spacing: 3px; padding: 2px 12px; }
+  .cover .event { margin-top: 9mm; font-size: 11pt; letter-spacing: 2.5px; text-transform: uppercase; opacity: .85; }
+  .cover h1 { color: #fff; font-size: 34pt; margin-top: 4mm; font-weight: 800; }
+  .cover .sub { font-size: 15pt; margin-top: 4mm; opacity: .95; }
+  .cover .body { padding: 11mm 20mm 0; }
+  .cover .tagline { font-size: 13pt; color: var(--hid); font-weight: 600; border-left: 4px solid var(--hid); padding-left: 10px; margin-bottom: 7mm; }
+  .cover .meta td { border: none; padding: 3px 0; font-size: 11pt; background: none !important; }
+  .cover .meta td:first-child { color: var(--muted); width: 38mm; }
+  .cover .pillars { margin-top: 8mm; }
+  .cover .foot { position: absolute; bottom: 10mm; left: 20mm; right: 20mm; font-size: 8.5pt; color: var(--muted); border-top: 1px solid var(--line); padding-top: 4mm; }
+  .toc { columns: 2; column-gap: 12mm; font-size: 9.5pt; margin-top: 4mm; }
+  .toc div { padding: 2px 0; border-bottom: 1px dotted var(--line); }
+  .toc span { color: var(--hid); font-weight: 700; display: inline-block; width: 8mm; }
+</style>
+</head>
+<body>
+
+<!-- ============================ COVER ============================ -->
+<div class="cover">
+  <div class="band">
+    <div class="logo">HID</div>
+    <div class="event">HID Hackathon 2026 &mdash; Build Beyond</div>
+    <h1>Can You Spot a Spoof?</h1>
+    <div class="sub">Face Liveness Detection &amp; Authentication for an Entry Kiosk<br>with Campus-Schedule Authorization and Safe Offline Mode</div>
+  </div>
+  <div class="body">
+    <div class="tagline">Passive first. Step-up only when unsure. Local-first, cloud-enhanced.<br>Fail-secure at every layer.</div>
+    <table class="meta">
+      <tr><td>Document</td><td>Solution description (updated to the built system, 14 Nov 2026)</td></tr>
+      <tr><td>Team</td><td>Team: ________________________</td></tr>
+      <tr><td>Date</td><td>14 November 2026</td></tr>
+      <tr><td>Venue</td><td>PES University, Bangalore</td></tr>
+      <tr><td>Cloud region</td><td>AWS us-east-1 (hackathon sandbox); production: ap-south-1 (Mumbai)</td></tr>
+    </table>
+    <div class="grid3 pillars">
+      <div class="card"><h4>Spot the spoof</h4><span class="small">Print, screen, video replay and masks: each one is met by its own layered defence, plus a separate check for injected camera feeds.</span></div>
+      <div class="card"><h4>Live is not authorized</h4><span class="small">The biometric result is combined with the campus access schedule, roles, zones and exceptions (Surprise Challenge 1).</span></div>
+      <div class="card"><h4>Offline, still safe</h4><span class="small">The edge service keeps deciding when the cloud is down. It is stricter offline, offers fallback verification, keeps minimal data and syncs on reconnect (Surprise Challenge 2).</span></div>
+    </div>
+    <h4 style="margin-top:7mm">Contents</h4>
+    <div class="toc">
+      <div><span>1</span>Executive summary</div>
+      <div><span>2</span>The problem and why it matters</div>
+      <div><span>3</span>Solution overview</div>
+      <div><span>4</span>System architecture</div>
+      <div><span>5</span>Pipeline stages</div>
+      <div><span>6</span>Decision logic</div>
+      <div><span>7</span>Per-spoof defences</div>
+      <div><span>8</span>SC1: Access with Campus Schedule</div>
+      <div><span>9</span>SC2: Offline Mode with Safe Access</div>
+      <div><span>10</span>Latency budget</div>
+      <div><span>11</span>AWS architecture</div>
+      <div><span>12</span>Evaluation methodology</div>
+      <div><span>13</span>Differentiators vs judging criteria</div>
+      <div><span>14</span>Risks and honest limits</div>
+      <div><span>15</span>Roadmap and build plan</div>
+    </div>
+  </div>
+  <div class="foot">Figures are <b>design targets or estimates</b> unless marked <b>dev measurement</b> (14 Nov 2026, n&nbsp;=&nbsp;32 attempts, offline mode, MacBook webcam), which are not evaluation results. Evaluation results are reported separately with 95% bounds.</div>
+</div>
+
+<!-- ============================ 1 + 2 ============================ -->
+<section class="page" style="font-size:8.8pt">
+  <h2><span class="num">1</span>Executive summary</h2>
+  <p>We propose an <b>HID entry-kiosk application</b> that captures a face, decides whether a <b>real, present person</b> is in front of the camera, verifies that person against enrolled users, and returns exactly one decision: <span class="tag allow">ALLOW</span> <span class="tag step">REQUEST VERIFICATION</span> <span class="tag deny">DENY</span>. Our target is to do this within <b>2 seconds of face lock</b>.</p>
+  <p>The design rests on three ideas:</p>
+  <ol>
+    <li><b>Passive-first, risk-adaptive step-up.</b> Every attempt runs fast passive checks: an ensemble of MiniFASNet anti-spoof models, a phone/screen detector, an FFT moiré check, a random <b>colour-flash reflection</b> measurement (built; <b>advisory</b> until the kiosk camera timing is re-validated) and a virtual-camera injection check. Face matching runs <i>in parallel</i>. Users are asked to do something (a smile or open-mouth challenge, then OTP or an HID credential) only in the uncertain middle zone, a grace window or a high-risk zone. A random challenge share is an <b>optional site policy</b>, off by default.</li>
+    <li><b>Three-zone, explainable fusion.</b> Each signal has a PASS line and a FAIL line, and anything in between is UNSURE. Hard spoof evidence means DENY. Every decision carries human-readable <b>reason codes</b> such as <code>SPOOF_DEVICE_DETECTED</code>, <code>SPOOF_FLASH_MISMATCH</code> or <code>QUALITY_LOW_LIGHT</code>.</li>
+    <li><b>Local-first, cloud-enhanced.</b> A local edge service on the kiosk <i>always</i> produces a decision. When online, it adds Amazon Rekognition matching and keeps the newest cloud-signed campus schedule bundle, which the edge evaluates locally (no extra network hop per attempt). This makes <b>Offline Mode (SC2)</b> a natural operating state rather than a bolt-on. <b>Campus Schedule (SC1)</b> is a policy layer applied after biometrics, because a live, recognized person is not automatically authorized.</li>
+  </ol>
+  <div class="grid3" style="margin:8px 0 10px">
+    <div class="kpi"><div class="v">1.52 / 1.56 s</div><div class="l">face lock to rendered, p50 / p95 (dev measurement, n = 32, offline, MacBook webcam, earlier 1 s capture window; now 0.7 s, not yet re-measured; target &lt; 2 s)</div></div>
+    <div class="kpi"><div class="v">4 + 1</div><div class="l">attack families covered + injection layer</div></div>
+    <div class="kpi"><div class="v">0</div><div class="l">auto-ALLOWs on UNSURE, spoof or stale offline data (design rule)</div></div>
+  </div>
+  <p>We evaluate with <b>ISO/IEC 30107-3</b> vocabulary (APCER per attack type, BPCER) plus FAR/FRR and p50/p95 latency, using an <b>iBeta Level 1-style</b> protocol (not certified). We report confidence bounds rather than a single accuracy figure.</p>
+
+  <h2 style="margin-top:16px"><span class="num">2</span>The problem and why it matters</h2>
+  <p>Face recognition alone answers <i>"whose face is this?"</i>. It does not answer <i>"is that face really here?"</i>. An attacker who holds up a printed photo, plays a video on a phone, or wears a mask can present a valid identity without being that person. This is a <b>presentation attack</b>. A modern variant feeds synthetic or replayed video straight into the camera pipeline (an <b>injection attack</b>), bypassing the lens entirely.</p>
+  <table class="compact">
+    <tr><th style="width:26%">Attack scenario (brief)</th><th>What the attacker does</th><th style="width:30%">Why it is hard for a webcam</th></tr>
+    <tr><td><b>Printed photo</b></td><td>Holds an A4 / glossy print of the enrolled user</td><td>High-resolution prints carry real facial texture</td></tr>
+    <tr><td><b>Screen replay (photo)</b></td><td>Shows the user's photo on a phone, tablet or laptop</td><td>Emissive screens look bright and "alive"</td></tr>
+    <tr><td><b>Video replay</b></td><td>Plays a video with blinks and head motion</td><td>Defeats naive blink / motion checks</td></tr>
+    <tr><td><b>3D / printed mask</b></td><td>Wears a paper (eye-cut), rigid or silicone mask</td><td>Real eyes blink through eye holes; 3D shape is correct</td></tr>
+  </table>
+  <p><b>Why it matters for HID.</b> Entry kiosks guard labs, server rooms, exam halls and hostels. A false ALLOW is a physical security breach. A false DENY at peak hours creates queues and tailgating. The organisers' reference targets reflect both sides:</p>
+  <table class="compact">
+    <tr><th>Organiser reference target</th><th>Value</th><th>How we will report it</th></tr>
+    <tr><td>Liveness accuracy</td><td>99.4%</td><td>APCER per attack type (worst-case headline) + BPCER</td></tr>
+    <tr><td>Face-authentication accuracy</td><td>99.2%</td><td>FAR / FRR at chosen thresholds, DET curve</td></tr>
+    <tr><td>False Accept Rate (FAR)</td><td>0.2%</td><td>Impostor cross-matching, with 95% upper bound</td></tr>
+    <tr><td>False Reject Rate (FRR)</td><td>0.6%</td><td>Bona fide attempts, with 95% upper bound</td></tr>
+    <tr><td>Decision time</td><td>&lt; 2 s</td><td>Measured p50 / p95, face lock to decision on screen</td></tr>
+  </table>
+  <p>The <b>surprise challenges</b> widen the problem from "is this a live, known face?" to "should this person be let through <i>this door</i>, <i>now</i>, even if the network is down?". That is the real access-control question HID's customers face.</p>
+</section>
+
+<!-- ============================ 3 + 4 ============================ -->
+<section class="page">
+  <h2><span class="num">3</span>Solution overview</h2>
+  <div class="flow">
+    <div class="st"><b>1 Capture</b>Face lock, quality gate, 0.7 s random colour flash (3 colours), 5 frames, injection check</div><div class="ar">&#9654;</div>
+    <div class="st"><b>2 Liveness</b>MiniFASNet ensemble, device detector, moiré, flash correlation, optional depth</div><div class="ar">&#9654;</div>
+    <div class="st"><b>3 Face auth</b>Rekognition 1:N / 1:1 (online), local ArcFace (always), run in parallel with 2</div><div class="ar">&#9654;</div>
+    <div class="st"><b>4 Biometric fusion</b>Three-zone rules giving BIO_PASS / BIO_UNSURE / BIO_FAIL</div><div class="ar">&#9654;</div>
+    <div class="st"><b>5 Policy</b>Campus schedule (SC1), then offline rules (SC2), giving ALLOW / REQUEST VERIFICATION (step-up) / DENY</div>
+  </div>
+  <div class="grid3">
+    <div class="card"><h4>Passive-first</h4>Genuine users with good light just look at the kiosk and walk through. No blinking games on the happy path.</div>
+    <div class="card"><h4>Risk-adaptive step-up</h4>Only suspicious attempts (the uncertain middle zone) get a deformation challenge (smile, open mouth, puff cheeks). Grace windows, uncertain matches and high-risk zones ask for a second factor: OTP, TOTP, a staff code or an HID card / mobile credential. A random challenge share is an optional site policy, off by default.</div>
+    <div class="card"><h4>Local-first, cloud-enhanced</h4>The edge service decides on every attempt. The cloud adds a stronger matcher, the authoritative schedule, audit and metrics. When the cloud disappears, the kiosk tightens its policy rather than failing open.</div>
+  </div>
+  <div class="callout"><b class="t">Fail-secure principle.</b> Any missing, stale, contradictory or low-confidence input moves the decision <i>towards</i> step-up or DENY, never towards ALLOW. The client never authorizes itself: the browser collects evidence, and the edge service owns every security decision.</div>
+
+  <h2 style="margin-top:14px"><span class="num">4</span>System architecture</h2>
+  <figure>
+  <svg viewBox="0 0 752 405" width="100%" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica Neue, Arial, sans-serif">
+    <defs>
+      <marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#0033A0"/></marker>
+      <marker id="ahg" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#6b7280"/></marker>
+    </defs>
+    <!-- Column frames -->
+    <rect x="4" y="4" width="200" height="397" rx="8" fill="#f4f7fc" stroke="#0033A0" stroke-width="1.5"/>
+    <rect x="242" y="4" width="244" height="397" rx="8" fill="#f4f7fc" stroke="#0033A0" stroke-width="1.5"/>
+    <rect x="524" y="4" width="224" height="397" rx="8" fill="#fff8ec" stroke="#d08700" stroke-width="1.5" stroke-dasharray="5 3"/>
+    <rect x="4" y="4" width="200" height="30" rx="8" fill="#0033A0"/><rect x="4" y="22" width="200" height="12" fill="#0033A0"/>
+    <rect x="242" y="4" width="244" height="30" rx="8" fill="#0033A0"/><rect x="242" y="22" width="244" height="12" fill="#0033A0"/>
+    <rect x="524" y="4" width="224" height="30" rx="8" fill="#d08700"/><rect x="524" y="22" width="224" height="12" fill="#d08700"/>
+    <text x="104" y="24" fill="#fff" font-size="12" font-weight="700" text-anchor="middle">KIOSK BROWSER</text>
+    <text x="364" y="24" fill="#fff" font-size="12" font-weight="700" text-anchor="middle">LOCAL EDGE SERVICE (offline-capable)</text>
+    <text x="636" y="24" fill="#fff" font-size="12" font-weight="700" text-anchor="middle">AWS CLOUD us-east-1</text>
+    <text x="104" y="48" fill="#6b7280" font-size="9" text-anchor="middle">React + Vite + TS, fullscreen</text>
+    <text x="364" y="48" fill="#6b7280" font-size="9" text-anchor="middle">FastAPI, Python 3.11, on kiosk host</text>
+    <text x="636" y="48" fill="#6b7280" font-size="9" text-anchor="middle">used when online</text>
+
+    <!-- Kiosk boxes -->
+    <g font-size="9.5">
+      <rect x="16" y="58" width="176" height="46" rx="5" fill="#fff" stroke="#9fb3dd"/>
+      <text x="26" y="74" font-weight="700" fill="#0033A0">Camera + MediaPipe</text>
+      <text x="26" y="88" fill="#1f2937">face lock, quality gate,</text><text x="26" y="99" fill="#1f2937">blendshapes (smile / jaw / cheek)</text>
+      <rect x="16" y="112" width="176" height="40" rx="5" fill="#fff" stroke="#9fb3dd"/>
+      <text x="26" y="128" font-weight="700" fill="#0033A0">Colour-flash capture</text>
+      <text x="26" y="142" fill="#1f2937">nonce, 3 colours, 0.7 s (advisory)</text>
+      <rect x="16" y="160" width="176" height="40" rx="5" fill="#fff" stroke="#9fb3dd"/>
+      <text x="26" y="176" font-weight="700" fill="#0033A0">Injection check</text>
+      <text x="26" y="190" fill="#1f2937">virtual-cam label, frame timing</text>
+      <rect x="16" y="208" width="176" height="40" rx="5" fill="#fff" stroke="#9fb3dd"/>
+      <text x="26" y="224" font-weight="700" fill="#0033A0">Connectivity monitor</text>
+      <text x="26" y="238" fill="#1f2937">ONLINE / OFFLINE badge</text>
+      <rect x="16" y="256" width="176" height="52" rx="5" fill="#fff" stroke="#9fb3dd"/>
+      <text x="26" y="272" font-weight="700" fill="#0033A0">Kiosk UI</text>
+      <text x="26" y="286" fill="#1f2937">decision + reason + time,</text><text x="26" y="297" fill="#1f2937">mode badge, step-up entry</text>
+      <rect x="16" y="316" width="176" height="74" rx="5" fill="#e8eef9" stroke="#9fb3dd"/>
+      <text x="26" y="332" font-weight="700" fill="#0033A0">Evidence bundle</text>
+      <text x="26" y="346" fill="#1f2937">3–5 JPEG frames, chroma</text><text x="26" y="357" fill="#1f2937">series, landmarks, device</text><text x="26" y="368" fill="#1f2937">info, attempt_id</text>
+      <text x="26" y="382" fill="#6b7280" font-size="8.5">no decision made in browser</text>
+    </g>
+
+    <g transform="translate(16,0)">
+    <!-- Edge boxes -->
+    <g font-size="9.5">
+      <rect x="238" y="58" width="220" height="62" rx="5" fill="#fff" stroke="#9fb3dd"/>
+      <text x="248" y="74" font-weight="700" fill="#0033A0">Liveness engine</text>
+      <text x="248" y="88" fill="#1f2937">MiniFASNetV2 + V1SE (ONNX)</text><text x="248" y="99" fill="#1f2937">device detector, FFT moiré, flash corr.</text><text x="248" y="110" fill="#1f2937">iPhone TrueDepth (off until H4)</text>
+      <rect x="238" y="128" width="220" height="40" rx="5" fill="#fff" stroke="#9fb3dd"/>
+      <text x="248" y="144" font-weight="700" fill="#0033A0">Local matcher</text>
+      <text x="248" y="158" fill="#1f2937">ArcFace vs encrypted kiosk templates</text>
+      <rect x="238" y="176" width="220" height="62" rx="5" fill="#0033A0"/>
+      <text x="248" y="193" font-weight="700" fill="#fff">Policy engine</text>
+      <text x="248" y="207" fill="#fff">1 biometric fusion (3 zones)</text><text x="248" y="218" fill="#fff">2 campus schedule (SC1)</text><text x="248" y="229" fill="#fff">3 offline restrictions (SC2)</text>
+      <rect x="238" y="246" width="220" height="40" rx="5" fill="#fff" stroke="#9fb3dd"/>
+      <text x="248" y="262" font-weight="700" fill="#0033A0">Fallback verification</text>
+      <text x="248" y="276" fill="#1f2937">TOTP, staff override, HID card ID</text>
+      <rect x="238" y="294" width="220" height="50" rx="5" fill="#fff" stroke="#9fb3dd"/>
+      <text x="248" y="310" font-weight="700" fill="#0033A0">Offline store (encrypted SQLite)</text>
+      <text x="248" y="324" fill="#1f2937">signed schedule bundle, sync queue,</text><text x="248" y="335" fill="#1f2937">hash-chained minimal log, TTL ≤ 24 h</text>
+      <rect x="238" y="352" width="220" height="38" rx="5" fill="#e8eef9" stroke="#9fb3dd"/>
+      <text x="248" y="368" font-weight="700" fill="#0033A0">Heartbeat / sync worker</text>
+      <text x="248" y="381" fill="#1f2937">3 missed 5 s beats = OFFLINE; /v1/sync</text>
+    </g>
+
+    </g>
+    <g transform="translate(32,0)">
+    <!-- Cloud boxes -->
+    <g font-size="9.5">
+      <rect x="504" y="58" width="200" height="40" rx="5" fill="#fff" stroke="#e7b766"/>
+      <text x="514" y="74" font-weight="700" fill="#8a5300">Cloud API (EC2 + API GW)</text>
+      <text x="514" y="88" fill="#1f2937">/match, /schedule, /sync, /otp</text>
+      <rect x="504" y="106" width="200" height="50" rx="5" fill="#fff" stroke="#e7b766"/>
+      <text x="514" y="122" font-weight="700" fill="#8a5300">Amazon Rekognition</text>
+      <text x="514" y="136" fill="#1f2937">SearchUsersByImage, CompareFaces</text><text x="514" y="147" fill="#1f2937">Face Liveness (step-up only)</text>
+      <rect x="504" y="164" width="200" height="40" rx="5" fill="#fff" stroke="#e7b766"/>
+      <text x="514" y="180" font-weight="700" fill="#8a5300">DynamoDB</text>
+      <text x="514" y="194" fill="#1f2937">users, schedules, decisions</text>
+      <rect x="504" y="212" width="200" height="40" rx="5" fill="#fff" stroke="#e7b766"/>
+      <text x="514" y="228" font-weight="700" fill="#8a5300">S3 + KMS</text>
+      <text x="514" y="242" fill="#1f2937">short-retention audit frames</text>
+      <rect x="504" y="260" width="200" height="40" rx="5" fill="#fff" stroke="#e7b766"/>
+      <text x="514" y="276" font-weight="700" fill="#8a5300">SES</text>
+      <text x="514" y="290" fill="#1f2937">email OTP (step-up)</text>
+      <rect x="504" y="308" width="200" height="40" rx="5" fill="#fff" stroke="#e7b766"/>
+      <text x="514" y="324" font-weight="700" fill="#8a5300">CloudWatch</text>
+      <text x="514" y="338" fill="#1f2937">latency + decision metrics</text>
+      <rect x="504" y="356" width="200" height="34" rx="5" fill="#fff8ec" stroke="#e7b766"/>
+      <text x="514" y="377" fill="#8a5300" font-size="9">schedule bundle signer + re-check</text>
+    </g>
+
+    </g>
+    <!-- Arrows -->
+    <path d="M192,350 H214 V200 H252" fill="none" stroke="#0033A0" stroke-width="2" marker-end="url(#ah)"/>
+    <text x="199" y="194" fill="#0033A0" font-size="8.5" font-weight="700">evidence</text>
+    <path d="M254,226 H224 V282 H194" fill="none" stroke="#0033A0" stroke-width="1.6" stroke-dasharray="4 2" marker-end="url(#ah)"/>
+    <text x="199" y="296" fill="#0033A0" font-size="8.5" font-weight="700">decision</text>
+    <line x1="474" y1="84" x2="534" y2="78" stroke="#6b7280" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#ahg)"/>
+    <text x="482" y="74" fill="#6b7280" font-size="8">API</text>
+    <line x1="474" y1="148" x2="534" y2="131" stroke="#6b7280" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#ahg)"/>
+    <text x="482" y="134" fill="#6b7280" font-size="8">match</text>
+    <line x1="534" y1="366" x2="476" y2="322" stroke="#6b7280" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#ahg)"/>
+    <text x="478" y="346" fill="#6b7280" font-size="8">bundle</text>
+    <line x1="474" y1="380" x2="534" y2="380" stroke="#6b7280" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#ahg)"/>
+    <text x="484" y="393" fill="#6b7280" font-size="8">sync</text>
+  </svg>
+  <figcaption>Figure 1. Local-first, cloud-enhanced architecture. Solid arrows: always on. Dashed grey arrows: only when online. The kiosk keeps working when the orange column is unreachable.</figcaption>
+  </figure>
+  <p class="small">Every decision response carries <code>decision</code>, <code>reason_codes[]</code>, <code>scores{}</code> (rounded), <code>latency_ms</code> and <code>mode</code> (ONLINE / OFFLINE). All thresholds live in one config file (<code>config/thresholds.yaml</code>) so they can be calibrated on a development split without touching code, then frozen for the test split. The kiosk screen shows the decision, a plain-language reason, the measured decision time and the ONLINE / OFFLINE mode badge.</p>
+</section>
+
+<!-- ============================ 5 ============================ -->
+<section class="page dense" style="font-size:7.9pt">
+  <h2><span class="num">5</span>Pipeline stages</h2>
+  <h3>5.1 Capture and quality gate (browser)</h3>
+  <ul>
+    <li><b>Face lock</b> with MediaPipe Face Landmarker (478 landmarks + 52 blendshapes) at camera frame rate.</li>
+    <li><b>Quality gate:</b> exactly one face, near-frontal pose, sharpness, exposure, and face size (minimum inter-ocular distance). A failure gives an immediate retake hint such as "move closer" or "more light", at most twice. Then a low/medium-risk door gives REQUEST VERIFICATION (manual review by desk staff) and a high-risk door gives DENY ("please contact the desk").</li>
+    <li><b>Colour-flash capture:</b> the edge issues a random sequence of exactly 3 colours &times; ~233 ms in 700 ms (&le; 3 changes/s, photosensitivity-safe) with a single-use nonce. The browser sends 5 frames at up to 1280 px; the edge measures the flash response on the frames (the browser chroma series is untrusted). Non-flash accessibility path: the attempt is UNSURE and always gets a deformation challenge, never an automatic ALLOW.</li>
+    <li><b>Injection check:</b> camera label against known virtual cameras (OBS, ManyCam, etc.) plus frame-timing consistency; a known virtual camera is hard evidence.</li>
+  </ul>
+
+  <h3>5.2 Liveness signals (edge service, run in parallel)</h3>
+  <table>
+    <tr><th style="width:22%">Signal</th><th>How it works</th><th style="width:28%">Strongest against</th></tr>
+    <tr><td><b>MiniFASNet ensemble</b></td><td>MiniFASNetV2 (2.7&times; crop) + MiniFASNetV1SE (4.0&times; crop), 80&times;80 input, ONNX, Apache-2.0, ~2 MB each. Scored per frame and aggregated over 3–5 frames.</td><td>Prints, screens (texture and Fourier cues)</td></tr>
+    <tr><td><b>Device-in-frame detector</b></td><td>COCO object detector. A cell phone, laptop or TV box (conf &ge; 0.40) that contains the face is hard evidence; a weaker overlapping box (conf &ge; 0.25) makes the attempt UNSURE.</td><td>Phone / tablet / laptop replay</td></tr>
+    <tr><td><b>FFT moiré check</b></td><td>Periodic high-frequency peaks in the face crop spectrum caused by screen pixel grids.</td><td>Screen replay</td></tr>
+    <tr><td><b>Colour-flash reflection</b> <span class="neutral tag">advisory</span></td><td>Correlate the face&#39;s chroma response with the nonce sequence; check lag (0–8 frames; webcam delay measured 4–7), lag stability and amplitude. A replay cannot anticipate a random sequence. Our own implementation. <b>Status:</b> reported on every attempt, no decision effect until kiosk frame timing is re-validated.</td><td>Video replay, screens, prints (once enforced)</td></tr>
+    <tr><td><b>Injection layer</b></td><td>Virtual-camera detection and timing anomalies, reported separately from presentation-attack detection.</td><td>Deepfake / OBS feeds</td></tr>
+    <tr><td><b>iPhone TrueDepth</b> <span class="neutral tag">optional</span></td><td>Front Face ID (TrueDepth) camera via our own free iOS app (DepthProbe) sending depth frames to the edge service. Checks: depth coverage, plane-fit flatness, nose relief, eye spacing, mouth deformation with a rigid forehead, eye-hole depth steps. <b>Status:</b> app v0.2.0 built and connected (token + per-attempt depth nonce); off in the decision until the H4 calibration (10 live vs 10 printed photo) passes.</td><td>Prints and screens (flat); basic paper / rigid masks</td></tr>
+  </table>
+
+  <h3>5.3 Face authentication (parallel with liveness)</h3>
+  <div class="grid2">
+    <div class="card"><h4>Online: Amazon Rekognition</h4>User vectors (<code>IndexFaces</code> / <code>CreateUser</code> / <code>AssociateFaces</code>). <code>SearchUsersByImage</code> for 1:N, <code>CompareFaces</code> for 1:1. Authoritative online: similarity &ge; 99, runner-up &lt; 80; the local matcher can only tighten it. us-east-1 in the sandbox (consenting team faces only, deleted at teardown), ap-south-1 in production. Time-boxed (700 ms): error or timeout makes that attempt OFFLINE. Rekognition switched off: local matcher with the offline bars.</div>
+    <div class="card"><h4>Always: local ArcFace</h4>uniface / ArcFace embeddings against an <b>encrypted local template cache</b> holding only the users entitled at this kiosk. Thresholds are set from the impostor score distribution (e.g. the 99.8th percentile for a 0.2% FAR target), with a top-1 / top-2 margin.</div>
+  </div>
+  <h3>5.4 Step-up verification (REQUEST VERIFICATION: UNSURE zone, grace window, high-risk zone; optional random check)</h3>
+  <ol>
+    <li><b>Recapture</b> with guidance.</li>
+    <li><b>Randomized two-step challenge</b>, issued only after face lock. One step is <i>always a deformation</i> (smile, open mouth, puff cheeks), paired with blink or a head turn. It is never blink-only, because an eye-cut paper mask lets the attacker&#39;s real eyes blink. <code>RANDOM_CHALLENGE</code> on a share of would-be ALLOWs is an optional site policy (e.g. 15% online / 30% offline), <b>off by default</b> (<code>challenge.random_rate</code> 0.0).</li>
+    <li><b>Optional</b> Rekognition Face Liveness (online only; too slow for the main path).</li>
+    <li><b>Out-of-band factor:</b> email OTP via SES (online), offline TOTP, staff override code, or HID card / mobile credential. A second missed challenge or two wrong codes end in <span class="tag deny">DENY</span>; 5 attack-evidence DENYs in 180 s lock the kiosk for 5 s (<code>RATE_LIMITED</code>).</li>
+  </ol>
+</section>
+
+<!-- ============================ 6 + 7 ============================ -->
+<section class="page dense" style="font-size:8.3pt">
+  <h2><span class="num">6</span>Decision logic</h2>
+  <p>Each signal is mapped to one of three zones. The thresholds below are <b>starting values</b> taken from published defaults and research. They are recalibrated on our labelled test set.</p>
+  <table>
+    <tr><th style="width:24%">Signal</th><th style="width:25%"><span class="tag allow">PASS</span></th><th style="width:27%"><span class="tag step">UNSURE</span> (step-up)</th><th><span class="tag deny">FAIL</span> (DENY)</th></tr>
+    <tr><td>Quality gate</td><td>all checks pass</td><td>any check fails: retake (max 2), then manual review</td><td>high-risk zone after 2 retakes</td></tr>
+    <tr><td>PAD ensemble P(live)</td><td>&ge; 0.80 on &ge; 3 frames and at most 1 frame &le; 0.30</td><td>everything else</td><td>&le; 0.30 on a strict majority of frames</td></tr>
+    <tr><td>Device-in-frame</td><td>no device box around face</td><td>overlapping box, conf &ge; 0.25</td><td>box (conf &ge; 0.40) contains face</td></tr>
+    <tr><td>Colour-flash correlation <span class="small">(advisory today: reported, no decision effect)</span></td><td>r &ge; 0.70, stable lag</td><td>0.30 &le; r &lt; 0.70, or weak amplitude</td><td>r &lt; 0.30, or lag outside 0–8 frames</td></tr>
+    <tr><td>Rekognition similarity</td><td>&ge; 99, clear runner-up gap</td><td>80–99</td><td>&lt; 80 / no match</td></tr>
+    <tr><td>Local ArcFace cosine</td><td>&ge; T_allow (start 0.50), margin &ge; 0.10</td><td>between T_deny and T_allow</td><td>&lt; T_deny (start 0.30)</td></tr>
+    <tr><td>Injection check</td><td>real camera device</td><td>unknown device label</td><td>known virtual camera</td></tr>
+    <tr><td>Depth (optional)</td><td>plane-fit RMS &gt; 6 mm, nose &ge; 15 mm</td><td>between bands</td><td>RMS &lt; 3 mm (flat)</td></tr>
+  </table>
+  <h3>Ordered fusion rules (explainable, not one opaque score)</h3>
+  <ol>
+    <li><b>Hard spoof evidence → BIO_FAIL → DENY:</b> device box around face, PAD fail on most frames, corroborated moiré, known virtual camera, failed / premature challenge; flash mismatch and flat depth once enforced / enabled.</li>
+    <li><b>Mask cues are softer:</b> one cue (eye-hole edge ring <code>MASK_CUE_EDGE</code>; with depth, <code>MASK_CUE_SHAPE</code>) gives BIO_UNSURE and a deformation challenge. Two strong cues give BIO_FAIL; depth-rigid under deformation (<code>MASK_CUE_RIGID</code>) gives DENY. The spectral cue (<code>MASK_CUE_SPECTRAL</code>) is optional and off in our config.</li>
+    <li><b>Identity:</b> no match → DENY. A match in the uncertain band → BIO_UNSURE.</li>
+    <li><b>All signals PASS → BIO_PASS.</b> Anything else → BIO_UNSURE.</li>
+    <li>Then the <b>schedule layer (SC1)</b> is applied, and then the <b>offline layer (SC2)</b>. Each layer can only keep a decision the same or make it stricter.</li>
+  </ol>
+  <div class="callout">The kiosk shows the decision, a plain-language reason ("Phone detected near face"), the measured decision time and the ONLINE / OFFLINE badge, never raw scores. Scores go to the operator dashboard and the audit log.</div>
+
+  <h2 style="margin-top:14px"><span class="num">7</span>Per-spoof defences</h2>
+  <table>
+    <tr><th style="width:17%">Attack</th><th style="width:27%">Primary layer</th><th style="width:31%">Secondary layers</th><th>Why the attack fails</th></tr>
+    <tr><td><b>Printed photo</b></td><td>MiniFASNet ensemble</td><td>Flat flash shading; depth flatness (optional iPhone)</td><td>Cannot reproduce 3D shading of a random colour; flat in depth</td></tr>
+    <tr><td><b>Screen photo</b></td><td>Device detector + FFT moiré</td><td>Flash: emissive screen barely tracks kiosk colours; depth flatness</td><td>Bezel, moiré, wrong flash response</td></tr>
+    <tr><td><b>Video replay</b></td><td>Today: PAD + device detector + moiré. Designed: colour-flash nonce (advisory)</td><td>Random challenge when UNSURE; depth once enabled</td><td>A recording cannot follow an unpredictable challenge or colour sequence</td></tr>
+    <tr><td><b>Eye-cut paper mask</b></td><td>Deformation challenge (smile / open mouth / puff)</td><td>Eye-hole edge ring, PAD texture, depth step (optional iPhone)</td><td>Real eyes blink, but paper cannot smile</td></tr>
+    <tr><td><b>Rigid 3D mask</b></td><td>Deformation challenge on any mask cue (random challenges on would-be ALLOWs as an optional site policy)</td><td>Depth rigidity during smile (M1, optional iPhone). Roadmap: flash spectral skin cue (off in config)</td><td>Correct shape, but cannot deform. Raises the bar; not solved</td></tr>
+    <tr><td><b>Silicone mask</b></td><td>Any weak cue → step-up + OTP / card</td><td>Roadmap: rPPG, depth / IR hardware</td><td><b>Honest limit</b> of RGB. Depth raises the bar but does not solve it.</td></tr>
+    <tr><td><b>Injection (virtual cam)</b></td><td>Device label + frame timing + single-use nonce</td><td>Flash nonce once enforced</td><td>Injected feed does not reflect our screen</td></tr>
+  </table>
+</section>
+
+<!-- ============================ 8 SC1 ============================ -->
+<section class="page dense" style="font-size:8.0pt">
+  <h2><span class="num">8</span>Surprise Challenge 1: Access with Campus Schedule</h2>
+  <div class="callout"><b class="t">Brief:</b> "A live, recognized person is not automatically authorized. The system must combine the biometric result with the campus access schedule and return ALLOW, STEP-UP VERIFICATION or DENY." Our answer: <b>Final decision = Biometric result &otimes; Schedule result</b>, evaluated in the <b>Asia/Kolkata</b> time zone and logged in UTC.</div>
+  <div class="grid2">
+    <div class="card"><h4>Biometric result (from section 6)</h4>
+      <span class="tag allow">BIO_PASS</span> live + matched with high confidence<br>
+      <span class="tag step">BIO_UNSURE</span> any signal in the middle zone<br>
+      <span class="tag deny">BIO_FAIL</span> spoof evidence or no match</div>
+    <div class="card"><h4>Schedule result (policy engine)</h4>
+      <code>IN_WINDOW</code> inside an entitled time window<br>
+      <code>GRACE_WINDOW</code> within &plusmn;15 min of a window edge<br>
+      <code>OUTSIDE_WINDOW</code> entitled zone, wrong time<br>
+      <code>NO_ENTITLEMENT</code> &middot; <code>ZONE_NOT_PERMITTED</code> &middot; <code>HOLIDAY</code> &middot; <code>REVOKED</code></div>
+  </div>
+  <h3>Decision matrix</h3>
+  <table>
+    <tr><th style="width:20%">Biometric \ Schedule</th><th>IN_WINDOW</th><th>GRACE_WINDOW (&plusmn;15 min)</th><th>OUTSIDE_WINDOW / NO_ENTITLEMENT / ZONE_NOT_PERMITTED / HOLIDAY / REVOKED</th></tr>
+    <tr><td><b>BIO_PASS</b></td><td><span class="tag allow">ALLOW</span></td><td><span class="tag step">REQUEST VERIFICATION</span></td><td><span class="tag deny">DENY</span></td></tr>
+    <tr><td><b>BIO_UNSURE</b></td><td><span class="tag step">REQUEST VERIFICATION</span></td><td><span class="tag deny">DENY</span></td><td><span class="tag deny">DENY</span></td></tr>
+    <tr><td><b>BIO_FAIL</b> (spoof / no match)</td><td><span class="tag deny">DENY</span></td><td><span class="tag deny">DENY</span></td><td><span class="tag deny">DENY</span></td></tr>
+  </table>
+  <p class="small">REQUEST VERIFICATION = API decision <code>STEP_UP</code>. In a <b>high-risk zone</b> (<code>SERVER_ROOM</code>) even BIO_PASS + IN_WINDOW becomes REQUEST VERIFICATION (<code>SCHEDULE_HIGH_RISK_ZONE</code> online, per <code>schedule.high_risk_requires_stepup_online</code>; <code>OFFLINE_HIGH_RISK_ZONE</code> offline, always), 0 min grace. A passed step-up turns it into ALLOW; nothing overrides DENY. One function evaluates the newest verified signed bundle, online and offline (no per-attempt cloud call).</p>
+  <div class="grid2">
+    <div>
+      <h4>Roles and default entitlements (example policy)</h4>
+      <table class="compact">
+        <tr><th>Role</th><th>Typical windows / zones</th></tr>
+        <tr><td>Student</td><td>Library Mon–Sat 08:00–21:00; labs; hostel by grant</td></tr>
+        <tr><td>Faculty</td><td>Library + labs Mon–Sat 07:00–22:00</td></tr>
+        <tr><td>Staff</td><td>Library + labs 07:00–21:00; server room by grant</td></tr>
+        <tr><td>Contractor</td><td>Gate + labs, weekdays, contract dates</td></tr>
+        <tr><td>Visitor</td><td>Pass-bound zones and validity</td></tr>
+      </table>
+    </div>
+    <div>
+      <h4>Zones with risk levels</h4>
+      <table class="compact">
+        <tr><th>Zone</th><th>Risk</th><th>Extra rule</th></tr>
+        <tr><td>MAIN_GATE, LIBRARY</td><td>Low</td><td>standard matrix</td></tr>
+        <tr><td>LAB_BLOCK, HOSTEL</td><td>Medium</td><td>standard</td></tr>
+        <tr><td>SERVER_ROOM</td><td>High</td><td>grant only; always step-up</td></tr>
+      </table>
+    </div>
+  </div>
+  <p><b>Exceptions</b> are versioned records in the signed bundle: event days (<code>EXC-HACK-2026</code>: lab block 08:00–23:00 today), exam week, visitor passes, holidays and revocations. Precedence, most restrictive first: REVOKED &gt; NO_ENTITLEMENT &gt; ZONE_NOT_PERMITTED &gt; HOLIDAY &gt; IN_WINDOW &gt; GRACE_WINDOW &gt; OUTSIDE_WINDOW.</p>
+  <h3>Worked examples</h3>
+  <table class="compact">
+    <tr><th style="width:4%">#</th><th style="width:37%">Situation (Asia/Kolkata)</th><th style="width:22%">Evaluation</th><th>Result</th></tr>
+    <tr><td>1</td><td>Student Priya, LIBRARY, Sat 14 Nov 10:05</td><td>BIO_PASS + IN_WINDOW</td><td><span class="tag allow">ALLOW</span> <span class="small">ACCESS_OK</span></td></tr>
+    <tr><td>2</td><td>Priya, LIBRARY, Sat 21:10 (closed 21:00, 15 min grace)</td><td>BIO_PASS + GRACE_WINDOW</td><td><span class="tag step">REQUEST VERIFICATION</span> <span class="small">SCHEDULE_GRACE_WINDOW; second factor &rarr; ALLOW</span></td></tr>
+    <tr><td>3</td><td>Priya, LIBRARY, Sat 21:30</td><td>BIO_PASS + OUTSIDE_WINDOW</td><td><span class="tag deny">DENY</span> <span class="small">SCHEDULE_OUTSIDE_WINDOW (live &ne; authorized)</span></td></tr>
+    <tr><td>4</td><td>Staff Rahul (server-room grant), SERVER_ROOM, Sat 10:00 (<code>EXC-SRV-HACK</code>), backlit</td><td>BIO_UNSURE + IN_WINDOW, high risk</td><td><span class="tag step">REQUEST VERIFICATION</span> <span class="small">LIVENESS_UNSURE, SCHEDULE_HIGH_RISK_ZONE; challenge + second factor</span></td></tr>
+    <tr><td>5</td><td>Contractor Suresh, LAB_BLOCK, Fri 20 Nov 10:00 (Campus Closure Day)</td><td>BIO_PASS + HOLIDAY</td><td><span class="tag deny">DENY</span> <span class="small">SCHEDULE_HOLIDAY</span></td></tr>
+  </table>
+</section>
+
+<!-- ============================ 9 SC2 ============================ -->
+<section class="page" style="font-size:8.0pt">
+  <h2><span class="num">9</span>Surprise Challenge 2: Offline Mode with Safe Access</h2>
+  <div class="callout"><b class="t">Brief:</b> offline, the kiosk must (a) keep a safe local decision process, (b) avoid unsafe automatic access, (c) provide fallback verification, (d) store only minimum temporary data and (e) sync on reconnect. Because the edge service already decides every attempt, going offline <b>tightens policy</b> rather than switching to a different system.</div>
+  
+  <div class="flow">
+    <div class="st"><b>Detect</b>5 s heartbeat; <strong>3 misses (~12–17 s) → OFFLINE</strong>; cloud timeout or 30 min unconfirmed bundle → offline rules</div><div class="ar">&#9654;</div>
+    <div class="st"><b>Decide locally</b>Local liveness + ArcFace vs encrypted kiosk templates; signed cached schedule</div><div class="ar">&#9654;</div>
+    <div class="st"><b>Tighten</b>Stricter thresholds; UNSURE never auto-ALLOWs; high-risk zones need fallback</div><div class="ar">&#9654;</div>
+    <div class="st"><b>Fallback</b>TOTP, staff override code, HID card / mobile credential ID</div><div class="ar">&#9654;</div>
+    <div class="st"><b>Record minimal</b>Encrypted, hash-chained log; TTL &le; 24 h</div><div class="ar">&#9654;</div>
+    <div class="st"><b>Sync + purge</b>Idempotent replay; server re-checks offline ALLOWs; flags; purge</div>
+  </div>
+  <div class="grid2">
+    <div>
+      <h4>(a) Safe local decision process</h4>
+      <ul>
+        <li>The same liveness pipeline runs locally. Rekognition is skipped and local ArcFace becomes the sole matcher.</li>
+        <li><b>Signed schedule bundle</b> cached from the cloud (refreshed every 15 min): <b>HMAC-SHA256</b> today, <b>Ed25519</b> in production. <b>Max staleness 12 h</b>: an expired bundle can still DENY, otherwise staff override only. A bundle failing verification never replaces the last valid one; no valid bundle at all → DENY. No automatic ALLOW from stale data.</li>
+        <li><b>Local templates</b> are encrypted at rest and limited to users entitled at <i>this</i> kiosk.</li>
+      </ul>
+      <h4>(b) Avoid unsafe automatic access</h4>
+      <ul>
+        <li><b>Stricter thresholds</b> offline (PAD 0.85, flash r 0.75, ArcFace +0.05, margin 0.15; no ambient-light flash exception).</li>
+        <li><b>Never auto-ALLOW on BIO_UNSURE</b> (offline always adds a second factor). A <b>grace-window</b> arrival gets REQUEST VERIFICATION with an offline second factor.</li>
+        <li><b>High-risk zones</b> always need TOTP or a staff code offline.</li>
+      </ul>
+  <h4>Offline storage</h4>
+      <p>Encrypted SQLite (AES-GCM), purged on cloud ack; unsynced records purged at <b>24 h</b>, leaving a tombstone reported at the next sync. DPDP Act 2023: purpose and storage limitation.</p>
+    </div>
+    <div>
+      <h4>(c) Fallback verification that works offline</h4>
+      <ul>
+        <li><b>TOTP (RFC 6238)</b>: encrypted per-user seed, &plusmn;1 step, replay-protected, always checked against real time.</li>
+        <li><b>Staff override codes</b> (manual review): PBKDF2-hashed in the bundle, single-use, valid until bundle expiry + 24 h, staff ID recorded, flagged for review.</li>
+        <li><b>HID card / mobile credential ID</b> (simulated): keyed hash must match the face candidate's card; not accepted in high-risk zones offline.</li>
+        <li>No SMS OTP (TRAI DLT); email OTP (SES) is online only.</li>
+      </ul>
+      <h4>(e) Synchronization on reconnect</h4>
+      <ul>
+        <li><code>POST /v1/sync</code>, <b>idempotent</b> per attempt: &le; 50 items + tombstones per batch, signed chain head; reply accepted / duplicates / rejected / flags.</li>
+        <li>The server <b>re-checks every offline ALLOW</b> against the authoritative schedule and revocations and <b>flags discrepancies</b> (e.g. one TOTP step used at two kiosks).</li>
+        <li>Hash chain verified; acknowledged records are <b>purged locally</b>.</li>
+      </ul>
+    </div>
+  </div>
+  <h4>(d) Data minimisation: what is stored offline</h4>
+  <table>
+    <tr><th style="width:26%">Field</th><th style="width:16%">Stored?</th><th>Notes</th></tr>
+    <tr><td>attempt_id, seq, kiosk_id, zone, ts_utc</td><td><span class="tag allow">yes</span></td><td>ULID idempotency key; per-kiosk counter; UTC ISO-8601</td></tr>
+    <tr><td>user_id, candidate_user_id</td><td><span class="tag allow">yes</span></td><td>pseudonymous IDs (e.g. <code>u_3c4d</code>), never the name or roll number</td></tr>
+    <tr><td>decision, reason_codes, resolved_codes</td><td><span class="tag allow">yes</span></td><td>e.g. <code>ACCESS_OK</code>, <code>FALLBACK_OK</code>, <code>OFFLINE_MODE</code>, <code>SCHEDULE_EXPIRED_CACHE</code></td></tr>
+    <tr><td>scores</td><td><span class="tag step">rounded</span></td><td>2 decimals, enough for audit but not for template reconstruction</td></tr>
+    <tr><td>fallback</td><td><span class="tag allow">yes</span></td><td>method, staff_id, code_id, totp_step (non-secret counter); never the code or TOTP value</td></tr>
+    <tr><td>schedule_version, cache_state, mode, prev_hash, record_hash</td><td><span class="tag allow">yes</span></td><td>which policy was applied; SHA-256 hash chain for tamper evidence</td></tr>
+    <tr><td>face images, crops, depth maps</td><td><span class="tag deny">never</span></td><td>discarded in memory after scoring</td></tr>
+    <tr><td>embeddings, display names, TOTP values, raw card IDs</td><td><span class="tag deny">never</span></td><td>only the pre-enrolled, encrypted kiosk templates exist on disk</td></tr>
+  </table>
+</section>
+
+<!-- ============================ 10 + 11 ============================ -->
+<section class="page" style="font-size:8.8pt">
+  <h2><span class="num">10</span>Latency budget</h2>
+  <div class="callout warn"><b>The budget table below is a design estimate</b> <span class="est">ESTIMATE</span>, not a measurement. Each segment is instrumented (<code>performance.now()</code> in the browser, server spans in the edge service). <b>Dev measurement</b> (n = 32, offline, MacBook webcam; not an eval result): face lock to rendered <b>p50 1518 / p95 1559 ms</b> (measured with the earlier 1,000 ms capture window; the shipped window is 700 ms and has not been re-measured yet); edge server total <b>p50 127 / p95 154 ms</b>. The SLA is defined as <b>face lock to decision on screen</b>, measured by a render beacon from the kiosk; server time is reported next to it.</div>
+  <table>
+    <tr><th>Segment</th><th style="width:20%">Budget (ms) <span class="est">EST.</span></th><th style="width:38%">Basis</th></tr>
+    <tr><td>Face lock + quality gate (browser, MediaPipe)</td><td>200–300</td><td>estimate</td></tr>
+    <tr><td>Capture window with 3 colours &times; ~233 ms</td><td>700</td><td>protocol design (&le; 3 changes/s)</td></tr>
+    <tr><td>Transfer of 3–5 frames to edge (localhost)</td><td>&lt; 50</td><td>estimate; no WAN on the critical path</td></tr>
+    <tr><td>Edge PAD: detector + 2 MiniFASNet + FFT + flash</td><td>30–150</td><td>MiniFASNet is ms-scale on CPU; object detector dominates</td></tr>
+    <tr><td>Face match (parallel): local ArcFace / Rekognition</td><td>50–150 / 200–500</td><td>estimate; Rekognition publishes no latency SLA; Bangalore &harr; us-east-1 adds ~200–250 ms RTT</td></tr>
+    <tr><td>Fusion + schedule + offline policy + render</td><td>&lt; 50</td><td>estimate</td></tr>
+    <tr><td><b>Total ALLOW path</b></td><td><b>&asymp; 1.0–1.6 s</b></td><td>fits only because liveness and match run in parallel</td></tr>
+  </table>
+  <p class="small">Step-up paths (challenge, OTP, Rekognition Face Liveness) are reported as a <b>separate</b> metric. They are not part of the 2-second ALLOW path. If the cloud match misses its time budget, that attempt is decided offline (local match, stricter offline rules, <code>OFFLINE_MODE</code>). The schedule is evaluated locally on the signed bundle, so it adds no network hop.</p>
+
+  <h2 style="margin-top:14px"><span class="num">11</span>AWS architecture (us-east-1 sandbox; ap-south-1 in production)</h2>
+  <p class="small">The hackathon sandbox (AWS Workshop Studio, role <code>WSParticipantRole</code>) allows only <b>us-east-1</b>. Our probe found every service we need allowed; deployment was in progress on 14 Nov. Every cloud feature still has a degraded path, and the edge keeps deciding. Production would pin <b>ap-south-1 (Mumbai)</b> for India DPDP data residency.</p>
+  <table>
+    <tr><th style="width:24%">Service</th><th>Role in the solution</th><th style="width:30%">Design note</th></tr>
+    <tr><td>EC2 t3.small (warm) + FastAPI</td><td>Cloud API: match, signed schedule bundle + revocations, OTP, sync, health</td><td>No cold starts; Lambda only with provisioned concurrency</td></tr>
+    <tr><td>API Gateway</td><td>TLS front door, throttling</td><td>Per-kiosk API key + HMAC request signing</td></tr>
+    <tr><td>Amazon Rekognition</td><td>User vectors: SearchUsersByImage (1:N), CompareFaces (1:1)</td><td>Consenting team faces only, deleted at teardown; low default TPS quotas; CompareFaces for 1:1 with jittered retries</td></tr>
+    <tr><td>Rekognition Face Liveness</td><td>Enrolment and step-up only</td><td>Too slow for the 2 s path; needs a Cognito identity pool</td></tr>
+    <tr><td>DynamoDB</td><td>Users, roles, schedules, exceptions, decisions</td><td>Single-digit ms reads (estimate)</td></tr>
+    <tr><td>S3 + KMS</td><td>Short-lived objects only (optional enrolment reference, Face Liveness output); no attempt frames</td><td>SSE-KMS; 1-day lifecycle expiry</td></tr>
+    <tr><td>SES</td><td>Email OTP for step-up</td><td>SMS skipped (TRAI DLT)</td></tr>
+    <tr><td>CloudWatch</td><td>Latency and decision metrics, alarms</td><td>Dashboard <code>hid-kiosk</code>; alarm on post-hoc revoked offline ALLOWs</td></tr>
+    <tr><td>Bundle signing key</td><td>Signs the offline schedule bundle</td><td>HMAC-SHA256 shared key today; Ed25519 in production (edge holds only the public key)</td></tr>
+  </table>
+  <p class="small">Scalability: kiosks are stateless towards the cloud apart from the sync queue. Each campus or building can run many kiosks against one regional backend, and edge services keep working during regional or network outages.</p>
+</section>
+
+<!-- ============================ 12 + 13 ============================ -->
+<section class="page">
+  <h2><span class="num">12</span>Evaluation methodology</h2>
+  <p>"Accuracy" is not an ISO metric. We report the vocabulary that testing labs use:</p>
+  <div class="grid2">
+    <table class="compact">
+      <tr><th>Metric</th><th>Meaning</th></tr>
+      <tr><td><b>APCER</b></td><td>% attacks wrongly accepted, <b>per attack type</b>; headline = worst type</td></tr>
+      <tr><td><b>BPCER</b></td><td>% genuine users wrongly rejected as attacks</td></tr>
+      <tr><td><b>FAR / FRR</b></td><td>face-match false accept / reject at the operating threshold; DET curve; rank-1 identification rate</td></tr>
+      <tr><td><b>Accuracy</b></td><td>liveness and face-auth accuracy with confidence intervals, next to HID's targets</td></tr>
+      <tr><td><b>Latency</b></td><td>p50 / p95 with bootstrap CI, face lock to rendered (client) and server total, per attack type and decision</td></tr>
+      <tr><td><b>Step-up rate</b></td><td>% genuine attempts sent to REQUEST VERIFICATION</td></tr>
+    </table>
+    <div>
+      <h4 style="margin-top:0">Protocol (iBeta Level 1-style, not certified)</h4>
+      <ul>
+        <li>8–12 subjects with a spread of skin tones, glasses and beards.</li>
+        <li>3 lighting conditions: office, backlit window, dim.</li>
+        <li>Attack species: A4 colour print, eye-cut print (worn), phone-screen photo, phone video replay, laptop/tablet replay, printed paper mask. Rigid 3D masks are a stretch tier. Virtual-camera injection is tested and reported separately from PAD. Face-swap video is roadmap.</li>
+        <li>Bona fide and attack attempts interleaved. Thresholds tuned on one split, metrics reported on a held-out split.</li>
+        <li>SC1/SC2: automated <code>pytest</code> decision-matrix tests covering every cell, every schedule result and every offline rule.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="callout"><b class="t">Honest statistics (rule of 3).</b> Zero errors in N trials means the true rate is below 3/N at 95% confidence. For example, 0/60 attacks accepted gives APCER &lt; 5%, and 0/150 gives &lt; 2%. Confirming HID's 0.6% FRR would need about 500 error-free genuine attempts, and 0.2% FAR about 1,500 impostor comparisons (reachable offline by cross-matching all subject pairs plus a public face set). We will state the volume each claim needs and report what we actually measured.</div>
+
+  <h2 style="margin-top:14px"><span class="num">13</span>Differentiators mapped to judging criteria</h2>
+  <table>
+    <tr><th style="width:24%">Criterion (weight)</th><th>What we bring</th></tr>
+    <tr><td><b>Problem-Solution Fit (25%)</b></td><td>Every attack type in the brief has a named primary + secondary defence. Both surprise challenges are implemented as policy layers with a full decision matrix. The design is framed around kiosks and access control, with HID card / mobile credential fallback. Privacy by design (DPDP Act 2023).</td></tr>
+    <tr><td><b>Innovation &amp; Creativity (20%)</b></td><td>Random colour-flash reflection measurement with no extra hardware (built; advisory until re-validated). A separate injection-attack layer. Risk-adaptive step-up that always includes a deformation (defeats eye-cut masks). Our own DepthProbe iPhone app for TrueDepth depth (built; enabled after calibration). Signed, hash-chained offline mode.</td></tr>
+    <tr><td><b>Technical Implementation (25%)</b></td><td>Clean three-tier architecture (browser / edge / AWS). Liveness and match in parallel. Config-driven thresholds. Tested policy engine. Rekognition user vectors, DynamoDB, KMS, SES and CloudWatch in the us-east-1 sandbox, each with a degraded path. Idempotent sync.</td></tr>
+    <tr><td><b>Functionality &amp; Usability (15%)</b></td><td>Passive happy path. Clear kiosk UI with ALLOW / REQUEST VERIFICATION / DENY, plain-language reasons and the measured decision time. Visible ONLINE / OFFLINE badge. Operator dashboard with per-attack results.</td></tr>
+    <tr><td><b>Presentation (15%)</b></td><td>Live attack gauntlet (print, phone photo, video replay, eye-cut mask, unenrolled person), enrolment with consent, a schedule demo, then a live offline demo with sync. Honest metrics with confidence bounds against HID's targets.</td></tr>
+  </table>
+</section>
+
+<!-- ============================ 14 + 15 ============================ -->
+<section class="page" style="font-size:8.8pt">
+  <h2><span class="num">14</span>Risks and honest limits</h2>
+  <table>
+    <tr><th style="width:22%">Risk / limit</th><th>Impact</th><th style="width:38%">Mitigation / how we say it</th></tr>
+    <tr><td><b>Silicone masks</b></td><td>RGB-only defences are weak against high-fidelity flexible masks</td><td>Route any weak cue to step-up + card / OTP. Depth "raises the bar", not "solved". Depth / IR / NIR hardware on the roadmap.</td></tr>
+    <tr><td><b>Model licences</b></td><td>InsightFace pretrained weights and CelebA-Spoof-trained models are non-commercial only</td><td>Fine for a demo; disclosed. Rekognition is the primary online matcher where the sandbox allows it, and MiniFASNet is Apache-2.0. A commercial licence or retraining is needed before production.</td></tr>
+    <tr><td><b>AWS sandbox limits</b></td><td>us-east-1 only, no quota increases, expiring credentials, ~200–250 ms RTT from Bangalore (our probe found the services we need allowed)</td><td>Probed in the first hour. Every cloud feature has a degraded path; local ArcFace and local schedule evaluation work without the cloud. Cloud match is parallel and time-boxed.</td></tr>
+    <tr><td><b>SMS OTP in India</b></td><td>Requires TRAI DLT registration, which is not feasible in a day</td><td>Email OTP (SES) online. TOTP / staff code / HID credential offline.</td></tr>
+    <tr><td><b>Phone / video replay</b></td><td>Likeliest live failure; flash nonce advisory today</td><td>PAD + device detector + moiré today; flash enforced after timing re-validation. Said on stage.</td></tr>
+    <tr><td><b>Lighting / backlight</b></td><td>Raises BPCER and step-up rate; weakens flash amplitude in bright rooms</td><td>Quality gate hints; weak flash → UNSURE, not FAIL. Report metrics per lighting condition.</td></tr>
+    <tr><td><b>Small test sample</b></td><td>Cannot prove 0.2% FAR / 0.6% FRR in one day</td><td>Rule-of-3 upper bounds. State the volume needed. Never round numbers up.</td></tr>
+    <tr><td><b>Photosensitivity</b></td><td>Screen flashing</td><td>3 colours in 0.7 s (&le; 3 changes/s), soft tints; non-flash accessibility path.</td></tr>
+  </table>
+
+  <h2 style="margin-top:14px"><span class="num">15</span>Roadmap and build plan</h2>
+  <div class="grid2">
+    <div>
+      <h4 style="margin-top:0">Roadmap beyond the hackathon</h4>
+      <ul>
+        <li>Depth + IR / 850 nm NIR camera module for mask resistance.</li>
+        <li>rPPG, a head-turn parallax (homography) check and the flash spectral skin cue (policy hook exists, off in config) as extra soft liveness signals.</li>
+        <li>Face-swap / deepfake video as a test species, and a live virtual-camera attack demo.</li>
+        <li>Enforce the flash nonce after timing re-validation; enable depth after H4; Ed25519-signed bundles (HMAC-SHA256 today).</li>
+        <li>Learned log-likelihood fusion alongside the rule set.</li>
+        <li>Real HID reader / mobile-credential integration; OSDP to door controllers.</li>
+        <li>Injection-attack detection aligned with CEN/TS 18099; formal iBeta PAD testing.</li>
+        <li>Fairness reporting per demographic group (FIDO-style).</li>
+        <li>Fleet management: per-kiosk template provisioning, key rotation, remote revocation push.</li>
+      </ul>
+    </div>
+    <div>
+      <h4 style="margin-top:0">One-day build plan as scheduled (built end-to-end by Claude Code with parallel subagents + independent verifier agents)</h4>
+      <table class="compact">
+        <tr><th style="width:24%">Hours</th><th>Milestone</th></tr>
+        <tr><td>0–1</td><td>Sandbox check, repo scaffold, enrol test users</td></tr>
+        <tr><td>1–3</td><td>Thin end-to-end path: capture → MiniFASNet → match → decision on screen</td></tr>
+        <tr><td>3–5</td><td>Colour flash, device detector, moiré, step-up challenge, OTP; SC1 schedule engine; SC2 offline mode + sync; collect attack samples</td></tr>
+        <tr><td>4</td><td>Go / no-go: iPhone depth (stream works and flat-print rejection)</td></tr>
+        <tr><td>5–6</td><td>Run test protocol, tune thresholds on split</td></tr>
+        <tr><td>7</td><td><b>Feature freeze</b></td></tr>
+        <tr><td>7–9</td><td>Dashboard, measured latency, slides</td></tr>
+        <tr><td>9–10</td><td>Rehearse live attack, offline and schedule demos; Q&amp;A prep</td></tr>
+      </table>
+    </div>
+  </div>
+  <h4>Starter components (pinned, reviewed before use)</h4>
+  <p class="small"><code>yakhyo/uniface</code> (MIT) for detection, quality, MiniFASNet and ArcFace &middot; <code>yakhyo/face-anti-spoofing</code> MiniFASNetV2 / V1SE ONNX (Apache-2.0) &middot; <code>google-ai-edge/mediapipe-samples</code> face_landmarker/js &middot; <code>aws-samples/rekognition-user-vectors</code> &middot; <code>vadimgodev/face-recognition</code> (two-threshold reference) &middot; <code>@aws-amplify/ui-react-liveness</code> (step-up only) &middot; Apple's free AVFoundation TrueDepth APIs (own DepthProbe app) </p>
+  <div class="callout"><b class="t">In one sentence:</b> a kiosk that is fast for real people, hard for attackers, honest about what it does not know, and still safe when the network goes away.</div>
+</section>
+
+</body>
+</html>

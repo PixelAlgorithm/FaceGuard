@@ -1,0 +1,51 @@
+{
+  "status": "ok",
+  "degraded_reasons": [],
+  "version": "0.1.0",
+  "models_loaded": {
+    "minifasnet_v2": true,
+    "minifasnet_v1se": true,
+    "face_detector": true,
+    "device_detector": true,
+    "arcface": true
+  },
+  "self_test": {
+    "minifasnet_real_index": 1,
+    "input_scale": "0-255 BGR",
+    "passed": true
+  },
+  "depth_probe": "unavailable",
+  "uptime_s": 418,
+  "pad_self_test": {
+    "ok": true,
+    "real_class_index": 1,
+    "input_scale": 1.0,
+    "live_min": 0.8516,
+    "attack_max": 0.1963,
+    "live_mean": 0.9258,
+    "attack_mean": 0.1003,
+    "message": "ok"
+  },
+  "detail": {
+    "kiosk_id": "KIOSK_MAIN_01",
+    "policy_runtime": "real",
+    "policy_version": "2026-11-14.3",
+    "cloud_configured": true,
+    "arcface_provider": "CoreMLExecutionProvider",
+    "model_errors": {},
+    "self_test": {
+      "ok": true,
+      "real_class_index": 1,
+      "input_scale": 1.0,
+      "live_min": 0.8516,
+      "attack_max": 0.1963,
+      "live_mean": 0.9258,
+      "attack_mean": 0.1003,
+      "message": "ok"
+    },
+    "template_cache": "<redacted: privacy filter>",
+    "depth_enabled": false,
+    "lan_listener": "listening 0.0.0.0:8001",
+    "demo_mode": true
+  }
+}

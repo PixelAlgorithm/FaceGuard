@@ -1,0 +1,16 @@
+# Organiser targets, copied verbatim from docs/PROBLEM.md section 3 (HID brief image
+# docs/images/03_performance_targets.jpg). Shown next to our measurements as "target" vs
+# "measured (95% CI)". Do not edit to make results look better.
+source: "docs/PROBLEM.md section 3 - HID Hackathon 2026 brief, Performance Evaluation"
+liveness_accuracy: 0.994      # "99.4% liveness detection accuracy"
+face_auth_accuracy: 0.992     # "99.2% face authentication accuracy"
+far: 0.002                    # "0.2% false acceptance rate (FAR)"
+frr: 0.006                    # "0.6% false rejection rate (FRR)"
+decision_time_ms: 2000        # "< 2 SECONDS DECISION TIME"
+
+# Protocol minimums for the reported (test) split - eval/PROTOCOL.md section 3.
+# Cells below these are flagged LOW_N in metrics.json / SUMMARY.md (never hidden).
+protocol_minimums:
+  attacks_per_species_test: 30
+  bona_fide_test: 120
+  latency_samples: 20

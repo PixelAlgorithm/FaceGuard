@@ -1,0 +1,15 @@
+# Test-suite run 20261114T1705Z (UTC) — stored source for slide/test counts
+## edge + policy + offline + depth
+1344 passed, 7 warnings in 36.51s
+## cloud
+147 passed in 7.16s
+## eval
+129 passed, 0 failed (pytest -q quiet mode prints no summary line; count = progress dots)
+## kiosk (tsc + lint + build)
+tsc OK
+lint OK
+build OK
+## ruff
+All checks passed!
+All checks passed!
+All checks passed!

@@ -1,0 +1,100 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RekognitionCollection",
+      "Effect": "Allow",
+      "Action": [
+        "rekognition:SearchUsersByImage",
+        "rekognition:IndexFaces",
+        "rekognition:CreateUser",
+        "rekognition:AssociateFaces",
+        "rekognition:DisassociateFaces",
+        "rekognition:DeleteUser",
+        "rekognition:DeleteFaces",
+        "rekognition:DescribeCollection",
+        "rekognition:ListFaces",
+        "rekognition:ListUsers"
+      ],
+      "Resource": "arn:aws:rekognition:${HID_REGION}:${ACCOUNT_ID}:collection/${COLLECTION_ID}"
+    },
+    {
+      "Sid": "RekognitionStateless",
+      "Effect": "Allow",
+      "Action": [
+        "rekognition:CompareFaces",
+        "rekognition:CreateFaceLivenessSession",
+        "rekognition:GetFaceLivenessSessionResults"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DynamoTables",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem",
+        "dynamodb:Query",
+        "dynamodb:DescribeTable"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:${HID_REGION}:${ACCOUNT_ID}:table/${DDB_USERS}",
+        "arn:aws:dynamodb:${HID_REGION}:${ACCOUNT_ID}:table/${DDB_DECISIONS}",
+        "arn:aws:dynamodb:${HID_REGION}:${ACCOUNT_ID}:table/${DDB_STATE}"
+      ]
+    },
+    {
+      "Sid": "S3AppObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::${BUCKET}/enroll/*",
+        "arn:aws:s3:::${BUCKET}/audit/*",
+        "arn:aws:s3:::${BUCKET}/liveness/*"
+      ]
+    },
+    {
+      "Sid": "SesSend",
+      "Effect": "Allow",
+      "Action": [
+        "ses:SendEmail"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Metrics",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "HIDKiosk"
+        }
+      }
+    },
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:${HID_REGION}:${ACCOUNT_ID}:log-group:/aws/lambda/${LAMBDA_NAME}:*"
+    },
+    {
+      "Sid": "AppEnvParameter",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter"
+      ],
+      "Resource": "arn:aws:ssm:${HID_REGION}:${ACCOUNT_ID}:parameter${SSM_PREFIX}/app-env"
+    }
+  ]
+}

@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FaceGuard - Can You Spot a Spoof? - HID Hackathon 2026</title>
+<!-- Offline: no CDN. Chart.js 4.4.1 (MIT) vendored in ./vendor -->
+<script src="vendor/chart.umd.4.4.1.min.js"></script>
+<style>
+/* ===================== design tokens ===================== */
+:root {
+  --color-background: #0B1220;
+  --color-surface: #121B2E;
+  --color-surface-2: #18233A;
+  --color-border: #26324D;
+  --color-text: #F1F5FB;
+  --color-muted: #A9B6CE;
+  --color-dim: #74829E;
+  --color-primary: #3BA4FF;        /* brand accent (HID-style blue) */
+  --color-primary-soft: rgba(59,164,255,.14);
+  --color-secondary: #8B7CFF;      /* status: advisory */
+  /* decision colour code - used ONLY for decisions */
+  --color-allow: #22C55E;
+  --color-allow-soft: rgba(34,197,94,.14);
+  --color-verify: #F59E0B;
+  --color-verify-soft: rgba(245,158,11,.14);
+  --color-deny: #EF4444;
+  --color-deny-soft: rgba(239,68,68,.14);
+  /* signal status chips (deliberately NOT the decision colours) */
+  --status-enforced: #3BA4FF;
+  --status-advisory: #8B7CFF;
+  --status-off: #74829E;
+  --primitive-gradient-primary: linear-gradient(120deg, #3BA4FF 0%, #8B7CFF 100%);
+  --typography-font-heading: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --typography-font-body: "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --typography-font-mono: "SF Mono", Menlo, Consolas, monospace;
+  --radius: 18px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { background: #05080F; color: var(--color-text); font-family: var(--typography-font-body); }
+body { overflow: hidden; }
+
+/* ===================== 1920x1080 stage, scaled to fit ===================== */
+.slide-deck {
+  position: absolute; left: 50%; top: 50%;
+  width: 1920px; height: 1080px;
+  transform-origin: 0 0;
+}
+.slide {
+  position: absolute; inset: 0;
+  width: 1920px; height: 1080px;
+  padding: 72px 96px 64px;
+  background: radial-gradient(1200px 600px at 85% -10%, rgba(59,164,255,.10), transparent 60%), var(--color-background);
+  display: flex; flex-direction: column;
+  opacity: 0; visibility: hidden; transition: opacity .35s;
+  overflow: hidden;
+}
+.slide.active { opacity: 1; visibility: visible; }
+.slide-content { flex: 1; display: flex; flex-direction: column; gap: 28px; min-height: 0; }
+
+/* footer on every slide */
+.foot {
+  position: absolute; left: 96px; right: 96px; bottom: 26px;
+  display: flex; justify-content: space-between; font-size: 20px; color: var(--color-dim);
+}
+
+/* ===================== typography ===================== */
+h1, h2, h3 { font-family: var(--typography-font-heading); letter-spacing: -0.01em; }
+.kicker { font-size: 24px; font-weight: 600; color: var(--color-primary); letter-spacing: .04em; }
+h2.title { font-size: 64px; line-height: 1.08; font-weight: 750; }
+h3 { font-size: 34px; font-weight: 700; }
+p, li { font-size: 28px; line-height: 1.35; color: var(--color-muted); }
+.lead { font-size: 32px; color: var(--color-muted); }
+strong, b { color: var(--color-text); }
+code, .mono { font-family: var(--typography-font-mono); font-size: .82em; color: #CFE3FF; }
+.grad { background: var(--primitive-gradient-primary); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+
+/* ===================== components ===================== */
+.card { background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius); padding: 28px 32px; }
+.card h3 { margin-bottom: 12px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
+.grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px; }
+.grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px; }
+ul.clean { list-style: none; display: flex; flex-direction: column; gap: 12px; }
+ul.clean li { padding-left: 30px; position: relative; }
+ul.clean li::before { content: ""; position: absolute; left: 4px; top: .55em; width: 12px; height: 12px; border-radius: 3px; background: var(--color-primary); }
+
+.pill { display: inline-flex; align-items: center; gap: 10px; font-weight: 700; border-radius: 999px; padding: 10px 22px; font-size: 26px; letter-spacing: .02em; }
+.pill.allow  { background: var(--color-allow-soft);  color: var(--color-allow);  border: 2px solid var(--color-allow); }
+.pill.verify { background: var(--color-verify-soft); color: var(--color-verify); border: 2px solid var(--color-verify); }
+.pill.deny   { background: var(--color-deny-soft);   color: var(--color-deny);   border: 2px solid var(--color-deny); }
+
+.chip { display: inline-block; font-size: 19px; font-weight: 700; letter-spacing: .05em; border-radius: 8px; padding: 6px 12px; white-space: nowrap; }
+.chip.enf { color: #fff; background: var(--status-enforced); }
+.chip.adv { color: #fff; background: var(--status-advisory); }
+.chip.off { color: var(--color-text); background: transparent; border: 2px dashed var(--status-off); }
+
+.code-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.code-list span { font-family: var(--typography-font-mono); font-size: 18px; padding: 5px 10px; border-radius: 8px; background: rgba(255,255,255,.06); color: var(--color-muted); }
+
+/* decision cards */
+.dcard { border-radius: var(--radius); padding: 30px 32px; display: flex; flex-direction: column; gap: 12px; border: 2px solid; }
+.dcard.allow  { border-color: var(--color-allow);  background: linear-gradient(180deg, var(--color-allow-soft), transparent 70%), var(--color-surface); }
+.dcard.verify { border-color: var(--color-verify); background: linear-gradient(180deg, var(--color-verify-soft), transparent 70%), var(--color-surface); }
+.dcard.deny   { border-color: var(--color-deny);   background: linear-gradient(180deg, var(--color-deny-soft), transparent 70%), var(--color-surface); }
+.dcard .dname { font-family: var(--typography-font-heading); font-size: 40px; font-weight: 800; }
+.dcard.allow .dname { color: var(--color-allow); }
+.dcard.verify .dname { color: var(--color-verify); }
+.dcard.deny .dname { color: var(--color-deny); }
+.dcard p { font-size: 25px; }
+
+/* tables */
+table.t { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 24px; }
+table.t th { text-align: left; color: var(--color-dim); font-weight: 600; font-size: 20px; letter-spacing: .05em; padding: 10px 16px; border-bottom: 1px solid var(--color-border); }
+table.t td { padding: 13px 16px; border-bottom: 1px solid var(--color-border); color: var(--color-muted); vertical-align: middle; line-height: 1.3; }
+table.t td:first-child { color: var(--color-text); font-weight: 650; }
+
+/* architecture boxes */
+.arch { display: grid; grid-template-columns: 1fr 70px 1.25fr 70px 1fr; align-items: stretch; }
+.abox { background: var(--color-surface); border: 2px solid var(--color-border); border-radius: var(--radius); padding: 26px 28px; display: flex; flex-direction: column; gap: 10px; }
+.abox.edge { border-color: var(--color-primary); box-shadow: 0 0 0 6px var(--color-primary-soft); }
+.abox h3 { font-size: 32px; }
+.abox .sub { font-size: 21px; color: var(--color-dim); font-weight: 600; letter-spacing: .04em; }
+.abox li { font-size: 23px; }
+.arrow { display: flex; align-items: center; justify-content: center; }
+.arrow svg { width: 60px; height: 40px; }
+
+.pipeline { display: flex; align-items: center; gap: 8px; flex-wrap: nowrap; }
+.pipeline .step { background: var(--color-surface-2); border: 1px solid var(--color-border); border-radius: 12px; padding: 11px 11px; font-size: 19px; font-weight: 600; color: var(--color-text); white-space: nowrap; }
+.pipeline .sep { color: var(--color-dim); font-size: 22px; }
+
+.banner { border-radius: var(--radius); padding: 22px 30px; background: var(--color-primary-soft); border: 1px solid rgba(59,164,255,.45); font-size: 28px; color: var(--color-text); }
+
+/* SC1 matrix */
+.matrix { display: grid; grid-template-columns: 220px repeat(3, 1fr); gap: 10px; }
+.matrix .h { font-size: 21px; color: var(--color-dim); font-weight: 700; letter-spacing: .04em; padding: 8px 10px; display: flex; align-items: flex-end; }
+.matrix .rh { font-size: 24px; font-weight: 700; color: var(--color-text); display: flex; align-items: center; padding: 0 10px; }
+.matrix .c { border-radius: 12px; padding: 16px 14px; font-size: 24px; font-weight: 800; text-align: center; display: flex; flex-direction: column; justify-content: center; min-height: 92px; }
+.matrix .c small { display: block; font-size: 17px; font-weight: 500; margin-top: 4px; color: var(--color-muted); }
+.c.allow  { background: var(--color-allow-soft);  color: var(--color-allow);  border: 2px solid var(--color-allow); }
+.c.verify { background: var(--color-verify-soft); color: var(--color-verify); border: 2px solid var(--color-verify); }
+.c.deny   { background: var(--color-deny-soft);   color: var(--color-deny);   border: 2px solid var(--color-deny); }
+
+/* metrics */
+.metric { background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius); padding: 22px 26px; }
+.metric .v { font-family: var(--typography-font-heading); font-size: 54px; font-weight: 800; line-height: 1.05; color: var(--color-text); }
+.metric .v small { font-size: 26px; color: var(--color-muted); font-weight: 600; }
+.metric .l { font-size: 21px; color: var(--color-muted); margin-top: 6px; line-height: 1.3; }
+.metric.pending { border-style: dashed; }
+.metric.pending .v { font-size: 30px; color: var(--color-dim); }
+
+/* ===================== navigation + notes ===================== */
+.progress-bar { position: fixed; top: 0; left: 0; height: 4px; background: var(--color-primary); transition: width .3s; z-index: 1000; }
+.nav-controls { position: fixed; top: 12px; right: 18px; display: flex; align-items: center; gap: 12px; z-index: 1000; opacity: .35; transition: opacity .2s; }
+.nav-controls:hover { opacity: 1; }
+.nav-btn { background: rgba(255,255,255,.12); border: none; color: #fff; width: 38px; height: 38px; border-radius: 50%; cursor: pointer; font-size: 18px; }
+.slide-counter { color: rgba(255,255,255,.7); font-size: 14px; }
+aside.notes { display: none; }
+#notesPanel {
+  display: none; position: fixed; left: 0; right: 0; bottom: 0; max-height: 38vh; overflow: auto;
+  background: rgba(5,8,15,.96); border-top: 2px solid var(--color-primary); padding: 18px 28px 60px;
+  font-size: 17px; line-height: 1.5; color: #DCE6F5; z-index: 999;
+}
+#notesPanel.show { display: block; }
+#notesPanel h4 { color: var(--color-primary); font-size: 14px; letter-spacing: .08em; margin-bottom: 6px; }
+#notesPanel .src { margin-top: 10px; color: var(--color-muted); font-size: 15px; }
+#notesPanel .src b { color: #fff; }
+.help { position: fixed; top: 16px; left: 18px; font-size: 13px; color: rgba(255,255,255,.35); z-index: 1000; }
+
+/* ===================== print: one 16:9 page per slide ===================== */
+@page { size: 1920px 1080px; margin: 0; }
+@media print {
+  html, body { background: var(--color-background); overflow: visible; }
+  .slide-deck { position: static; transform: none !important; width: 1920px; height: auto; }
+  .slide { position: relative; opacity: 1; visibility: visible; transition: none; page-break-after: always; break-after: page; }
+  .slide:last-child { page-break-after: auto; break-after: auto; }
+  .progress-bar, .nav-controls, #notesPanel, .help { display: none !important; }
+  * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+}
+</style>
+</head>
+<body>
+<div class="progress-bar" id="progressBar"></div>
+<div class="slide-deck" id="deck">
+
+<!-- ============================ 1. TITLE ============================ -->
+<section class="slide active" data-title="Title">
+  <div class="slide-content" style="justify-content:center; gap:34px;">
+    <div class="kicker">HID HACKATHON 2026 &middot; PES UNIVERSITY &middot; 14 NOV 2026</div>
+    <h1 style="font-size:132px; line-height:1.0; font-weight:800;"><span class="grad">FaceGuard</span></h1>
+    <p style="font-size:48px; font-weight:700; margin-top:-18px;">Can You Spot a Spoof?</p>
+    <p class="lead" style="font-size:40px; max-width:1500px; color:var(--color-text);">FaceGuard is an HID entry kiosk that checks <b>liveness</b>, <b>identity</b>, the <b>campus schedule</b> and <b>connectivity</b>, then returns one clear decision.</p>
+    <div style="display:flex; gap:22px; margin-top:6px;">
+      <span class="pill allow">ALLOW</span>
+      <span class="pill verify">REQUEST VERIFICATION</span>
+      <span class="pill deny">DENY</span>
+    </div>
+    <p style="font-size:32px; margin-top:26px;">Team <b style="font-size:40px;">CipherTrust</b> &nbsp;&middot;&nbsp; "Spot the spoof, check the schedule, never fail open."</p>
+  </div>
+  <div class="foot"><span>FaceGuard</span><span>1</span></div>
+  <aside class="notes">
+    <p>Hi, we're team CipherTrust, and this is FaceGuard. The challenge was "Can you spot a spoof?": an HID entry kiosk has to tell a live person from a photo, a screen, a video or a mask, and decide within 2 seconds. We built that, plus both surprise challenges: campus schedule and offline mode. Every decision comes out as one of three colours: green ALLOW, amber REQUEST VERIFICATION, red DENY. Those colours stay the same through the whole deck.</p>
+    <p class="src"><b>Sources:</b> No measured numbers on this slide. "2 seconds" is the brief's requirement (docs/PROBLEM.md section 1).</p>
+  </aside>
+</section>
+
+<!-- ============================ 2. PROBLEM ============================ -->
+<section class="slide" data-title="Problem">
+  <div class="slide-content">
+    <div class="kicker">THE PROBLEM</div>
+    <h2 class="title">The same face can look real<br>and still not be the real person.</h2>
+    <div class="grid4" style="margin-top:6px;">
+      <div class="card"><h3>Printed photo</h3><p>A4 print or an eye-cut paper mask with real eyes blinking through it</p></div>
+      <div class="card"><h3>Screen replay</h3><p>A photo shown on a phone or laptop held up to the camera</p></div>
+      <div class="card"><h3>Video replay</h3><p>A clip that blinks and smiles, so "is it moving?" is not enough</p></div>
+      <div class="card"><h3>Mask (3D / printed)</h3><p>Rigid or printed masks; silicone is the hardest case</p></div>
+    </div>
+    <div class="grid2">
+      <div class="card" style="border-color:var(--color-verify);">
+        <h3>Surprise 1: live is not authorised</h3>
+        <p>A real, recognised student at the gate at 22:30 still should not get in. Biometrics have to be combined with the <b>campus schedule</b>.</p>
+      </div>
+      <div class="card" style="border-color:var(--color-deny);">
+        <h3>Surprise 2: network down must not mean door open</h3>
+        <p>When the central service is unreachable, the kiosk still decides, <b>safely</b>, and syncs the decisions later.</p>
+      </div>
+    </div>
+    <p style="font-size:26px;">Why it matters: the kiosk is <b>unattended</b>, and one false accept opens a real door. HID's reference targets: liveness accuracy 99.4%, face-auth accuracy 99.2%, FAR 0.2%, FRR 0.6%, decision &lt; 2 s.</p>
+  </div>
+  <div class="foot"><span>FaceGuard &middot; Problem</span><span>2</span></div>
+  <aside class="notes">
+    <p>Four attack types from the brief: printed photo, screen replay, video replay and masks. The eye-cut print matters because real eyes blink through the holes, so a blink check passes it. Then the two surprise challenges: a live, recognised person is not automatically authorised, and losing the network must never open the door. The kiosk is unattended, so a false accept is a security incident, not a UX bug.</p>
+    <p class="src"><b>Sources:</b> 99.4%, 99.2%, 0.2%, 0.6%, &lt; 2 s = HID organiser targets, verbatim from the brief (docs/PROBLEM.md section 3, image 03). They are targets, not our results. "22:30" = demo step 8 (docs/DEMO_AND_PITCH.md 1.2; student MAIN_GATE window 06:00-22:00 in config/schedule.demo.json).</p>
+  </aside>
+</section>
+
+<!-- ============================ 3. ARCHITECTURE PICTURE ============================ -->
+<section class="slide" data-title="Our answer">
+  <div class="slide-content">
+    <div class="kicker">OUR ANSWER IN ONE PICTURE</div>
+    <h2 class="title">Local-first, cloud-enhanced</h2>
+    <div class="arch">
+      <div class="abox">
+        <div class="sub">KIOSK BROWSER</div>
+        <h3>React + Vite + TS</h3>
+        <ul class="clean">
+          <li>MediaPipe face lock + quality gate</li>
+          <li>Colour-flash capture, 5 frames (flash advisory)</li>
+          <li>Challenge: smile / open mouth + blink / turn</li>
+          <li>Virtual-camera check</li>
+          <li>ONLINE / OFFLINE badge</li>
+        </ul>
+      </div>
+      <div class="arrow"><svg viewBox="0 0 60 40"><path d="M4 20h44" stroke="#74829E" stroke-width="4"/><path d="M40 8l14 12-14 12" fill="none" stroke="#74829E" stroke-width="4"/></svg></div>
+      <div class="abox edge">
+        <div class="sub" style="color:var(--color-primary);">LOCAL EDGE SERVICE &middot; ALWAYS DECIDES</div>
+        <h3>FastAPI on the kiosk laptop</h3>
+        <ul class="clean">
+          <li>Liveness: 2&times; MiniFASNet, YOLOX phone/screen, moir&eacute;, mask cues, flash</li>
+          <li>Local ArcFace matcher on an encrypted template cache</li>
+          <li>Policy engine: biometrics &rarr; schedule (SC1) &rarr; mode (SC2)</li>
+          <li>Encrypted offline log + sync queue</li>
+          <li>Fallback: TOTP / HID card / staff code</li>
+        </ul>
+      </div>
+      <div class="arrow"><svg viewBox="0 0 60 40"><path d="M4 20h44" stroke="#74829E" stroke-width="4" stroke-dasharray="7 5"/><path d="M40 8l14 12-14 12" fill="none" stroke="#74829E" stroke-width="4"/></svg></div>
+      <div class="abox">
+        <div class="sub">AWS CLOUD &middot; WHEN ONLINE</div>
+        <h3>API Gateway &rarr; EC2</h3>
+        <ul class="clean">
+          <li>Rekognition user vectors (on, time-boxed)</li>
+          <li>Authoritative signed schedule</li>
+          <li>DynamoDB decisions ledger</li>
+          <li>SES email OTP</li>
+          <li>/v1/sync + CloudWatch</li>
+        </ul>
+      </div>
+    </div>
+    <div class="pipeline">
+      <span class="step">Face lock</span><span class="sep">&rsaquo;</span>
+      <span class="step">Quality</span><span class="sep">&rsaquo;</span>
+      <span class="step">Injection check</span><span class="sep">&rsaquo;</span>
+      <span class="step">Liveness &#8741; Match</span><span class="sep">&rsaquo;</span>
+      <span class="step">Biometric fusion</span><span class="sep">&rsaquo;</span>
+      <span class="step">Schedule (SC1)</span><span class="sep">&rsaquo;</span>
+      <span class="step">Mode rules (SC2)</span><span class="sep">&rsaquo;</span>
+      <span class="pill allow" style="font-size:17px; padding:7px 11px; white-space:nowrap;">ALLOW</span>
+      <span class="pill verify" style="font-size:17px; padding:7px 11px; white-space:nowrap;">REQUEST VERIFICATION</span>
+      <span class="pill deny" style="font-size:17px; padding:7px 11px; white-space:nowrap;">DENY</span>
+    </div>
+    <div class="banner">The edge <b>always</b> produces the decision. Online, it adds Rekognition and the authoritative schedule. Offline is a normal mode, not a bolt-on.</div>
+  </div>
+  <div class="foot"><span>FaceGuard &middot; Architecture</span><span>3</span></div>
+  <aside class="notes">
+    <p>Three boxes. The kiosk browser finds the face and captures five frames while the screen flashes a random colour sequence. The edge service on the kiosk laptop does the real work: liveness and face matching run in parallel, then one policy engine applies biometrics, then the campus schedule, then the offline rules. AWS adds Rekognition, the authoritative schedule and the audit ledger when it is reachable. Because the edge always decides, losing the cloud is just a mode switch.</p>
+    <p class="src"><b>Sources:</b> "5 frames" = CaptureSpec in docs/PROBLEM.md section 6 R1 and docs/ARCHITECTURE.md. No measured numbers on this slide. Components: docs/ARCHITECTURE.md sections 1-3, CLAUDE.md section 3. Flash advisory = config/thresholds.yaml liveness.flash.enforce false. Challenge actions = challenge.deformation_actions SMILE/OPEN_MOUTH + secondary_actions BLINK/TURN_LEFT/TURN_RIGHT. Rekognition on = match.rekognition.enabled true, confirmed by live GET /v1/mode (policy_bars.rekognition true, cloud_match.enabled true) at 21:52 IST; timeout 700 ms = latency_budget_ms.rekognition_timeout. Early cloud probe (Rekognition started at face lock, overlapping the capture): in the code (docs/ARCHITECTURE.md C1/C3), and live GET /v1/mode at 22:41 IST (policy_version 2026-11-14.3) showed rekognition_probe_deadline_ms 1500. Its latency effect is NOT measured; see the Innovation slide.</p>
+  </aside>
+</section>
+
+<!-- ============================ 4. DECISION LOGIC ============================ -->
+<section class="slide" data-title="Decision logic">
+  <div class="slide-content">
+    <div class="kicker">DECISION LOGIC</div>
+    <h2 class="title">Three outcomes, every one explained</h2>
+    <div class="grid3">
+      <div class="dcard allow">
+        <div class="dname">ALLOW</div>
+        <p>Live, identity matched, inside the schedule window, mode rules satisfied.</p>
+        <div class="code-list"><span>ACCESS_OK</span><span>FALLBACK_OK</span></div>
+      </div>
+      <div class="dcard verify">
+        <div class="dname">REQUEST VERIFICATION</div>
+        <p>Something is unsure. Next step: recapture, a face challenge (smile / open mouth), or TOTP / HID card / email OTP / staff.</p>
+        <div class="code-list"><span>LIVENESS_UNSURE</span><span>MATCH_LOW</span><span>MASK_CUE_EDGE</span><span>SCHEDULE_GRACE_WINDOW</span><span>RANDOM_CHALLENGE</span><span>OFFLINE_FALLBACK_REQUIRED</span></div>
+      </div>
+      <div class="dcard deny">
+        <div class="dname">DENY</div>
+        <p>Hard spoof evidence, &ge; 2 strong mask cues, unknown face, outside the schedule, failed challenge.</p>
+        <div class="code-list"><span>SPOOF_PASSIVE</span><span>SPOOF_DEVICE_DETECTED</span><span>SPOOF_MOIRE</span><span>INJECTION_VIRTUAL_CAMERA</span><span>CHALLENGE_FAILED</span><span>NOT_ENROLLED</span><span>SCHEDULE_OUTSIDE_WINDOW</span></div>
+      </div>
+    </div>
+    <div class="card" style="padding:24px 32px;">
+      <h3 style="font-size:30px;">Fail-secure rules (enforced by tests)</h3>
+      <div class="grid3" style="gap:10px 36px;">
+        <p style="font-size:24px;"><b>Default is DENY.</b> Any error returns DENY with <code>SYSTEM_ERROR</code>, never an open door.</p>
+        <p style="font-size:24px;"><b>Hard spoof evidence is final.</b> No schedule, step-up or override can upgrade it.</p>
+        <p style="font-size:24px;"><b>Unsure never auto-allows.</b> Every UNSURE signal routes to verification.</p>
+        <p style="font-size:24px;"><b>Each stage only tightens.</b> Biometrics, then schedule, then mode.</p>
+        <p style="font-size:24px;"><b>Offline is stricter</b> than online, never looser.</p>
+        <p style="font-size:24px;"><b>Every response</b> carries <code>decision</code>, <code>reason_codes</code>, <code>scores</code>, <code>latency_ms</code>, <code>mode</code>.</p>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><span>FaceGuard &middot; Decision policy</span><span>4</span></div>
+  <aside class="notes">
+    <p>Every signal has three zones: pass, fail, and an unsure band in between. Unsure never guesses: it asks for verification. Hard evidence like a phone in the frame is an immediate DENY that nothing can override. The step-up challenge always includes a mouth movement, because paper can't smile. And every decision carries reason codes, so the guard and an auditor can see exactly why. These rules are invariants checked by the policy test suite.</p>
+    <p class="src"><b>Sources:</b> "&ge; 2 strong mask cues" = config/thresholds.yaml mask.strong_cue_deny_count 2. Reason-code strings checked against edge/policy/codes.py. Invariants = docs/DECISION_POLICY.md section 1 (P1-P12). No measured numbers on this slide.</p>
+  </aside>
+</section>
+
+<!-- ============================ 5. LIVENESS STACK ============================ -->
+<section class="slide" data-title="Liveness stack">
+  <div class="slide-content" style="gap:20px;">
+    <div class="kicker">LIVENESS STACK &middot; HONEST STATUS</div>
+    <h2 class="title" style="font-size:58px;">Layered signals, each marked as it ships today</h2>
+    <table class="t">
+      <thead><tr><th>SIGNAL</th><th>WHAT IT CATCHES</th><th>RULE (config/thresholds.yaml)</th><th>STATUS</th></tr></thead>
+      <tbody>
+        <tr><td>Passive PAD: MiniFASNetV2 + V1SE</td><td>print, screen texture</td><td>pass &ge; 0.80, spoof &le; 0.30 on most frames</td><td><span class="chip enf">ENFORCED</span></td></tr>
+        <tr><td>Phone / screen detector (YOLOX-Tiny)</td><td>device bezel around the face</td><td>conf &ge; 0.40 &rarr; DENY; 0.25&ndash;0.40 &rarr; unsure</td><td><span class="chip enf">ENFORCED</span></td></tr>
+        <tr><td>Moir&eacute; FFT</td><td>screen pixel grid</td><td>0.40 unsure / 0.70 fail (needs a 2nd signal)</td><td><span class="chip enf">ENFORCED</span></td></tr>
+        <tr><td>Mask cues (RGB ring, M2)</td><td>paper / mask edges, eye holes</td><td>0.50 weak / 0.75 strong; 1 cue &rarr; verify, 2 strong &rarr; DENY</td><td><span class="chip enf">ENFORCED</span></td></tr>
+        <tr><td>Random deformation challenge</td><td>masks, photos, replays</td><td>smile / open mouth + blink / turn; 15% online, 30% offline + every unsure</td><td><span class="chip enf">ENFORCED</span></td></tr>
+        <tr><td>Injection check</td><td>virtual cameras, injected streams</td><td>camera-label denylist, frame gaps 15&ndash;400 ms, single-use nonce</td><td><span class="chip enf">ENFORCED</span></td></tr>
+        <tr><td>Colour-flash nonce</td><td>video replay, slow deepfakes</td><td>3 random colours in 700 ms, measured every attempt</td><td><span class="chip adv">ADVISORY</span></td></tr>
+        <tr><td>iPhone TrueDepth (own DepthProbe app)</td><td>flat prints, screens, rigid masks</td><td>app built, edge listener on :8001; <code>depth.enabled</code> false until H4 calibration (10 live vs 10 print)</td><td><span class="chip off">PENDING CALIBRATION</span></td></tr>
+      </tbody>
+    </table>
+    <p style="font-size:23px;"><span class="chip enf">ENFORCED</span> changes the decision &nbsp; <span class="chip adv">ADVISORY</span> measured and shown to the operator, no decision effect yet &nbsp; <span class="chip off">PENDING CALIBRATION</span> built, not in today's decision</p>
+  </div>
+  <div class="foot"><span>FaceGuard &middot; Liveness</span><span>5</span></div>
+  <aside class="notes">
+    <p>We don't rely on one model. Two passive anti-spoof networks look at texture, a phone and screen detector looks for a device around the face, an FFT looks for the screen's moir&eacute; pattern, and a ring detector looks for mask edges. On top of that, a share of would-be ALLOWs get a random challenge, and it always includes a mouth movement. Two honest flags: the colour flash runs on every attempt but is advisory until we re-validate the webcam timing, and the iPhone depth app is built and integrated but stays off until it passes calibration.</p>
+    <p class="src"><b>Sources (all config/thresholds.yaml as shipped, file mtime 14 Nov 19:10 IST):</b> PAD pass_min 0.80 / fail_max 0.30 (liveness.pad); device fail_conf 0.40 / unsure_conf 0.25; moire unsure_score 0.40 / fail_score 0.70, enforce true, require_corroboration true; mask m2_ring_score_weak 0.50 / strong 0.75, m2_rgb_enforce true, strong_cue_deny_count 2; challenge.random_rate 0.15, offline.overrides challenge.random_rate 0.30, deformation_actions SMILE/OPEN_MOUTH, secondary BLINK/TURN_LEFT/TURN_RIGHT; injection min/max_frame_interval_ms 15/400; flash colours 3, duration_ms 700, enforce false; depth.enabled false. Live GET /v1/mode policy_bars at 21:52 IST confirmed random_rate 0.15, flash_enforce false, moire_enforce true, m2_rgb_enforce true, rekognition true. GET /v1/health at 21:52 IST: depth_enabled false, lan_listener "listening 0.0.0.0:8001", depth_probe "unavailable" (the iPhone was not streaming at that moment), so only say "connected" after you see the phone on /v1/health. H4 = 10 live vs 10 print calibration (CLAUDE.md section 10). YOLOX-Tiny (Apache-2.0) per docs/ARCHITECTURE.md section 8.</p>
+  </aside>
+</section>
+
+<!-- ============================ 6. INNOVATION ============================ -->
+<section class="slide" data-title="Innovation">
+  <div class="slide-content" style="gap:22px;">
+    <div class="kicker">INNOVATION &middot; WHAT IS DIFFERENT HERE</div>
+    <h2 class="title" style="font-size:58px;">Six ideas beyond "run an anti-spoof model"</h2>
+    <div class="grid3" style="gap:22px;">
+      <div class="card" style="padding:24px 28px;">
+        <h3 style="font-size:29px;">Random colour-flash nonce</h3>
+        <p style="font-size:23px;">The server issues a fresh random 3-colour sequence per attempt; the screen flashes it in 700 ms and we check that the face reflects it. A replayed video can't know the colours in advance.</p>
+        <p style="margin-top:12px;"><span class="chip adv">ADVISORY</span> <span style="font-size:19px;">until frame timing is re-validated</span></p>
+      </div>
+      <div class="card" style="padding:24px 28px;">
+        <h3 style="font-size:29px;">Risk-adaptive step-up</h3>
+        <p style="font-size:23px;">Only unsure or risky attempts get a challenge. It <b>always</b> includes a mouth movement (smile / open mouth) plus a blink or turn, never blink-only: real eyes blink through an eye-cut print. Random on 15% of entries online, 30% offline.</p>
+        <p style="margin-top:12px;"><span class="chip enf">ENFORCED</span></p>
+      </div>
+      <div class="card" style="padding:24px 28px;">
+        <h3 style="font-size:29px;">Early cloud probe</h3>
+        <p style="font-size:23px;">At face lock the kiosk sends one frame ahead, so Rekognition runs <b>while</b> the colour-flash capture is still happening instead of after it. A late answer is never waited for: that attempt is decided locally.</p>
+        <p style="margin-top:12px;"><span class="chip enf">LIVE</span> <span style="font-size:19px;">speed-up not measured yet</span></p>
+      </div>
+      <div class="card" style="padding:24px 28px;">
+        <h3 style="font-size:29px;">Signed schedule, last valid bundle</h3>
+        <p style="font-size:23px;">Schedules arrive as signed per-kiosk bundles evaluated on the kiosk. A bad or tampered bundle is rejected and never replaces the last valid one; with no valid bundle there is no ALLOW.</p>
+        <p style="margin-top:12px;"><span class="chip enf">ENFORCED</span></p>
+      </div>
+      <div class="card" style="padding:24px 28px;">
+        <h3 style="font-size:29px;">Injection as its own layer</h3>
+        <p style="font-size:23px;">Virtual-camera label denylist (OBS, ManyCam...), frame-gap bounds of 15&ndash;400 ms and a single-use capture nonce. Reported separately from presentation attacks (CEN/TS 18099).</p>
+        <p style="margin-top:12px;"><span class="chip enf">ENFORCED</span></p>
+      </div>
+      <div class="card" style="padding:24px 28px;">
+        <h3 style="font-size:29px;">Own iPhone TrueDepth app</h3>
+        <p style="font-size:23px;">DepthProbe, our SwiftUI app, streams TrueDepth depth to the edge so a flat print or screen can be caught by shape, not texture. Raises the bar for masks; it does not solve them.</p>
+        <p style="margin-top:12px;"><span class="chip off">BUILT &middot; CALIBRATION PENDING</span></p>
+      </div>
+    </div>
+    <div class="banner" style="font-size:25px;">And on every decision: <b>reason codes</b> in plain words for the person at the door, full scores for the operator.</div>
+  </div>
+  <div class="foot"><span>FaceGuard &middot; Innovation</span><span>6</span></div>
+  <aside class="notes">
+    <p>Six things set this apart. One: the colour flash is a challenge-response check with no extra hardware; the server picks the colours, so a pre-recorded video can't match them. We measure it on every attempt, but it stays advisory until we re-validate the webcam frame timing. Two: step-up is risk-adaptive and always asks for a mouth movement, because an eye-cut paper mask passes any blink check. Three: the early cloud probe starts Rekognition at face lock, overlapping it with the capture; if it's late, the kiosk decides locally rather than waiting. It's live, but we have not measured the gain yet, so no number. Four: the schedule is a signed bundle with a last-valid-bundle rule, so tampering can only deny. Five: injection attacks are their own layer. Six: we wrote our own iPhone depth app; it's built and connected but stays off until calibration.</p>
+    <p class="src"><b>Sources:</b> flash = config/thresholds.yaml liveness.flash colours 3, duration_ms 700, enforce false (live GET /v1/mode 22:41 IST: flash_enforce false). Step-up = challenge.deformation_actions SMILE/OPEN_MOUTH + secondary BLINK/TURN_LEFT/TURN_RIGHT; random_rate 0.15, offline.overrides 0.30 (GET /v1/mode 22:41 IST: random_rate 0.15); never blink-only = docs/DECISION_POLICY.md and CLAUDE.md section 4. Early probe = docs/ARCHITECTURE.md C1/C3 (POST /v1/attempt/{id}/probe at face lock, fire-and-forget, never delays capture), config/thresholds.yaml latency_budget_ms.rekognition_probe_deadline 1500; a miss makes the attempt OFFLINE (P7, ARCHITECTURE.md section on degraded paths); live GET /v1/mode 22:41 IST policy_version 2026-11-14.3, rekognition true, rekognition_probe_deadline_ms 1500. There is NO stored latency measurement of the probe in eval/results/, so do not quote a speed-up. Bundle + LVB = docs/ARCHITECTURE.md section 8 bundle integrity row (HMAC-SHA256 today, Ed25519 in production; rejected bundle never replaces LVB; no LVB = INVALID = no ALLOW), docs/API.md SCHEDULE_BUNDLE_INVALID. Injection = config/thresholds.yaml injection min/max_frame_interval_ms 15/400; NONCE_REUSED 409 (docs/API.md); CEN/TS 18099 framing = docs/DEMO_AND_PITCH.md section 3. DepthProbe = docs/IPHONE_SETUP.md; depth.enabled false until H4 (10 live vs 10 print, CLAUDE.md section 10). No measured numbers on this slide.</p>
+  </aside>
+</section>
+
+<!-- ============================ 7. SC1 SCHEDULE ============================ -->
+<section class="slide" data-title="SC1 Campus schedule">
+  <div class="slide-content">
+    <div class="kicker">SURPRISE CHALLENGE 1 &middot; ACCESS WITH CAMPUS SCHEDULE</div>
+    <h2 class="title">Biometric result &times; signed schedule bundle</h2>
+    <div style="display:grid; grid-template-columns: 1.25fr 1fr; gap:40px; align-items:start;">
+      <div class="matrix">
+        <div class="h"></div>
+        <div class="h">IN WINDOW</div>
+        <div class="h">GRACE &plusmn;15 MIN</div>
+        <div class="h">OUTSIDE / NO GRANT / HOLIDAY / REVOKED</div>
+        <div class="rh">Bio PASS</div>
+        <div class="c allow">ALLOW<small>high-risk zone: verify</small></div>
+        <div class="c verify">REQUEST VERIFICATION<small>second factor</small></div>
+        <div class="c deny">DENY</div>
+        <div class="rh">Bio UNSURE</div>
+        <div class="c verify">REQUEST VERIFICATION<small>challenge / factor</small></div>
+        <div class="c deny">DENY</div>
+        <div class="c deny">DENY</div>
+        <div class="rh">Bio FAIL / spoof</div>
+        <div class="c deny">DENY<small>schedule not checked</small></div>
+        <div class="c deny">DENY</div>
+        <div class="c deny">DENY</div>
+      </div>
+      <ul class="clean">
+        <li><b>Rules:</b> roles &times; zones &times; weekly windows, plus exceptions, holidays, visitor passes, revocations</li>
+        <li><b>High-risk zones</b> (server room): explicit grant only, no grace, second factor even inside the window</li>
+        <li><b>HMAC-SHA256 signed bundle</b>, refreshed from the cloud every 15 min and evaluated locally, so there is no extra cloud call per attempt</li>
+        <li><b>Stale data may deny, never allow.</b> A tampered bundle is rejected.</li>
+      </ul>
+    </div>
+    <div class="banner">Demo: Prajwal, live and recognised at the main gate at <b>22:30</b> &rarr; <span style="color:var(--color-deny); font-weight:800;">DENY</span>. At <b>22:10</b> (grace) &rarr; <span style="color:var(--color-verify); font-weight:800;">REQUEST VERIFICATION</span> &rarr; HID card &rarr; <span style="color:var(--color-allow); font-weight:800;">ALLOW</span>.</div>
+  </div>
+  <div class="foot"><span>FaceGuard &middot; SC1</span><span>7</span></div>
+  <aside class="notes">
+    <p>A live, recognised person is not automatically authorised. Biometrics run first; only a person who passes, or is merely unsure, gets the schedule check. Inside the window it's ALLOW; within 15 minutes of the edge it's a second factor instead of a hard no; outside it's DENY. High-risk zones like the server room need an explicit grant, get no grace and always need a second factor. The schedule arrives as a signed bundle and is evaluated on the kiosk, so it costs no network time and still works offline.</p>
+    <p class="src"><b>Sources:</b> matrix = docs/SURPRISE_CHALLENGES.md SC1.4 (high-risk IN_WINDOW STEP_UP: schedule.high_risk_requires_stepup_online default true). Grace 15 min = config/thresholds.yaml schedule.grace_minutes 15; high-risk grace 0 = grace_minutes_high_risk 0. Refresh 15 min = cache.bundle_refresh_interval_min (docs/DEMO_AND_PITCH.md P3). 22:30 / 22:10 = demo steps 8-9 (docs/DEMO_AND_PITCH.md 1.2; student MAIN_GATE 06:00-22:00 in config/schedule.demo.json). HMAC-SHA256 = docs/ARCHITECTURE.md section 8.</p>
+  </aside>
+</section>
+
+<!-- ============================ 8. SC2 OFFLINE ============================ -->
+<section class="slide" data-title="SC2 Offline mode">
+  <div class="slide-content" style="gap:22px;">
+    <div class="kicker">SURPRISE CHALLENGE 2 &middot; OFFLINE MODE WITH SAFE ACCESS</div>
+    <h2 class="title">The kiosk keeps deciding, and decides more strictly</h2>
+    <table class="t" style="font-size:25px;">
+      <thead><tr><th>THE BRIEF ASKS</th><th>WHAT WE BUILT</th></tr></thead>
+      <tbody>
+        <tr><td>Safe local decision process</td><td>Same edge policy engine; heartbeat detects the outage (3 misses &rarr; OFFLINE); signed cached schedule + local ArcFace</td></tr>
+        <tr><td>Avoid unsafe automatic access</td><td>Stricter bars (PAD 0.80 &rarr; 0.85, cosine 0.50 &rarr; 0.55); unsure never auto-allows; high-risk zones never auto-allow</td></tr>
+        <tr><td>Fallback verification</td><td>Offline TOTP (replay-protected), single-use staff override codes, HID card ID (not for high-risk zones)</td></tr>
+        <tr><td>Minimum temporary information</td><td>No images, crops, embeddings or names; AES-256-GCM encrypted log, hash-chained, 2-dp scores, purged on ack or after 24 h</td></tr>
+        <tr><td>Synchronise on reconnect</td><td>Idempotent <code>/v1/sync</code> keyed by <code>attempt_id</code>, &le; 50 per batch; the cloud re-checks every offline ALLOW and raises alerts</td></tr>
+      </tbody>
+    </table>
+    <div class="banner">Demonstrated live: offline decisions queue on the kiosk and sync to the AWS cloud on reconnect. The kiosk badge shows ONLINE / OFFLINE / SYNCING; SYNCING still uses offline rules until the queue is acknowledged.</div>
+  </div>
+  <div class="foot"><span>FaceGuard &middot; SC2</span><span>8</span></div>
+  <aside class="notes">
+    <p>The five bullets of the brief map one to one. The same engine keeps deciding locally, with higher pass bars. Anything unsure and anything in a high-risk zone needs a second factor that works with zero connectivity: an authenticator code, a single-use staff code, or the HID card. What we keep is minimal: no images, no embeddings, rounded scores, encrypted and hash-chained, deleted on sync. We demonstrated the reconnect live: the queued decisions sync to the cloud, and the cloud re-checks every offline ALLOW against the authoritative schedule. If you want to show it, show it on the live dashboard rather than quoting a number.</p>
+    <p class="src"><b>Sources:</b> 3 misses = connectivity.misses_to_offline 3 (docs/DEMO_AND_PITCH.md 1.2 note). PAD 0.80/0.85, cosine 0.50/0.55 = config/thresholds.yaml liveness.pad.pass_min + offline.overrides (also docs/SURPRISE_CHALLENGES.md SC2.3). 24 h = offline_store.max_retention_hours (docs/PROBLEM.md section 6 SC2d). &le; 50 per batch = sync.batch_size (docs/DEMO_AND_PITCH.md step 14). 2-dp scores = SC2.5. "Demonstrated live": no sync log, queue-depth trace or screenshot is stored in eval/results/, so the slide makes no queue-size or "drained" claim. Do not quote any queue size from memory; store evidence under eval/results/ first if you want one on a slide.</p>
+  </aside>
+</section>
+
+<!-- ============================ 9. AWS ============================ -->
+<section class="slide" data-title="AWS architecture">
+  <div class="slide-content">
+    <div class="kicker">AWS ARCHITECTURE &middot; DEPLOYED IN THE HACKATHON SANDBOX (us-east-1)</div>
+    <h2 class="title">Managed services, each with a degraded path</h2>
+    <div class="grid4">
+      <div class="card"><h3>API Gateway &rarr; EC2</h3><p>HTTPS HTTP API in front of a warm FastAPI on t3.small. Edge requests are HMAC-signed.</p></div>
+      <div class="card"><h3>Rekognition</h3><p>On. User vectors: IndexFaces &rarr; CreateUser &rarr; AssociateFaces; SearchUsersByImage. Time-boxed (700 ms); a miss means that attempt is decided offline.</p></div>
+      <div class="card"><h3>DynamoDB</h3><p><code>hid_users</code>, <code>hid_decisions</code>, <code>hid_state</code>. Idempotent sync ledger with TTL.</p></div>
+      <div class="card"><h3>S3 + SSE-KMS</h3><p>Bucket provisioned: KMS-encrypted, public access blocked, TLS-only, <b>1-day lifecycle</b>. Audit-image upload is not built yet.</p></div>
+      <div class="card"><h3>SES</h3><p>Email OTP as an online step-up factor (SMS to India needs TRAI DLT registration).</p></div>
+      <div class="card"><h3>CloudWatch</h3><p>Dashboard <code>hid-kiosk</code>, latency and decision metrics, alarm on post-sync revocation alerts.</p></div>
+      <div class="card"><h3>SSM + IAM</h3><p>Secrets in a SecureString parameter, instance profile, no keys on the box.</p></div>
+      <div class="card" style="border-style:dashed;"><h3>Production</h3><p>Pin <b>ap-south-1 (Mumbai)</b> for DPDP data residency and lower latency.</p></div>
+    </div>
+    <div class="banner">Every cloud feature can fail without opening a door: the edge falls back to local matching and offline rules.</div>
+  </div>
+  <div class="foot"><span>FaceGuard &middot; AWS</span><span>9</span></div>
+  <aside class="notes">
+    <p>This is deployed, not a diagram of intentions. API Gateway fronts a warm EC2 instance. Rekognition holds user vectors for our consenting team members. DynamoDB is the decision ledger the offline queue syncs into. The S3 bucket is provisioned, KMS-encrypted with a one-day lifecycle, but audit-image upload is not built, so we don't claim it. SES sends email OTPs. CloudWatch has the dashboard. The sandbox only allows us-east-1; in production we'd pin Mumbai for DPDP residency. I can show the console live.</p>
+    <p class="src"><b>Sources:</b> cloud/SANDBOX.md section 0 (deployed 14 Nov ~10:00 UTC: API Gateway 8c1yi8fjgj &rarr; EC2 t3.small, FACE_BACKEND=rekognition, STORE_BACKEND=dynamodb, EMAIL_BACKEND=ses; S3 SSE-KMS + lifecycle 1 day; dashboard hid-kiosk + alarm hid-kiosk-post-hoc-revoked; SSM SecureString /hid-kiosk/app-env). us-east-1 only: SANDBOX.md section 0 (ap-south-1 Rekognition denied by SCP). TRAI DLT: SANDBOX.md section 2. SES is in sandbox mode: OTP reaches only verified addresses. Rekognition timeout 700 ms = latency_budget_ms.rekognition_timeout (config/thresholds.yaml). The live edge GET /v1/mode at 21:52 IST showed mode ONLINE, schedule bundle v45 signature_valid FRESH, last_sync ok, cloud_match.enabled true. Rekognition collection hid-kiosk-users: 2 users / 10 faces (SANDBOX.md section 0, read-only check 15:50 UTC). S3: the cloud code only writes an optional enrolment reference image (cloud/app/services/enroll_service.py), and only when ENROLL_STORE_REFERENCE is true (default false, cloud/app/config.py); there is no audit-image upload, so don't claim one.</p>
+  </aside>
+</section>
+
+<!-- ============================ 10. PRIVACY & SECURITY ============================ -->
+<section class="slide" data-title="Privacy and security">
+  <div class="slide-content">
+    <div class="kicker">PRIVACY &amp; SECURITY BY DESIGN</div>
+    <h2 class="title">Store the minimum, sign everything</h2>
+    <div class="grid2">
+      <div class="card">
+        <h3>Privacy (India DPDP Act 2023)</h3>
+        <ul class="clean">
+          <li>Opt-in consent page at enrolment: no tick, no template</li>
+          <li>Templates, not images; <b>no images stored offline, ever</b></li>
+          <li>Templates encrypted at rest (Fernet); log fields AES-256-GCM</li>
+          <li>Pseudonymous IDs, 2-dp scores, 24 h retention, purge on sync</li>
+          <li>Erasure: one call deletes the local template, TOTP secret and cloud user</li>
+          <li>Only consenting team faces; teardown script deletes them</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Security</h3>
+        <ul class="clean">
+          <li>HMAC-SHA256 signed schedule bundles (Ed25519 in production)</li>
+          <li>HMAC-signed edge &rarr; cloud requests with a timestamp window</li>
+          <li>Single-use capture nonce: reuse is rejected</li>
+          <li>Injection layer: virtual-camera denylist + frame-timing bounds</li>
+          <li>Hash-chained decision log, verified on sync</li>
+          <li>Lockout after repeated attack attempts; raw scores only on the operator screen</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><span>FaceGuard &middot; Privacy &amp; security</span><span>10</span></div>
+  <aside class="notes">
+    <p>Privacy first: enrolment is opt-in, we keep templates rather than images, and offline nothing visual is ever written to disk. The offline log has pseudonymous IDs and rounded scores, is encrypted and is deleted within a day. On security: schedules are signed so a tampered file is rejected, every capture has a single-use nonce, and injection, meaning a virtual camera feeding a fake stream, is its own layer, separate from presentation attacks. The DPDP Act treats biometrics as personal data, and this is how we meet consent, minimisation and erasure.</p>
+    <p class="src"><b>Sources:</b> docs/ARCHITECTURE.md section 8 (transport HMAC &plusmn;60 s skew, nonce TTL 10 s, reuse &rarr; 409 NONCE_REUSED, bundle HMAC-SHA256 / Ed25519 production, DPDP row); edge/ml/templates.py (Fernet template cache); docs/SURPRISE_CHALLENGES.md SC2.5 (AES-256-GCM log, 2-dp scores, never_stored list); 24 h = offline_store.max_retention_hours; erasure DELETE /v1/enroll/{user_id} (docs/PROBLEM.md section 6 P1). Lockout: rate_limit 5 attack DENYs in 180 s &rarr; 5 s (config/thresholds.yaml; a demo-day trade-off, see docs/DEMO_AND_PITCH.md section 3). S3 audit-image upload is NOT implemented (cloud/app has no audit upload path), so it is deliberately absent from this slide. Consent checkbox = kiosk/public/enroll.html and kiosk/src/admin/panels/EnrolPanel.tsx (docs/DEMO_AND_PITCH.md step 7).</p>
+  </aside>
+</section>
+
+<!-- ============================ 11. RESULTS ============================ -->
+<section class="slide" data-title="Results">
+  <div class="slide-content" style="gap:20px;">
+    <div class="kicker">RESULTS &middot; MEASURED ONLY, NOTHING ESTIMATED</div>
+    <h2 class="title" style="font-size:58px;">What we have measured, and what is still pending</h2>
+    <div style="display:grid; grid-template-columns: 1.15fr 1fr; gap:32px; flex:1; min-height:0;">
+      <div class="card" style="display:flex; flex-direction:column; gap:10px; padding:22px 26px;">
+        <h3 style="font-size:28px; margin:0;">Edge server latency per stage (ms), n = 40</h3>
+        <div style="position:relative; flex:1; min-height:0;"><canvas id="latencyChart"></canvas></div>
+        <p style="font-size:19px; color:var(--color-dim);">Server side only (frames received &rarr; decision). Synthetic 1280&times;720 frames (the shipped upload size), Apple M4, offline, local match, policy 2026-11-14.3. Excludes face lock, the capture window, Rekognition and rendering.</p>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:18px;">
+        <div class="grid2" style="gap:18px;">
+          <div class="metric"><div class="v">76.0 <small>ms</small></div><div class="l">server total p50 (server side only)<br>95% CI [75, 81]</div></div>
+          <div class="metric"><div class="v">106.4 <small>ms</small></div><div class="l">server total p95 (server side only)<br>95% CI [88, 122]</div></div>
+        </div>
+        <div class="metric" style="padding:18px 24px;">
+          <div class="l" style="margin:0 0 6px; color:var(--color-text); font-weight:700;" id="testsTitle">Automated tests, stored run 14 Nov 2026 17:05 UTC</div>
+          <table class="t" style="font-size:21px;">
+            <tr><td>Edge + policy + offline + depth</td><td>1,344 passed</td></tr>
+            <tr><td>Cloud API</td><td>147 passed</td></tr>
+            <tr><td>Eval harness</td><td>129 passed, 0 failed</td></tr>
+            <tr><td>Kiosk</td><td>typecheck + lint + production build OK</td></tr>
+            <tr><td>Lint (ruff)</td><td>clean</td></tr>
+          </table>
+        </div>
+        <div class="metric pending" style="padding:18px 24px;">
+          <div class="v" style="color:var(--color-verify); font-size:30px;">Eval run pending</div>
+          <div class="l">APCER per attack type, BPCER, FAR, FRR, liveness + face-auth accuracy, client face lock &rarr; decision at the shipped 700 ms window.<br><b>Rule of 3:</b> 0 errors in N trials only shows the rate is &lt; 3/N (95%). Showing FAR &le; 0.2% takes ~1,497 error-free impostor trials; FRR &le; 0.6% takes ~498.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><span>FaceGuard &middot; Results</span><span>11</span></div>
+  <aside class="notes">
+    <p>We only show numbers we measured and stored. Server side only: once the frames arrive, the edge does quality, both liveness models, the device detector, matching and policy in 76 ms median and about 106 ms at p95 over 40 runs at the real 1280-pixel upload size. That is not the door-to-decision time, which also includes face lock, the 700 ms capture and rendering, and we haven't stored a measurement of that yet. What it does show is that inference is a small part of the 2-second budget. The accuracy metrics come from an iBeta Level 1-style protocol run that is still pending, and we won't put a number on a slide before it exists. Zero errors on a small set is only an upper bound: to show HID's 0.2% FAR you need about 1,500 error-free impostor trials.</p>
+    <p class="src"><b>Sources:</b> chart, 76.0 / 106.4 ms and the CIs = <b>eval/results/latency_edge_1280_20261114T171323Z.md</b> (raw rows: latency_edge_1280_20261114T171323Z.csv; scripts/bench_latency.py --runs 40 --warmup 3 on a scratch edge, port 8096, not the live edge; policy_version 2026-11-14.3; 5 synthetic 1280x720 JPEG q85 frames per attempt from edge/synth.py; Apple M4; OFFLINE, no cloud configured, so local ArcFace only and the Rekognition time box is NOT included; CIs = percentile bootstrap, 2000 resamples, as stored; order-stat bounds [75, 82] / [91, 122] are in the same file; with n = 40 the p95 CI is indicative). Chart stage values (p50 / p95 ms): decode+detect+align+quality 17.5 / 24.0; liveness branch 55.0 / 76.6; match branch 57.0 / 71.0; policy 1.0 / 2.0; server total 76.0 / 106.4. All 40 measured attempts ended DENY (SCHEDULE_OUTSIDE_WINDOW + OFFLINE_MODE, 12 also LIVENESS_UNSURE) because the bench ran after the 22:00 window closed; the liveness and match branches still ran on every attempt (non-zero stage times above). These decisions are NOT an accuracy result. The laptop was shared with the live edge, kiosk and other agents (load average about 3.1-3.5 in the file). The older 640x480 run (eval/results/latency_edge.md, n = 30) is superseded for the slide. Test table = exactly the stored file <b>eval/results/tests_20261114T1705Z.txt</b> (run 20261114T1705Z UTC = 22:35 IST): edge + policy + offline + depth "1344 passed, 7 warnings"; cloud "147 passed"; eval "129 passed, 0 failed" (pytest -q prints no summary line there, the count is the progress dots, as the file says); kiosk tsc OK, lint OK, build OK; ruff "All checks passed!" x3. If any suite is re-run before presenting, store the new output under eval/results/ and update this table from that file only. 1,497 and 498 = the exact binomial minimum N with (1-p)^N &le; 0.05 for p = 0.002 and 0.006 (also docs/DEMO_AND_PITCH.md section 3). No client face lock &rarr; decision latency is on this slide: no stored measurement of it exists in eval/results/ yet.</p>
+  </aside>
+</section>
+
+<!-- ============================ 12. NEXT / LIMITS ============================ -->
+<section class="slide" data-title="Honest limits">
+  <div class="slide-content">
+    <div class="kicker">HONEST LIMITS</div>
+    <h2 class="title">What we would tell a security reviewer</h2>
+    <div class="grid2">
+      <div class="card" style="border-color:var(--color-verify);">
+        <h3>Known limits today</h3>
+        <ul class="clean">
+          <li><b>Silicone masks</b> deform like skin, a known limit of RGB. Depth raises the bar but doesn't solve it.</li>
+          <li><b>Colour flash is advisory</b> until the webcam frame timing is re-validated</li>
+          <li><b>Depth is off</b> until the DepthProbe calibration passes</li>
+          <li><b>Moir&eacute; and mask thresholds</b> still need calibration on the eval dev split</li>
+          <li><b>Licences:</b> InsightFace / CelebA-Spoof-trained weights are non-commercial</li>
+        </ul>
+      </div>
+      <div class="card" style="border-color:var(--color-primary);">
+        <h3>Not measured yet, so not claimed</h3>
+        <ul class="clean">
+          <li><b>No eval run yet:</b> no APCER, BPCER, FAR, FRR or accuracy numbers today</li>
+          <li><b>Client face lock &rarr; decision</b> latency: no stored measurement yet</li>
+          <li><b>Early cloud probe</b> is live, but its speed-up is not measured</li>
+          <li><b>Online path:</b> no stored latency run includes the Rekognition call</li>
+          <li>Genuine users can be stepped up until moir&eacute; / mask bands are calibrated</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><span>FaceGuard &middot; Limits</span><span>12</span></div>
+  <aside class="notes">
+    <p>Here's what we'd tell a security reviewer. Silicone masks are the known limit of any RGB camera; depth helps but doesn't solve it, and the product answer is depth plus near-infrared hardware. The flash and the depth checks are built but not deciding yet, for the reasons on screen. On the right is everything we have not measured, which is why there is no number for it anywhere in this deck. We say "iBeta Level 1-style", not certified. The roadmap on the next slide closes these gaps.</p>
+    <p class="src"><b>Sources:</b> no measured numbers on this slide. Limits: CLAUDE.md section 8 honesty rules; config/thresholds.yaml marks moire and mask M2 as [cal]; licences per docs/ARCHITECTURE.md section 8. Eval not run: eval/results/ contains no metrics file (only latency files and tests_20261114T1705Z.txt). Online path: eval/results/latency_edge_1280_20261114T171323Z.md states cloud not configured, Rekognition time box NOT included. Early probe live: GET /v1/mode 22:41 IST rekognition_probe_deadline_ms 1500; no stored probe measurement.</p>
+  </aside>
+</section>
+
+<!-- ============================ 13. SCALE + ROADMAP ============================ -->
+<section class="slide" data-title="Scale and roadmap">
+  <div class="slide-content" style="gap:24px;">
+    <div class="kicker">SCALE &amp; ROADMAP</div>
+    <h2 class="title" style="font-size:58px;">From one kiosk to a campus fleet</h2>
+    <div style="display:grid; grid-template-columns: 1fr 1.1fr; gap:32px;">
+      <div class="card">
+        <h3>How it scales</h3>
+        <ul class="clean">
+          <li><b>Edge per door, cloud per campus:</b> each kiosk decides locally, so adding doors adds no work to the 2 s path</li>
+          <li><b>Per-kiosk bundles:</b> each kiosk gets only its own zone, schedule and users' templates, signed for that kiosk</li>
+          <li><b>Idempotent sync</b> keyed by <code>attempt_id</code> with a per-kiosk sequence, so many kiosks can reconnect at once</li>
+          <li><b>Ed25519 bundle signing:</b> kiosks hold only the public key, so a stolen kiosk cannot forge a schedule</li>
+          <li><b>ap-south-1 (Mumbai)</b> in production for DPDP data residency</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Roadmap, in order</h3>
+        <ul class="clean">
+          <li><b>1. Run the eval:</b> iBeta Level 1-<b>style</b> protocol, ISO/IEC 30107-3 APCER / BPCER with bounds</li>
+          <li><b>2. Calibrate</b> moir&eacute; / mask bands on the eval <b>dev split</b>, freeze them, then score the test split</li>
+          <li><b>3. Enforce the flash nonce</b> after the kiosk frame timing is re-validated</li>
+          <li><b>4. Depth go-live:</b> enable TrueDepth after the 10 live vs 10 print calibration passes</li>
+          <li><b>5. AWS Face Liveness</b> as an optional cloud step-up, never on the 2 s path</li>
+          <li><b>6.</b> HID card / mobile ID fusion; CEN/TS 18099 injection testing; licensed matcher</li>
+        </ul>
+      </div>
+    </div>
+    <div class="banner" style="font-size:25px;">Every roadmap item tightens or measures; none of them loosens the fail-secure rules.</div>
+  </div>
+  <div class="foot"><span>FaceGuard &middot; Scale &amp; roadmap</span><span>13</span></div>
+  <aside class="notes">
+    <p>How this grows. Every door gets its own edge, every campus one cloud. Because the edge decides locally, adding doors doesn't slow anyone down. Each kiosk gets its own signed bundle with only its zone, its schedule and its users, and sync is idempotent, so a whole building coming back online at once is safe. In production we'd switch from HMAC to Ed25519, so a stolen kiosk can't sign a schedule, and pin Mumbai for data residency. The roadmap, in order: run the evaluation, calibrate on the dev split and freeze, enforce the flash, turn on depth after calibration, add AWS Face Liveness as a cloud step-up, then HID card and mobile ID fusion and formal injection testing.</p>
+    <p class="src"><b>Sources:</b> no measured numbers on this slide; no cost figures (docs/DEMO_AND_PITCH.md section 3 says any cost must be marked "list price, to verify"; none is shown). Per-kiosk bundles and caches = docs/ARCHITECTURE.md C14 and data table (hid_users "used only to build per-kiosk caches"; per-kiosk bundles cut from hid_state). Per-kiosk seq + hash chain = docs/ARCHITECTURE.md (offline log ordering). Idempotent sync keyed by attempt_id = SC2 slide sources. Ed25519 production / HMAC-SHA256 today = docs/ARCHITECTURE.md section 8 bundle integrity row. ap-south-1 = CLAUDE.md section 3 and cloud/SANDBOX.md section 0 (sandbox is us-east-1 only). Dev/test split, iBeta Level 1-style = eval protocol (designed, not run). Depth H4 = CLAUDE.md section 10. Face Liveness step-up = cloud POST /v1/liveness/session (docs/DEMO_AND_PITCH.md section 3). Roadmap order = docs/DEMO_AND_PITCH.md section 2 row 11.</p>
+  </aside>
+</section>
+
+<!-- ============================ 14. THANK YOU ============================ -->
+<section class="slide" data-title="Thank you">
+  <div class="slide-content" style="justify-content:center; align-items:flex-start; gap:30px;">
+    <div class="kicker">THANK YOU</div>
+    <h1 style="font-size:120px; line-height:1.0; font-weight:800;"><span class="grad">Questions?</span></h1>
+    <p class="lead" style="font-size:40px; color:var(--color-text);">Spot the spoof, check the schedule, never fail open.</p>
+    <div style="display:flex; gap:22px;">
+      <span class="pill allow">ALLOW</span>
+      <span class="pill verify">REQUEST VERIFICATION</span>
+      <span class="pill deny">DENY</span>
+    </div>
+    <div class="grid3" style="width:100%; margin-top:20px;">
+      <div class="card"><h3 style="font-size:28px;">Local-first</h3><p style="font-size:24px;">The edge always decides; offline is a mode, not a failure.</p></div>
+      <div class="card"><h3 style="font-size:28px;">Explainable</h3><p style="font-size:24px;">Reason codes and scores on every decision.</p></div>
+      <div class="card"><h3 style="font-size:28px;">Honest</h3><p style="font-size:24px;">Measured numbers with bounds; limits named.</p></div>
+    </div>
+    <p style="font-size:28px;">Team <b>CipherTrust</b> &middot; HID Hackathon 2026</p>
+  </div>
+  <div class="foot"><span>FaceGuard</span><span>14</span></div>
+  <aside class="notes">
+    <p>Thank you. To sum up: we spot the spoof, check the schedule, and never fail open. The edge always decides, every decision is explained, and we only claim what we measured. Happy to take questions. Likely ones, with answers in docs/DEMO_AND_PITCH.md section 3: "Does step-up break 2 s?" (no, it is a decision in itself), "Why not AWS Face Liveness?" (too slow for the door, needs the cloud), "Is offline a security hole?" (offline is stricter), and "Is it certified?" (no, iBeta Level 1-style).</p>
+    <p class="src"><b>Sources:</b> no numbers on this slide.</p>
+  </aside>
+</section>
+
+</div><!-- /.slide-deck -->
+
+<div id="notesPanel"></div>
+<div class="help">&larr; &rarr; navigate &middot; N notes &middot; F fullscreen</div>
+<div class="nav-controls">
+  <button class="nav-btn" onclick="prevSlide()" aria-label="Previous slide">&larr;</button>
+  <span class="slide-counter"><span id="current">1</span> / <span id="total">14</span></span>
+  <button class="nav-btn" onclick="nextSlide()" aria-label="Next slide">&rarr;</button>
+</div>
+
+<script>
+(function () {
+  const deck = document.getElementById('deck');
+  const slides = Array.from(document.querySelectorAll('.slide'));
+  const total = slides.length;
+  const panel = document.getElementById('notesPanel');
+  let current = 1;
+  document.getElementById('total').textContent = total;
+
+  function fit() {
+    const s = Math.min(window.innerWidth / 1920, window.innerHeight / 1080);
+    deck.style.transform = 'scale(' + s + ') translate(-50%, -50%)';
+    deck.style.transformOrigin = '0 0';
+    deck.style.left = '50%'; deck.style.top = '50%';
+    deck.style.transform = 'translate(-50%, -50%) scale(' + s + ')';
+    deck.style.transformOrigin = 'center center';
+  }
+
+  function renderNotes() {
+    const n = slides[current - 1].querySelector('aside.notes');
+    panel.innerHTML = '<h4>SPEAKER NOTES &middot; SLIDE ' + current + ' &middot; ' +
+      (slides[current - 1].dataset.title || '') + '</h4>' + (n ? n.innerHTML : '');
+  }
+
+  window.showSlide = function (n) {
+    current = Math.max(1, Math.min(total, n));
+    slides.forEach((s, i) => s.classList.toggle('active', i === current - 1));
+    document.getElementById('current').textContent = current;
+    document.getElementById('progressBar').style.width = (current / total * 100) + '%';
+    renderNotes();
+    if (location.hash !== '#' + current) history.replaceState(null, '', '#' + current);
+  };
+  window.nextSlide = () => showSlide(current + 1);
+  window.prevSlide = () => showSlide(current - 1);
+
+  document.addEventListener('keydown', (e) => {
+    if (['ArrowRight', 'PageDown', ' '].includes(e.key)) { e.preventDefault(); nextSlide(); }
+    else if (['ArrowLeft', 'PageUp'].includes(e.key)) { e.preventDefault(); prevSlide(); }
+    else if (e.key === 'Home') showSlide(1);
+    else if (e.key === 'End') showSlide(total);
+    else if (e.key === 'n' || e.key === 'N') panel.classList.toggle('show');
+    else if (e.key === 'f' || e.key === 'F') {
+      if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {});
+      else document.exitFullscreen();
+    }
+  });
+  document.addEventListener('click', (e) => {
+    if (e.target.closest('.nav-controls') || e.target.closest('#notesPanel')) return;
+    nextSlide();
+  });
+
+  window.addEventListener('resize', fit);
+  fit();
+  const start = parseInt((location.hash || '#1').slice(1), 10);
+  showSlide(isNaN(start) ? 1 : start);
+
+  /* ---- Results chart: values copied from eval/results/latency_edge_1280_20261114T171323Z.md (n = 40) ---- */
+  if (window.Chart) {
+    Chart.defaults.font.family = getComputedStyle(document.documentElement).getPropertyValue('--typography-font-body');
+    Chart.defaults.font.size = 18;
+    Chart.defaults.color = '#A9B6CE';
+    new Chart(document.getElementById('latencyChart'), {
+      type: 'bar',
+      data: {
+        labels: ['Decode + detect + quality', 'Liveness branch', 'Match branch', 'Policy decide', 'Server total'],
+        datasets: [
+          { label: 'p50', data: [17.5, 55.0, 57.0, 1.0, 76.0], backgroundColor: '#3BA4FF', borderRadius: 6 },
+          { label: 'p95', data: [24.0, 76.6, 71.0, 2.0, 106.4], backgroundColor: 'rgba(59,164,255,.40)', borderColor: '#3BA4FF', borderWidth: 2, borderRadius: 6 }
+        ]
+      },
+      options: {
+        indexAxis: 'y', responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: {
+          legend: { position: 'top', align: 'end', labels: { boxWidth: 18, font: { size: 18 } } },
+          tooltip: { callbacks: { label: (c) => c.dataset.label + ': ' + c.raw + ' ms' } }
+        },
+        scales: {
+          x: { beginAtZero: true, grid: { color: 'rgba(255,255,255,.07)' }, title: { display: true, text: 'ms (liveness and match run in parallel)', font: { size: 17 } } },
+          y: { grid: { display: false }, ticks: { font: { size: 19 }, color: '#F1F5FB' } }
+        }
+      }
+    });
+  }
+})();
+</script>
+</body>
+</html>

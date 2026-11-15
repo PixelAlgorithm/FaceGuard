@@ -1,0 +1,87 @@
+#!/bin/bash
+# EC2 user-data for the HID kiosk cloud API (Amazon Linux 2023, x86_64). Rendered by deploy_ec2.sh.
+# No AWS credentials are ever placed on the instance: code and app.env are fetched once over HTTPS via
+# short-lived presigned URLs; AWS access (if any) comes from the instance profile.
+set -euo pipefail
+exec > >(tee -a /var/log/hid-cloud-bootstrap.log) 2>&1
+echo "HID_BOOT start $(date -u +%FT%TZ)"
+
+dnf install -y python3.11 openssl >/dev/null
+id hid >/dev/null 2>&1 || useradd --system --home-dir /opt/hid --shell /sbin/nologin hid
+mkdir -p /opt/hid/data
+cd /opt/hid
+curl -fsS --retry 5 --retry-delay 2 -o /opt/hid/app.tgz '${HID_ARTIFACT_URL}'
+ssm_param='${HID_SSM_PARAM}'
+umask 077
+if [ -n "$ssm_param" ]; then
+  # secrets: SSM SecureString read with the instance role (never in user-data, logs or stdout)
+  for _ in 1 2 3 4 5; do
+    aws ssm get-parameter --region '${HID_REGION}' --name "$ssm_param" --with-decryption \
+      --query Parameter.Value --output text > /opt/hid/app.env 2>/dev/null && break
+    sleep 3
+  done
+else
+  curl -fsS --retry 5 --retry-delay 2 -o /opt/hid/app.env '${HID_ENV_URL}'
+fi
+umask 022
+test -s /opt/hid/app.env || { echo "HID_BOOT no app env" | tee /dev/console; exit 1; }
+chmod 600 /opt/hid/app.env
+tar -xzf /opt/hid/app.tgz -C /opt/hid && rm -f /opt/hid/app.tgz
+
+tls_mode='${HID_TLS_MODE}'
+tls_args=""
+if [ "$tls_mode" = "selfsigned" ]; then
+  tok=$(curl -fsS -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
+  pub_ip=$(curl -fsS -H "X-aws-ec2-metadata-token: $tok" http://169.254.169.254/latest/meta-data/public-ipv4)
+  pub_dns=$(curl -fsS -H "X-aws-ec2-metadata-token: $tok" http://169.254.169.254/latest/meta-data/public-hostname || true)
+  san="IP:$pub_ip"
+  [ -n "$pub_dns" ] && san="$san,DNS:$pub_dns"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 7 -subj "/CN=hid-kiosk-cloud" \
+    -addext "subjectAltName=$san" -keyout /opt/hid/tls.key -out /opt/hid/tls.crt 2>/dev/null
+  chmod 600 /opt/hid/tls.key
+  fp=$(openssl x509 -in /opt/hid/tls.crt -noout -fingerprint -sha256 | cut -d= -f2)
+  # visible via `aws ec2 get-console-output` -> the edge pins this certificate
+  echo "HID_TLS_FINGERPRINT_SHA256=$fp" | tee /dev/console
+  tls_args="--ssl-keyfile /opt/hid/tls.key --ssl-certfile /opt/hid/tls.crt"
+fi
+chown -R hid:hid /opt/hid
+
+cat >/etc/systemd/system/hid-cloud.service <<UNIT
+[Unit]
+Description=HID kiosk cloud API (FastAPI/uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=hid
+Group=hid
+WorkingDirectory=/opt/hid/app
+EnvironmentFile=/opt/hid/app.env
+Environment=PYTHONPATH=/opt/hid/app:/opt/hid/vendor
+Environment=PYTHONUNBUFFERED=1
+Environment=CLOUD_LOAD_DOTENV=0
+ExecStart=/usr/bin/python3.11 -m uvicorn cloud.app.main:app --host 0.0.0.0 --port ${HID_APP_PORT} --workers 1 --no-access-log --timeout-keep-alive 75 $tls_args
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/hid/data
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now hid-cloud
+for _ in $(seq 1 60); do
+  if curl -fsSk "http$([ "$tls_mode" = selfsigned ] && echo s)://127.0.0.1:${HID_APP_PORT}/v1/health" >/dev/null; then
+    echo "HID_BOOT healthy $(date -u +%FT%TZ)" | tee /dev/console
+    exit 0
+  fi
+  sleep 2
+done
+echo "HID_BOOT unhealthy" | tee /dev/console
+journalctl -u hid-cloud --no-pager | tail -50
+exit 1

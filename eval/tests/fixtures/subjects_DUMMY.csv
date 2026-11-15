@@ -1,0 +1,7 @@
+subject_id,split,enrolled_user_id,consent,consent_version,notes
+DUMMY_S01,dev,u_dummy1,yes,DUMMY,DUMMY
+DUMMY_S02,dev,u_dummy2,yes,DUMMY,DUMMY
+DUMMY_S03,test,u_dummy3,yes,DUMMY,DUMMY
+DUMMY_S04,test,u_dummy4,yes,DUMMY,DUMMY
+DUMMY_S05,test,u_dummy5,yes,DUMMY,DUMMY
+DUMMY_S06,test,u_dummy6,yes,DUMMY,DUMMY

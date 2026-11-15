@@ -1,0 +1,329 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		212A4E9B8A20B6DD6A26EE18 /* DepthCamera.swift in Sources */ = {isa = PBXBuildFile; fileRef = A836EF034DBC4385DC7C3B4E /* DepthCamera.swift */; };
+		3DE35968FFA4D4545284D08C /* EdgeClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 66FE4DC67446A8A4EC532A7C /* EdgeClient.swift */; };
+		6128B10B80F890F0F0F129D0 /* ProbeModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3EE138559BAEA9EAFBB19480 /* ProbeModel.swift */; };
+		8B9C6E59580422436D0A5F0B /* Diagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 741DE550599A2A7E9806CD0A /* Diagnostics.swift */; };
+		E296554F8D7510ABFB042979 /* FaceLocator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A322C825770A3F2CA2D198A /* FaceLocator.swift */; };
+		EA4FABF8B7BB2D42A1301331 /* DepthProbeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C161B9B7341AD5B80E83F7C8 /* DepthProbeApp.swift */; };
+		EF0B8A2EF997A85DF98E3A82 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3EE08D0F7CD7E6451140E1FD /* ContentView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		1FEB944021027A9C0F8B69EC /* DepthProbe.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = DepthProbe.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		3EE08D0F7CD7E6451140E1FD /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		3EE138559BAEA9EAFBB19480 /* ProbeModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProbeModel.swift; sourceTree = "<group>"; };
+		66FE4DC67446A8A4EC532A7C /* EdgeClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EdgeClient.swift; sourceTree = "<group>"; };
+		741DE550599A2A7E9806CD0A /* Diagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Diagnostics.swift; sourceTree = "<group>"; };
+		7A322C825770A3F2CA2D198A /* FaceLocator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FaceLocator.swift; sourceTree = "<group>"; };
+		A836EF034DBC4385DC7C3B4E /* DepthCamera.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DepthCamera.swift; sourceTree = "<group>"; };
+		C161B9B7341AD5B80E83F7C8 /* DepthProbeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DepthProbeApp.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		53CA06862BC0E4CBBAA6F06C /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				1FEB944021027A9C0F8B69EC /* DepthProbe.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		937C66D9CFAEC5AD7983641C /* DepthProbe */ = {
+			isa = PBXGroup;
+			children = (
+				3EE08D0F7CD7E6451140E1FD /* ContentView.swift */,
+				A836EF034DBC4385DC7C3B4E /* DepthCamera.swift */,
+				C161B9B7341AD5B80E83F7C8 /* DepthProbeApp.swift */,
+				741DE550599A2A7E9806CD0A /* Diagnostics.swift */,
+				66FE4DC67446A8A4EC532A7C /* EdgeClient.swift */,
+				7A322C825770A3F2CA2D198A /* FaceLocator.swift */,
+				3EE138559BAEA9EAFBB19480 /* ProbeModel.swift */,
+			);
+			path = DepthProbe;
+			sourceTree = "<group>";
+		};
+		B0F69E29E884CC06F094FB70 = {
+			isa = PBXGroup;
+			children = (
+				937C66D9CFAEC5AD7983641C /* DepthProbe */,
+				53CA06862BC0E4CBBAA6F06C /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		6A2BDC0532935B553A380638 /* DepthProbe */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 68C72237AE296DE43B5B34F0 /* Build configuration list for PBXNativeTarget "DepthProbe" */;
+			buildPhases = (
+				D75DD94554F2C0C1F83F3EE5 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = DepthProbe;
+			packageProductDependencies = (
+			);
+			productName = DepthProbe;
+			productReference = 1FEB944021027A9C0F8B69EC /* DepthProbe.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		4636A8FF22AF9684D2D39A16 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					6A2BDC0532935B553A380638 = {
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 723004B97929F5BEE3FAF9C4 /* Build configuration list for PBXProject "DepthProbe" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = B0F69E29E884CC06F094FB70;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 53CA06862BC0E4CBBAA6F06C /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				6A2BDC0532935B553A380638 /* DepthProbe */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		D75DD94554F2C0C1F83F3EE5 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				EF0B8A2EF997A85DF98E3A82 /* ContentView.swift in Sources */,
+				212A4E9B8A20B6DD6A26EE18 /* DepthCamera.swift in Sources */,
+				EA4FABF8B7BB2D42A1301331 /* DepthProbeApp.swift in Sources */,
+				8B9C6E59580422436D0A5F0B /* Diagnostics.swift in Sources */,
+				3DE35968FFA4D4545284D08C /* EdgeClient.swift in Sources */,
+				E296554F8D7510ABFB042979 /* FaceLocator.swift in Sources */,
+				6128B10B80F890F0F0F129D0 /* ProbeModel.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		08D92E33B41EF78727C44877 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_PREVIEWS = NO;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = DepthProbe/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.3.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.prajwalm.depthprobe;
+				PRODUCT_NAME = DepthProbe;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		0C94B5773109DD53641696B2 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_PREVIEWS = NO;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = DepthProbe/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.3.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.prajwalm.depthprobe;
+				PRODUCT_NAME = DepthProbe;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		0D8E506E72C126F252C2F1DE /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_STRICT_CONCURRENCY = minimal;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		A2DF7C661A89B272ED28C529 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_STRICT_CONCURRENCY = minimal;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		68C72237AE296DE43B5B34F0 /* Build configuration list for PBXNativeTarget "DepthProbe" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				08D92E33B41EF78727C44877 /* Debug */,
+				0C94B5773109DD53641696B2 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		723004B97929F5BEE3FAF9C4 /* Build configuration list for PBXProject "DepthProbe" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0D8E506E72C126F252C2F1DE /* Debug */,
+				A2DF7C661A89B272ED28C529 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 4636A8FF22AF9684D2D39A16 /* Project object */;
+}

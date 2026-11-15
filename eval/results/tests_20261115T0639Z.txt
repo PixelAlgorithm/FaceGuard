@@ -1,0 +1,5 @@
+# Gate round 2 (verifier PASS) 2026-11-15T06:39:42Z
+edge+policy+offline+depth: 1721 passed
+cloud: 272 passed
+eval: 130 passed
+kiosk: tsc OK, oxlint OK, contract 369 passed 0 failed, vite build OK

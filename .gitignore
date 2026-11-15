@@ -1,0 +1,23 @@
+# secrets & env
+.env
+*.pem
+*.key
+# models & data (biometric data never committed)
+models/
+eval/captures/
+edge/data/
+*.sqlite
+*.db
+# python
+__pycache__/
+.venv/
+.pytest_cache/
+.ruff_cache/
+# node
+node_modules/
+dist/
+.vite/
+# os
+.DS_Store
+# live deploy state (may hold keys/IDs)
+cloud/infra/.state/

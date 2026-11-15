@@ -1,0 +1,66 @@
+{
+  "window": {
+    "since": "2026-11-14T17:15:44.888039Z",
+    "until": "2026-11-14T17:16:21.468192Z"
+  },
+  "attempts": 4,
+  "decisions": {
+    "DENY": 4
+  },
+  "by_mode": {
+    "ONLINE": 4
+  },
+  "reason_codes": {
+    "SCHEDULE_OUTSIDE_WINDOW": 3,
+    "LIVENESS_UNSURE": 1,
+    "INJECTION_VIRTUAL_CAMERA": 1
+  },
+  "latency_ms": {
+    "face_lock_to_decision_server": {
+      "p50": 1062.5,
+      "p95": 2172.3,
+      "n": 4
+    },
+    "liveness": {
+      "p50": 120.0,
+      "p95": 125.1,
+      "n": 4
+    },
+    "match": {
+      "p50": 125.5,
+      "p95": 141.5,
+      "n": 4
+    },
+    "policy": {
+      "p50": 1.5,
+      "p95": 3.7,
+      "n": 4
+    },
+    "quality": {
+      "p50": 44.0,
+      "p95": 64.5,
+      "n": 4
+    },
+    "schedule": {
+      "p50": 0.0,
+      "p95": 0.0,
+      "n": 4
+    },
+    "total": {
+      "p50": 171.5,
+      "p95": 209.1,
+      "n": 4
+    },
+    "client": {
+      "p50": 1094.0,
+      "p95": 1124.6,
+      "n": 3
+    }
+  },
+  "by_label": {},
+  "sync": {
+    "queue_depth": 0,
+    "last_sync_at": "2026-11-14T17:16:07.827598Z"
+  },
+  "note": "latency_ms.client = kiosk-measured face lock -> decision rendered; other stages are edge-side; face_lock_to_decision_server uses the kiosk clock (same host)"
+}

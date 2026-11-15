@@ -1,0 +1,40 @@
+{
+  "name": "hid-kiosk",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "assets": "node scripts/fetch-assets.mjs",
+    "predev": "node scripts/fetch-assets.mjs",
+    "dev": "vite",
+    "predev:mock": "node scripts/fetch-assets.mjs",
+    "dev:mock": "vite --mode mock",
+    "prebuild": "node scripts/fetch-assets.mjs",
+    "build": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json && node scripts/contract-test.ts && vite build",
+    "test": "node scripts/contract-test.ts",
+    "test:contract": "node scripts/contract-test.ts",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
+    "lint": "oxlint",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-vision": "1.2.3",
+    "qrcode": "1.5.4",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.5",
+    "@types/node": "^24.19.2",
+    "@types/qrcode": "^1.5.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "oxlint": "^1.90.0",
+    "tailwindcss": "^4.3.5",
+    "typescript": "~7.0.2",
+    "vite": "^8.3.6",
+    "yaml": "^2.9.1"
+  },
+  "description": "HID entry kiosk UI + operator dashboard (React + Vite + TS + Tailwind, MediaPipe Face Landmarker)"
+}

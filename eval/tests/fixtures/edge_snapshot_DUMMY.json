@@ -1,0 +1,100 @@
+{
+  "_comment": "DUMMY edge responses for snapshot_metrics.py --fixture (dry run). Synthetic, not a measurement.",
+  "health": {
+    "status": "ok",
+    "version": "DUMMY"
+  },
+  "mode": {
+    "mode": "ONLINE",
+    "policy_version": "DUMMY",
+    "kiosk_id": "KIOSK_DUMMY",
+    "zone": "LIBRARY",
+    "rate_limit": {
+      "enabled": true,
+      "locked": false,
+      "retry_after_s": null
+    },
+    "policy_bars": {
+      "flash_enforce": false,
+      "moire_enforce": true,
+      "m2_rgb_enforce": true,
+      "rekognition": true
+    }
+  },
+  "metrics": {
+    "window": {
+      "since": null,
+      "until": "2026-11-14T06:30:00Z"
+    },
+    "attempts": 3,
+    "decisions": {
+      "ALLOW": 1,
+      "DENY": 2
+    },
+    "by_mode": {
+      "ONLINE": 3
+    },
+    "reason_codes": {
+      "ACCESS_OK": 1,
+      "SPOOF_FLASH_MISMATCH": 1,
+      "SPOOF_PASSIVE": 1,
+      "SPOOF_DEVICE_DETECTED": 1
+    },
+    "latency_ms": {
+      "client": {
+        "p50": 1400,
+        "p95": 1500,
+        "n": 3
+      },
+      "total": {
+        "p50": 300,
+        "p95": 350,
+        "n": 3
+      }
+    },
+    "by_label": {},
+    "sync": {
+      "queue_depth": 0,
+      "last_sync_at": null
+    }
+  },
+  "attempts": {
+    "att_DUMMY0001": {
+      "attempt_id": "att_DUMMY0001",
+      "decision": "ALLOW",
+      "stage": "final",
+      "reason_codes": [
+        "ACCESS_OK"
+      ],
+      "mode": "ONLINE",
+      "scores": {
+        "pad_mean": 0.93,
+        "match_local": 0.71
+      },
+      "latency_ms": {
+        "total": 319
+      },
+      "policy_version": "DUMMY",
+      "candidate": {
+        "user_id": "u_dummy1",
+        "display": "DUMMY NAME"
+      }
+    },
+    "att_DUMMY0002": {
+      "attempt_id": "att_DUMMY0002",
+      "decision": "ALLOW",
+      "stage": "final",
+      "reason_codes": [
+        "ACCESS_OK"
+      ],
+      "mode": "ONLINE",
+      "scores": {
+        "pad_mean": 0.9
+      },
+      "latency_ms": {
+        "total": 301
+      },
+      "policy_version": "DUMMY"
+    }
+  }
+}

@@ -1,0 +1,16 @@
+---
+name: depth-iphone
+description: Builds depth/ (iPhone 16 Pro Max is available; gated at H4) — a small SwiftUI iOS app 'DepthProbe' (depth/ios/) reading the iPhone 16 Pro Max front TrueDepth camera via AVFoundation/ARKit, which long-polls GET /v1/depth/pending and pushes 1–3 depth frames per attempt to the edge with POST /v1/depth/frames, plus depth/checks.py for D0–D4 (flatness, curvature, nose relief, valid pixels, scale) and mask cues M1–M3. Use only for iPhone depth work.
+---
+You own `depth/` (`depth/ios/` DepthProbe app + `dist/` IPAs, `depth/checks.py`, `depth/calibrate.py`, `depth/protocol.py`, `depth/tests/`). Read `docs/IPHONE_SETUP.md` (the route used today: unsigned IPA sideloaded by the operator; Record3D is paid and NOT used; no :8765 bridge), `docs/API.md` v1.1 (`/v1/depth/pending`, `/v1/depth/frames`, `depth_nonce`, `DepthFramesMeta.accuracy`), `docs/DECISION_POLICY.md` §3.3–3.4, `config/thresholds.yaml` (`liveness.depth`, `liveness.mask`) and the depth section of the `liveness-kiosk` skill. `docs/research/**` is non-normative background.
+
+**Status (2026-11-14):** DepthProbe v0.2.0 is sideloaded and connected to the edge's LAN listener (`0.0.0.0:8001`, `X-Depth-Token`). `liveness.depth.enabled` stays `false` until the **H4 calibration** passes: `python -m depth.calibrate serve` with ≥ 10 live + ≥ 10 printed-photo PASSIVE captures, then `summary` must say GO. Only policy-engine flips the flag.
+
+Rules:
+- Use the FRONT TrueDepth camera, not rear LiDAR. Continuity Camera carries no depth.
+- Push model: the app captures depth **during the colour-flash capture window** (plus one frame during the mouth challenge for M1) and pushes it; the edge never pulls. Late depth is ignored (`NOT_AVAILABLE`, no effect on the decision).
+- Xcode: run every Xcode command with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` (xcode-select still points at the Command Line Tools; no sudo needed). The free-team profile from this Mac is banned on the device, so ship an **unsigned IPA** (`depth/ios/dist/DepthProbe-<version>.ipa`; recipe in `docs/IPHONE_SETUP.md`) that the operator sideloads and re-signs with their own tool. Bump `MARKETING_VERSION` in `depth/ios/project.yml` for every new IPA. The installed iOS Simulator has no TrueDepth camera: use it for compile/UI checks only, never for depth numbers or the go/no-go.
+- Go/no-go at hour 4: DepthProbe runs on the physical phone, a depth result reaches the edge for a real attempt, AND D1 rejects a printed photo while passing a live face. If not, stop and report — the lead drops it to a roadmap slide.
+- Send 1–3 depth frames (+1 JPEG, intrinsics) per attempt via the contract in `docs/API.md` v1.1, never a depth video stream. Depth maps stay in RAM on the edge.
+- Thresholds from `config/thresholds.yaml` (depth section); the calibration CLI logs measured values (numbers and labels only, never depth maps, images or the token) to `depth/calibration/depth_calibration.csv`. Report the H4 verdict with its rule-of-3 bound; it is a go/no-go, not an accuracy claim.
+- Run `depth.calibrate serve` on its own port: it falls back to 8002 when the live edge holds 8001. Never stop or rebind the live edge's listener, and never test against the live `:8000` edge.

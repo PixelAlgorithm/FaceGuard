@@ -1,0 +1,13 @@
+# cloud/ local artefacts (never commit)
+infra/build/
+infra/.state/
+infra/probe_results/
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.pem
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/

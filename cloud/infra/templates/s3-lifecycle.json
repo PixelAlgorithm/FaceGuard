@@ -1,0 +1,57 @@
+{
+  "Rules": [
+    {
+      "ID": "audit-frames-1d",
+      "Filter": {
+        "Prefix": "audit/"
+      },
+      "Status": "Enabled",
+      "Expiration": {
+        "Days": 1
+      }
+    },
+    {
+      "ID": "liveness-output-1d",
+      "Filter": {
+        "Prefix": "liveness/"
+      },
+      "Status": "Enabled",
+      "Expiration": {
+        "Days": 1
+      }
+    },
+    {
+      "ID": "deploy-artifacts-1d",
+      "Filter": {
+        "Prefix": "deploy/"
+      },
+      "Status": "Enabled",
+      "Expiration": {
+        "Days": 1
+      }
+    },
+    {
+      "ID": "enrol-reference-1d",
+      "Filter": {
+        "Prefix": "enroll/"
+      },
+      "Status": "Enabled",
+      "Expiration": {
+        "Days": 1
+      }
+    },
+    {
+      "ID": "everything-else-1d",
+      "Filter": {
+        "Prefix": ""
+      },
+      "Status": "Enabled",
+      "Expiration": {
+        "Days": 1
+      },
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 1
+      }
+    }
+  ]
+}

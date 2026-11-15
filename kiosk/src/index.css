@@ -1,0 +1,148 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+  /* Decision tones: each pairs with an icon + headline (never colour alone). Contrast >= 5.5:1. */
+  --color-allow: #0b7a2b;
+  --color-allow-ink: #ffffff;
+  --color-stepup: #f2a900;
+  --color-stepup-ink: #111111;
+  --color-deny: #b71c1c;
+  --color-deny-ink: #ffffff;
+  --color-kiosk: #0b0b0b;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #0b0b0b;
+  color: #ffffff;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Mirror ONLY the preview. Uploaded frames and inference use the raw (unmirrored) stream. */
+.mirror {
+  transform: scaleX(-1);
+}
+
+/* Face oval: the huge box-shadow darkens (or, during capture, tints) everything outside the oval. */
+.face-oval {
+  position: absolute;
+  left: 50%;
+  top: 47%;
+  width: min(44vh, 70vw);
+  height: min(60vh, 95vw);
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  box-shadow: 0 0 0 200vmax rgba(0, 0, 0, 0.55);
+  transition:
+    box-shadow 40ms ease-out,
+    opacity 200ms ease;
+  pointer-events: none;
+}
+
+.face-ring {
+  position: absolute;
+  left: 50%;
+  top: 47%;
+  width: min(44vh, 70vw);
+  height: min(60vh, 95vw);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  overflow: visible;
+}
+
+/* Colour-flash light source: OPAQUE full-viewport fill (no alpha), above the preview, ~40 ms soft edges. */
+.flash-fill {
+  position: fixed;
+  inset: 0;
+  z-index: 45;
+  opacity: 0;
+  pointer-events: none;
+  /* no transition: the colour must change exactly in the frame that flash_events timestamps */
+}
+
+.text-shadow {
+  text-shadow:
+    0 2px 12px rgba(0, 0, 0, 0.85),
+    0 0 2px rgba(0, 0, 0, 0.9);
+}
+
+@keyframes countdown-shrink {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+.countdown-bar {
+  transform-origin: left center;
+  animation-name: countdown-shrink;
+  animation-timing-function: linear;
+  animation-fill-mode: forwards;
+}
+
+@keyframes soft-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+.soft-pulse {
+  animation: soft-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes pop-in {
+  from {
+    transform: scale(0.85);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+.pop-in {
+  animation: pop-in 180ms ease-out;
+}
+
+/* Decision screen: fully opaque from its FIRST painted frame (the rendered timestamp must mean
+   "the person can see the decision"), only the content settles in. */
+@keyframes settle-in {
+  from {
+    transform: scale(0.97);
+  }
+  to {
+    transform: scale(1);
+  }
+}
+.settle-in {
+  animation: settle-in 160ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .soft-pulse,
+  .spin,
+  .pop-in,
+  .settle-in {
+    animation: none;
+  }
+}

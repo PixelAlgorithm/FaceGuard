@@ -1,0 +1,27 @@
+[project]
+name = "hid-eval"
+version = "0.1.0"
+description = "HID kiosk evaluation harness: capture logger, ISO/IEC 30107-3 PAD metrics, FMR/FNMR, latency, SC1/SC2 scenarios"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "numpy>=1.26,<2.3",
+  "scipy>=1.11",
+  "matplotlib>=3.8",
+  "httpx>=0.27",
+  "pyyaml>=6.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"

@@ -1,0 +1,38 @@
+# REFERENCE ONLY - not used for pass/fail. The SC1/SC2 gate is keyed by docs/POLICY_TEST_CASES.md IDs
+# (sections 5-7), parsed at run time by scenarios/cases.py (lead decision, round 2). This file maps the
+# superseded pad-evaluation skill IDs (S1-x / S2-x) to those IDs and lists the live demonstrations that the
+# operator logs with `capture.py --scenario <ID>` (rows excluded from PAD metrics, shown as live evidence).
+
+legacy_skill_ids:
+  S1-1: Q01        # inside window -> ALLOW
+  S1-2: S04        # outside window -> DENY SCHEDULE_OUTSIDE_WINDOW
+  S1-3: [S01, S02] # grace -> STEP_UP, TOTP -> ALLOW
+  S1-4: S09        # zone not permitted
+  S1-5: S21        # holiday / campus closure
+  S1-6: S13        # high-risk zone in window -> second factor
+  S1-7: L03        # biometric UNSURE in window -> STEP_UP (core section 2)
+  S1-8: S30        # spoof + schedule never evaluated
+  S1-9: O25        # unusable schedule bundle -> fail-secure
+  S1-10: null      # window boundary minute: no normative vector yet (start <= t < end per SURPRISE_CHALLENGES SC1.2)
+  S2-1: X02        # heartbeat misses -> OFFLINE
+  S2-3: O01        # offline ALLOW, low-risk zone
+  S2-4: [O04, O06] # offline high-risk -> STEP_UP -> TOTP ALLOW
+  S2-5: O14        # offline UNSURE -> STEP_UP + second factor
+  S2-6: O17        # offline spoof -> DENY
+  S2-7: O19        # expired bundle -> staff override only
+  S2-8: [O06, O07] # TOTP ok / wrong twice -> DENY (max_attempts_per_step = 2)
+  S2-9: [D01, D02, D03]  # minimal encrypted store
+  S2-10: [X04, Y01]      # reconnect drains queue; idempotent replay
+  S2-11: Q10       # rate limit
+  invalid_bundle: O24
+
+live_demos:  # docs/DEMO_AND_PITCH.md run sheet order; log each with capture.py --scenario <ID>
+  - Q01   # live enrolled user, LIBRARY 10:05 -> ALLOW
+  - L01   # A4 print -> DENY SPOOF_PASSIVE
+  - L05   # phone photo -> DENY SPOOF_DEVICE_DETECTED
+  - S04   # outside window -> DENY
+  - S01   # grace -> STEP_UP (then S02 TOTP -> ALLOW)
+  - S13   # server room in window -> STEP_UP second factor
+  - O01   # offline ALLOW, low-risk
+  - O04   # offline server room -> STEP_UP fallback (then O06 TOTP -> ALLOW)
+  - O17   # offline phone spoof -> DENY

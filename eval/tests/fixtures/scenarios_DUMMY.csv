@@ -1,0 +1,6 @@
+run_id,ts_utc,scenario_id,challenge,title,backend,status,expected,observed_decision,observed_codes,detail,policy_case
+DUMMY-SC1,2026-11-14T07:00:00.000Z,S04,SC1,DUMMY S04,runtime,PASS,see scenarios.yaml,DENY,SCHEDULE_OUTSIDE_WINDOW,DUMMY,
+DUMMY-SC1,2026-11-14T07:00:01.000Z,S01,SC1,DUMMY S01,runtime,FAIL,see scenarios.yaml,ALLOW,ACCESS_OK,DUMMY,
+DUMMY-SC1,2026-11-14T07:00:02.000Z,O01,SC2,DUMMY O01,runtime,PASS,see scenarios.yaml,ALLOW,ACCESS_OK;OFFLINE_MODE,DUMMY,
+DUMMY-SC1,2026-11-14T07:00:03.000Z,Y01,SC2,DUMMY Y01,runtime,BLOCKED,see scenarios.yaml,,,DUMMY,
+DUMMY-SC1,2026-11-14T07:00:04.000Z,Q01,CORE,DUMMY Q01,runtime,PASS,see scenarios.yaml,ALLOW,ACCESS_OK,DUMMY,

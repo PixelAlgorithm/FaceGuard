@@ -1,0 +1,232 @@
+Non-normative research notes (pre-build). Where they differ from docs/*.md, the docs win.
+
+HID HACKATHON 2026 - "CAN YOU SPOT A SPOOF?"
+Basic Solution Idea (summary)
+=====================================================================
+
+1. THE PROBLEM
+---------------------------------------------------------------------
+An HID entry kiosk must tell a REAL, PRESENT person from a spoof
+(printed photo, photo on a screen, video replay, 3D/printed mask),
+check that the person is the enrolled user, and decide within 2 seconds:
+
+  ALLOW                - live person + identity match
+  REQUEST VERIFICATION - unsure (bad light, unclear face) -> retake / action / OTP
+  DENY                 - spoof found OR identity does not match
+
+Organiser targets: 99.4% liveness acc, 99.2% face-auth acc,
+0.2% FAR, 0.6% FRR, decision < 2 s.
+
+
+2. OUR IDEA IN ONE LINE
+---------------------------------------------------------------------
+Passive checks first, extra checks only when unsure: fast automatic
+checks + face match run AT THE SAME TIME on every attempt, and
+the user is asked to do something (smile / OTP) only in the
+uncertain middle zone.
+
+
+3. HOW IT WORKS (pipeline)
+---------------------------------------------------------------------
+ STEP 1  CAPTURE (browser, React + MediaPipe Face Landmarker)
+         - Lock onto the face; quality check: one face, frontal pose,
+           sharp, enough light, big enough.
+         - Bad quality -> REQUEST VERIFICATION (retake) right away.
+         - During ~1 s capture the screen flashes a random 3-4 colour
+           sequence chosen by the server. A real 3D face reflects
+           those colours in sync; phone screens / prints don't (or lag).
+         - Check for virtual cameras (OBS, ManyCam) = injection attack.
+
+ STEP 2  LIVENESS (server, FastAPI on warm CPU EC2, AWS Mumbai)
+         Runs in PARALLEL with Step 3:
+         - MiniFASNet anti-spoof models (tiny ~2 MB, Apache-2.0)
+           on 3-5 frames.
+         - Object detector: phone / laptop / TV around the face?
+         - FFT moire check: screen stripe patterns.
+         - Colour-flash reflection check (recomputed on server).
+
+ STEP 3  FACE AUTHENTICATION
+         - Amazon Rekognition SearchUsersByImage (1:N) against
+           enrolled users / CompareFaces (1:1).
+         - Backup + threshold tuning: InsightFace buffalo_l (ArcFace).
+
+ STEP 4  DECISION (fusion with two thresholds per signal)
+         - Every signal has a PASS line and a FAIL line; anything in
+           between = REQUEST VERIFICATION.
+             anti-spoof score >= 0.8 on 3 of 5 frames = pass, <= 0.3 = fail
+             flash correlation >= 0.7 = pass, < 0.3 = fail
+             face similarity: high = match, low = no match
+         - Clear evidence (phone in frame, wrong flash, virtual cam)
+           = DENY.
+         - ONE mask warning sign -> REQUEST VERIFICATION;
+           SEVERAL strong signs together -> DENY.
+
+ STEP-UP (only for the "unsure" case)
+         1. Retake photo
+         2. Random challenge that MUST include mouth/cheek movement
+            (smile, open mouth, puff cheeks) - NOT blink only, because
+            an eye-cut paper mask lets real eyes blink through it.
+         3. Optional: AWS Rekognition Face Liveness (slow, ~several s)
+         4. Email OTP / on-screen code / HID card fallback
+
+
+4. HOW EACH SPOOF IS CAUGHT
+---------------------------------------------------------------------
+ Printed photo     -> anti-spoof model + flat flash reflection +
+                      head-turn shows a flat plane
+ Screen replay     -> phone/laptop detector + moire + screen ignores
+                      the random flash colours
+ Video replay      -> random flash colours can't be pre-recorded;
+                      reflection timing lags by >= 1 frame
+ Paper/eye-cut mask-> smile/open-mouth challenge (paper can't bend)
+                      + sharp edges around eye holes
+ Rigid 3D mask     -> deformation challenge + skin colour reflectance
+ Silicone mask     -> honest limit of a webcam; roadmap = depth/IR camera
+
+
+5. SPEED (target < 2 s)  - estimates, measure on the day
+---------------------------------------------------------------------
+ Face lock + quality ........ ~0.3 s
+ Capture with colour flash .. ~0.8-1.0 s
+ Upload + server checks ..... ~0.3-0.5 s (liveness & match in parallel)
+ Decision + UI .............. ~0.05 s
+ TOTAL ALLOW path ........... ~1.3-1.9 s
+ (Step-up path is reported as a separate metric.)
+
+
+6. AWS ARCHITECTURE (region ap-south-1 Mumbai)
+---------------------------------------------------------------------
+ Browser kiosk (React) -> API Gateway / ALB -> FastAPI on EC2 (CPU)
+   -> Rekognition (user vectors for face match)
+   -> DynamoDB (users, attempts, decisions)
+   -> S3 + KMS encryption, short retention (audit images)
+   -> CloudWatch (latency + decision metrics)
+   -> SES email OTP (SMS to India needs TRAI DLT - not doable today)
+   -> Rekognition Face Liveness only for enrolment / step-up
+
+
+7. HOW WE PROVE IT (evaluation)
+---------------------------------------------------------------------
+ Use ISO/IEC 30107-3 metrics, not just "accuracy":
+   APCER  - % attacks wrongly accepted (report per attack type;
+            headline = worst type)
+   BPCER  - % real users wrongly rejected
+   FAR / FRR for face match + DET curve
+   Decision time p50 / p95
+ Test plan: 8-12 people x 3 lighting conditions x 6 attack types
+   (print, eye-cut print, phone photo, phone video, laptop replay,
+   mask if available), real and attack attempts mixed.
+ Honest stats: 0 failures in N tries -> true rate < 3/N (95%).
+   e.g. 0/60 attacks passed -> APCER < 5%.
+ Say "followed an iBeta Level 1-style protocol", never "certified".
+
+
+8. WHAT MAKES US DIFFERENT
+---------------------------------------------------------------------
+ - Risk-adaptive step-up: fast for real users, harder for attackers.
+ - Random colour-flash challenge (no extra hardware).
+ - Injection-attack layer (virtual camera / deepfake feed detection).
+ - Fallback to HID card / mobile credential - fits HID's access
+   control business.
+ - Reason codes for every decision ("phone detected", "low light").
+ - Live dashboard: results per attack type vs HID targets.
+ - Fairness + lighting breakdown of false rejects.
+ - Privacy: encrypted templates, short retention (DPDP Act aware).
+ Demo moment: eye-cut paper mask blinks fine... then FAILS the smile.
+
+
+9. RISKS / CAVEATS
+---------------------------------------------------------------------
+ - InsightFace weights + CelebA-Spoof data = non-commercial only
+   (fine for demo, mention it).
+ - Webcam can't reliably stop silicone masks -> roadmap item.
+ - AWS sandbox may block services; Mumbai Rekognition limits are low
+   (5 req/s) - check in the first 30 minutes.
+ - All thresholds/timings above are starting points; tune on the day.
+
+
+10. BUILD PLAN (10 hours, team of 4: Frontend / ML / AWS / Eval+Pitch)
+---------------------------------------------------------------------
+ Hour 0-1   Sandbox check, repo setup, enrol 3-4 teammates
+ Hour 1-3   Thin end-to-end path working: capture -> MiniFASNet ->
+            Rekognition -> ALLOW/DENY on screen
+ Hour 3-5   Add colour flash, phone detector, moire, step-up challenge,
+            email OTP; start collecting test attacks
+ Hour 5-6   Run test protocol, tune thresholds
+ Hour 7     FEATURE FREEZE
+ Hour 7-9   Metrics dashboard, latency numbers, slides
+ Hour 9-10  Rehearse live attack demo + judge Q&A
+
+Full research report: reports/Face liveness hackathon solution.md
+
+
+11. ADD-ON: iPHONE 16 PRO MAX DEPTH CAMERA (3D / mask check)
+---------------------------------------------------------------------
+ USE THE FRONT TrueDepth (Face ID) CAMERA, NOT THE REAR LiDAR.
+   - TrueDepth faces the user and works best at 25-50 cm (kiosk distance).
+   - Rear LiDAR faces away, is low-res (256x192 in ARKit), built for rooms,
+     and its depth is ML-filled from the RGB image (could make a print
+     look slightly 3D).
+   - Continuity Camera (iPhone as Mac webcam) sends RGB ONLY, no depth.
+     Fine as a better webcam (turn off Center Stage/Portrait effects).
+   - Raw IR image is NOT available to apps; only depth.
+
+ HOW TO GET DEPTH TO OUR SERVER
+   Option A (recommended): Record3D app -> USB -> `pip install record3d`
+     on laptop -> small Python process computes depth checks -> posts
+     result to FastAPI with the attempt ID. (~6 h, check USB streaming
+     is free in the first 15 min.)
+   Option B: our own SwiftUI + ARKit app (needs Xcode + iOS skills,
+     7-9 h; too risky without iOS experience).
+
+ DEPTH CHECKS (thresholds are estimates - tune on the day)
+   D0  valid depth pixels on face    < 40% fail / >= 60% pass
+   D1  flatness (plane fit RMS)      < 3 mm FAIL (print/screen) / > 6 mm pass
+   D2  curved fit (bent paper)       < 2 mm fail / > 4 mm pass
+   D3  nose sticks out from cheeks   < 8 mm fail / >= 15 mm pass
+   D4  real eye spacing              outside 45-80 mm = fail
+   M1  smile/open-mouth in depth: mouth area must deform while forehead
+       stays still. Rigid -> mask sign. (ARKit says "smiling" but depth
+       says rigid = strong mask sign -> DENY)
+   M2  sharp depth step around eye holes / face edge -> mask sign
+   M3  shape differs from user's enrolled depth template -> mask sign
+   Rule: D1-D4 fail = DENY. One mask sign = REQUEST VERIFICATION,
+         two or more = DENY.
+
+ WHAT IT REALLY BUYS US
+   - Prints + phone/laptop screens: almost trivially caught (flat).
+   - Paper / rigid 3D masks: caught at a basic level via M1-M3 + smile.
+   - Silicone masks: still a limit (even Face ID was fooled by a
+     ~$150 mask in 2017). Pitch line: "depth raises the bar", not "solved".
+   - Research backing: depth was the best single input on CASIA-SURF
+     (ACER 5.0% vs 11.3% RGB); on WMCA (masks) depth alone was weaker,
+     but all channels combined reached 0.3% ACER -> fusion matters.
+
+ PLAN: one person owns it. GO/NO-GO at hour 4 = stream works AND D1
+   rejects a printed photo. If not, drop it to a roadmap slide.
+ Risks: sunlight kills IR (stay indoors), phone heats up (keep on
+   power), send results + few JPEGs not raw depth video (<100 ms LAN).
+
+
+12. STARTER GITHUB REPOS (our starting layer)
+---------------------------------------------------------------------
+ 1. yakhyo/uniface (MIT, pip)  - detection, quality, MiniFASNet
+    anti-spoof, ArcFace matching, FAISS search; CPU/ONNX.
+    + yakhyo/face-anti-spoofing release: MiniFASNetV2.onnx, V1SE.onnx
+ 2. vadimgodev/face-recognition (FastAPI, MIT) - already does
+    two-threshold matching (local >= 0.8 accept, 0.6-0.8 check with
+    Rekognition) + Silent-Face anti-spoof.
+    + aws-samples/rekognition-user-vectors (helpers.py for SearchUsers)
+ 3. google-ai-edge/mediapipe-samples -> examples/face_landmarker/js
+    (browser capture + smile / open-mouth / cheek-puff blendshapes)
+    Reference: vladmandic/human demo/faceid (gating state machine)
+ 4. Colour flash: write our own (~60 lines numpy). Reference only:
+    watcharaponthod-code/ekyc server/app/flash.py (no license).
+ 5. @aws-amplify/ui-react-liveness (FaceLivenessDetector) - step-up
+    only; works in ap-south-1; needs Cognito identity pool.
+ 6. iPhone depth: marek-simonik/record3d (pip install record3d).
+ Avoid: archived vladmandic/face-api, AWS samples locked to us-east-1,
+   InsightFace weights = non-commercial.
+
+ Details: research_notes/starter_repos.md
+          research_notes/iphone_depth_liveness.md

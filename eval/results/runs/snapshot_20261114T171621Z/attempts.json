@@ -1,0 +1,84 @@
+{
+  "meta": {
+    "taken_at_utc": "2026-11-14T17:16:21.481Z",
+    "command": "python snapshot_metrics.py --edge http://127.0.0.1:8000",
+    "edge": "http://127.0.0.1:8000",
+    "fixture": null,
+    "dummy": false,
+    "switches": {
+      "thresholds_path": "/Users/prajwalm/Documents/hidhack/Project/config/thresholds.yaml",
+      "thresholds_sha256": "d9e62826253f2137db287561ede0778ce924da9fb6c4cdb1c924a15bc4e97e70",
+      "policy_version": "2026-11-14.3",
+      "flash": {
+        "enabled": true,
+        "enforce": false,
+        "state": "ADVISORY",
+        "duration_ms": 700,
+        "colours": [
+          3,
+          3
+        ]
+      },
+      "moire": {
+        "enforce": true,
+        "unsure_score": 0.4,
+        "fail_score": 0.7,
+        "require_corroboration": true
+      },
+      "mask_m2_rgb": {
+        "enforce": true,
+        "weak": 0.5,
+        "strong": 0.75
+      },
+      "pad": {
+        "pass_min": 0.8,
+        "fail_max": 0.3,
+        "min_pass_frames": 3
+      },
+      "device_detector": {
+        "unsure_conf": 0.25,
+        "fail_conf": 0.4
+      },
+      "depth_enabled": false,
+      "random_challenge": {
+        "rate_online": 0.15,
+        "rate_offline": 0.3,
+        "deformation_actions": [
+          "SMILE",
+          "OPEN_MOUTH"
+        ],
+        "secondary_actions": [
+          "BLINK",
+          "TURN_LEFT",
+          "TURN_RIGHT"
+        ]
+      },
+      "rate_limit": {
+        "enabled": true,
+        "max_failures": 5,
+        "window_s": 180,
+        "lockout_s": 5
+      },
+      "rekognition_enabled": true,
+      "match_local_allow_min_cosine": 0.5
+    },
+    "edge_config_diff": [],
+    "calls": {
+      "GET /v1/health:200": 1,
+      "GET /v1/mode:200": 1,
+      "GET /v1/metrics:200": 1
+    },
+    "n_requested": 0,
+    "n_found": 0,
+    "n_missing": 0,
+    "missing": {},
+    "attempts_csv": null,
+    "attempts_csv_sha256": null,
+    "run_id": null,
+    "privacy_findings": [
+      "mode.template_cache: forbidden key",
+      "health.detail.template_cache: forbidden key"
+    ]
+  },
+  "attempts": {}
+}

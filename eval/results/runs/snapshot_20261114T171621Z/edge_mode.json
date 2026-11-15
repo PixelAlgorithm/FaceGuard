@@ -1,0 +1,71 @@
+{
+  "mode": "ONLINE",
+  "state": "ONLINE",
+  "since": "2026-11-14T17:09:35.874354Z",
+  "forced": false,
+  "last_cloud_ok_at": "2026-11-14T17:16:19.291176Z",
+  "reason": null,
+  "schedule_bundle": {
+    "version": 45,
+    "issued_at": "2026-11-14T12:30:41Z",
+    "expires_at": "2026-11-15T00:30:41Z",
+    "signature_valid": true,
+    "cache_state": "FRESH",
+    "refresh_age_s": 13,
+    "rejected": []
+  },
+  "revocation_seq": 7,
+  "template_cache": "<redacted: privacy filter>",
+  "sync_queue_depth": 0,
+  "demo_clock": null,
+  "kiosk_id": "KIOSK_MAIN_01",
+  "zone": "MAIN_GATE",
+  "policy_version": "2026-11-14.3",
+  "rate_limit": {
+    "enabled": true,
+    "locked": false,
+    "retry_after_s": null
+  },
+  "last_sync": {
+    "at": "2026-11-14T17:16:07.827598Z",
+    "report": {
+      "accepted": 1,
+      "duplicates": 0,
+      "rejected": 0,
+      "flags": [],
+      "queue_depth": 0,
+      "ok": true,
+      "error": null,
+      "bundle": "not_modified",
+      "sent": 1,
+      "revoked_users": [],
+      "rejected_items": []
+    }
+  },
+  "server_flags": [],
+  "random_challenge": "AUTO",
+  "policy_bars": {
+    "pad_pass": 0.8,
+    "flash_pass_r": 0.7,
+    "match_allow": 0.5,
+    "match_margin": 0.1,
+    "random_rate": 0.15,
+    "ambient_exception": true,
+    "moire_unsure": 0.4,
+    "device_unsure": 0.25,
+    "flash_enforce": false,
+    "moire_enforce": true,
+    "m2_rgb_enforce": true,
+    "rekognition": true,
+    "rekognition_timeout_ms": 700,
+    "rekognition_probe_deadline_ms": 1500
+  },
+  "cloud_match": {
+    "enabled": true,
+    "recent": 4,
+    "misses": 0,
+    "last_miss_at": null,
+    "last_ok_at": "2026-11-14T17:16:06.455725Z",
+    "degraded": false
+  }
+}

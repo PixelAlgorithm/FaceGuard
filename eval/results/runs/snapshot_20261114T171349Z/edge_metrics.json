@@ -1,0 +1,23 @@
+{
+  "window": {
+    "since": "2026-11-14T17:13:49.762833Z",
+    "until": "2026-11-14T17:13:49.762833Z"
+  },
+  "attempts": 0,
+  "decisions": {},
+  "by_mode": {},
+  "reason_codes": {},
+  "latency_ms": {
+    "client": {
+      "p50": null,
+      "p95": null,
+      "n": 0
+    }
+  },
+  "by_label": {},
+  "sync": {
+    "queue_depth": 0,
+    "last_sync_at": "2026-11-14T17:09:35.874251Z"
+  },
+  "note": "latency_ms.client = kiosk-measured face lock -> decision rendered; other stages are edge-side; face_lock_to_decision_server uses the kiosk clock (same host)"
+}
