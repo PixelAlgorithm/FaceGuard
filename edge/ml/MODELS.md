@@ -2,9 +2,20 @@
 
 All weights are downloaded by `bash scripts/fetch_models.sh` into `models/`, which is gitignored.
 Each file is pinned by URL and SHA-256, and the edge re-verifies every SHA-256 at startup
-(`edge/ml/registry.py`). Weights are data only: no downloaded code is executed. The pre- and
-post-processing code is ours, apart from the numpy helpers imported from the pip package
-`uniface==4.3.0` (MIT).
+(`edge/ml/registry.py`). ONNX Runtime is never given a path: `edge/ml/onnx.make_session` reads each
+pinned file once, checks the SHA-256 of exactly those bytes and builds the session from the bytes,
+so the file cannot be swapped between the check and the load. Weights are data only: no downloaded
+code is executed. The pre- and post-processing code is ours, apart from the numpy helpers imported
+from the pip package `uniface` 4.3.0 (MIT).
+
+**Dependency pin (read before upgrading).** `edge/uv.lock` pins uniface 4.3.0 and onnxruntime
+1.32.0 (numpy 2.2.6); install with `uv sync --frozen`. `edge/pyproject.toml` still says
+`uniface>=1.0` / `onnxruntime>=1.18`, so `pip install -e edge` can pull other versions. Detection
+depends on an undocumented uniface behaviour: `generate_anchors(image_size=...)` takes
+**(height, width)** although its docstring says (width, height). A release that "fixes" this would
+transpose the priors for every non-square frame and silently degrade boxes, PAD crops, alignment and
+matching. `edge/ml/tests/test_em_perception.py::test_em13_uniface_anchor_layout_is_height_width`
+pins the layout; run the model tests after any uniface or onnxruntime upgrade.
 
 | key | file | SHA-256 | source URL | licence / caveat |
 |---|---|---|---|---|

@@ -2,7 +2,9 @@
 
 Embedding: 5-point aligned 112x112 crop -> RGB -> (x - 127.5) / 127.5 -> NCHW -> 512-d, L2-normalised.
 Search is a pure function over an immutable gallery snapshot: per-user score = max over that user's
-templates; top2 = best *different* user. Gallery = this kiosk's entitled users only (caller filters).
+templates; top2 = best *different* user. The caller searches the FULL cached gallery (minus DPDP-erased
+users, `exclude`) so the top-1 is the true nearest identity and the margin is measured against every cached
+user; entitlement is applied to that winner by the policy (schedule), never by hiding look-alikes (F1).
 """
 
 from __future__ import annotations
@@ -38,15 +40,17 @@ class Gallery:
         return set(self.user_ids)
 
 
-def search(q: np.ndarray | None, gallery: Gallery, allowed: set[str] | None = None) -> MatchScore:
-    """1:N search. `allowed` restricts the gallery (None = no restriction)."""
+def search(q: np.ndarray | None, gallery: Gallery, allowed: set[str] | None = None,
+           exclude: frozenset[str] | set[str] | None = None) -> MatchScore:
+    """1:N search. `allowed` restricts the gallery (None = no restriction); `exclude` drops users that must
+    never be a candidate (DPDP-erased). Decision paths pass `exclude` only, never `allowed` (F1)."""
     if q is None or gallery.matrix.shape[0] == 0:
         return MatchScore(top1_user=None, top1=None, top2=None, n_users=0)
     qn = q / (np.linalg.norm(q) + 1e-9)
     sims = gallery.matrix @ qn.astype(np.float32)
     best: dict[str, float] = {}
     for uid, s in zip(gallery.user_ids, sims):
-        if allowed is not None and uid not in allowed:
+        if (allowed is not None and uid not in allowed) or (exclude is not None and uid in exclude):
             continue
         if s > best.get(uid, -2.0):
             best[uid] = float(s)

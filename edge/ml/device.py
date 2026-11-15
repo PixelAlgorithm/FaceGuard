@@ -80,9 +80,13 @@ class DeviceDetector:
         self.classes = [int(c) for c in classes]
 
     def preprocess(self, bgr: np.ndarray) -> tuple[np.ndarray, float]:
+        """Letterbox onto the 416 canvas. Each resized side is clamped to >= 1 px so a degenerate
+        aspect ratio (e.g. 4 x 4096) letterboxes to a sliver instead of raising cv2.error (EM-10);
+        every other frame gets exactly the previous int(side * r) size."""
         h, w = bgr.shape[:2]
         r = min(INPUT / h, INPUT / w)
-        resized = cv2.resize(bgr, (int(w * r), int(h * r)), interpolation=cv2.INTER_LINEAR)
+        size = (min(INPUT, max(1, int(w * r))), min(INPUT, max(1, int(h * r))))
+        resized = cv2.resize(bgr, size, interpolation=cv2.INTER_LINEAR)
         canvas = np.full((INPUT, INPUT, 3), 114, dtype=np.uint8)
         canvas[: resized.shape[0], : resized.shape[1]] = resized
         return np.ascontiguousarray(canvas.transpose(2, 0, 1)[None], dtype=np.float32), r
