@@ -219,7 +219,7 @@ def test_rendered_eval_context_and_metrics(client, admin_headers):
     again = client.post(f"/v1/attempt/{s['attempt_id']}/rendered",
                         json={"face_lock_at_ms": meta["face_lock_at_ms"], "rendered_at_ms": meta["face_lock_at_ms"] + 9})
     assert again.status_code == 204  # first beacon wins; repeats ignored
-    m = client.get("/v1/metrics", params={"label": "bona_fide"}).json()
+    m = client.get("/v1/metrics", params={"label": "bona_fide"}, headers=admin_headers).json()
     assert m["latency_ms"]["client"]["n"] == 1 and m["latency_ms"]["client"]["p50"] == 1400.0
     assert m["by_label"]["bona_fide"]["n"] >= 1 and m["by_label"]["bona_fide"]["latency_ms"]["client"]["n"] == 1
     assert client.delete("/v1/admin/eval/context", headers=admin_headers).status_code == 204

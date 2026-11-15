@@ -310,7 +310,8 @@ def test_random_challenge_force_mode(lite_settings, thresholds, tmp_path):
     with lite_client(lite_ctx(lite_settings, thresholds, scratch_runtime(tmp_path))) as c:
         r = c.post("/v1/admin/random-challenge", json={"mode": "FORCE"}, headers=ADMIN)
         assert r.status_code == 200 and r.json() == {"random_challenge": "FORCE"}
-        assert c.get("/v1/mode").json()["random_challenge"] == "FORCE"
+        assert c.get("/v1/admin/mode/detail", headers=ADMIN).json()["random_challenge"] == "FORCE"
+        assert "random_challenge" not in c.get("/v1/mode").json()  # offline-verification F6: badge subset only
         assert c.post("/v1/admin/random-challenge", json={"mode": "AUTO"}, headers=ADMIN).status_code == 200
 
 
@@ -351,10 +352,10 @@ def test_kiosk_switch_never_uses_the_unsigned_example(lite_settings, thresholds,
 def test_metrics_last_sync_at_matches_mode(lite_settings, thresholds, tmp_path):
     rt = scratch_runtime(tmp_path)
     with lite_client(lite_ctx(lite_settings, thresholds, rt)) as c:
-        assert c.get("/v1/metrics").json()["sync"]["last_sync_at"] is None  # never synced
+        assert c.get("/v1/metrics", headers=ADMIN).json()["sync"]["last_sync_at"] is None  # never synced
         rt.sync.last_sync_at = datetime(2026, 11, 14, 8, 30, tzinfo=UTC)
-        at = c.get("/v1/mode").json()["last_sync"]["at"]
-        sync = c.get("/v1/metrics").json()["sync"]
+        at = c.get("/v1/admin/mode/detail", headers=ADMIN).json()["last_sync"]["at"]
+        sync = c.get("/v1/metrics", headers=ADMIN).json()["sync"]
         assert at is not None and sync["last_sync_at"] == at and sync["queue_depth"] == 0
 
 

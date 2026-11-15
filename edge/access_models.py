@@ -228,6 +228,7 @@ class AccessUsersResponse(_Strict):
     read_only: bool
     read_only_code: ReadOnlyCode | None
     read_only_reason: str | None
+    read_only_cloud_reason: str | None = None  # cloud 403 reason, unchanged (RBAC v2 D)
     mode: Literal["ONLINE", "OFFLINE"]
     kiosk_id: str
     zone: str | None

@@ -46,6 +46,13 @@ HERMETIC_ENV: dict[str, str] = {
     "FORCE_OFFLINE": "0",
     "DEMO_MODE": "1",
     "EDGE_LAN_PORT": "0",  # the LAN listener has its own test on a free port
+    "EDGE_EXTRA_ALLOWED_HOSTS": "testserver",  # TestClient's Host header (TrustedHostMiddleware, F3)
+    # RBAC v2 D test migration: the existing tests authenticate with X-Admin-Token (legacy principal); the
+    # production default (flag off -> 401) is covered by test_rbac_wiring.py
+    "AUTH_LEGACY_ADMIN_TOKEN": "1",
+    # staff sessions in these tests skip the MFA step (MFA itself is covered by test_auth_*.py and the production
+    # default by test_rbac_wiring.py)
+    "AUTH_MFA_REQUIRED_ROLES": "none",
     "EDGE_DATA_DIR": tempfile.mkdtemp(prefix="edge_test_data_"),
 }
 os.environ.update(HERMETIC_ENV)

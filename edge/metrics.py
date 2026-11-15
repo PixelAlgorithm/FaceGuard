@@ -30,20 +30,34 @@ class DecisionRecord:
     eval_label: str | None
 
 
+CP_BISECTION_STEPS = 60
+
+
+def _log_binom_cdf(k: int, n: int, p: float, log_comb: np.ndarray) -> float:
+    """log P(X <= k), X ~ Binomial(n, p), in log space (no float overflow for any n)."""
+    if p <= 0.0:
+        return 0.0
+    if p >= 1.0:
+        return -math.inf
+    i = np.arange(k + 1, dtype=np.float64)
+    terms = log_comb + i * math.log(p) + (n - i) * math.log1p(-p)
+    top = float(terms.max())
+    return top + math.log(float(np.exp(terms - top).sum()))
+
+
 def clopper_pearson_upper(k: int, n: int, alpha: float = 0.05) -> float:
-    """One-sided (1 - alpha) upper bound on a binomial proportion (bisection on the CDF)."""
-    if n <= 0:
+    """One-sided (1 - alpha) upper bound on a binomial proportion: bisection on the binomial CDF evaluated in
+    log space with lgamma (F6: the former math.comb * float form overflowed at n ~ 1000 and took seconds)."""
+    if n <= 0 or k >= n:
         return 1.0
-    if k >= n:
-        return 1.0
-
-    def cdf(p: float) -> float:
-        return sum(math.comb(n, i) * p**i * (1 - p) ** (n - i) for i in range(k + 1))
-
+    k = max(0, int(k))
+    lg_n = math.lgamma(n + 1)
+    log_comb = np.array([lg_n - math.lgamma(i + 1) - math.lgamma(n - i + 1) for i in range(k + 1)])
+    log_alpha = math.log(alpha)
     lo, hi = k / n, 1.0
-    for _ in range(60):
+    for _ in range(CP_BISECTION_STEPS):
         mid = (lo + hi) / 2
-        if cdf(mid) > alpha:
+        if _log_binom_cdf(k, n, mid, log_comb) > log_alpha:
             lo = mid
         else:
             hi = mid
@@ -54,6 +68,17 @@ def error_upper_95(k: int, n: int) -> float | None:
     if n <= 0:
         return None
     return round(3.0 / n if k == 0 else clopper_pearson_upper(k, n), 4)
+
+
+def _finite(v: Any) -> float | None:
+    """A latency value as a finite float, else None (F10: a 400-digit int or NaN must never raise here)."""
+    if isinstance(v, bool) or not isinstance(v, int | float):
+        return None
+    try:
+        f = float(v)
+    except OverflowError:
+        return None
+    return f if math.isfinite(f) else None
 
 
 def _pct(values: list[float]) -> dict[str, Any]:
@@ -80,7 +105,8 @@ class MetricsStore:
             self._client.append((datetime.now(UTC), attempt_id, float(client_latency_ms), eval_label))
 
     def record(self, response: dict[str, Any], eval_label: str | None, kind: str = "frames") -> None:
-        lat = {k: float(v) for k, v in (response.get("latency_ms") or {}).items() if isinstance(v, int | float)}
+        lat = {k: f for k, f in ((k, _finite(v)) for k, v in (response.get("latency_ms") or {}).items())
+               if f is not None}
         rec = DecisionRecord(
             ts=datetime.now(UTC),
             attempt_id=str(response.get("attempt_id")),

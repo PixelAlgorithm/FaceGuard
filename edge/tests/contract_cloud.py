@@ -30,7 +30,7 @@ from edge.config import PROJECT_ROOT
 
 KIOSK = "KIOSK_MAIN_01"
 BUNDLE_KEY = "contract-bundle-key"
-CLOUD_URL = "http://fake-cloud.test"
+CLOUD_URL = "https://fake-cloud.test"  # EAE-07: plain http is refused unless DEMO_MODE=1
 EDGE_ADMIN = "contract-edge-admin"
 CLOUD_ADMIN = "contract-cloud-admin"
 ADMIN = {"X-Admin-Token": EDGE_ADMIN}
@@ -173,8 +173,11 @@ class ContractCloud:
             raise httpx.ConnectError("fake cloud down", request=request)
         m, path = request.method, request.url.path
         body = json.loads(request.content) if request.content else None
+        query = dict(request.url.params)
+        # probe 10b: every write carries a per-call request_id (signed); recorded apart so body asserts stay exact
+        rid = (body.pop("request_id", None) if isinstance(body, dict) else None) or query.pop("request_id", None)
         self.requests.append({"method": m, "path": path, "headers": dict(request.headers), "json": body,
-                              "query": dict(request.url.params)})
+                              "query": query, "request_id": rid})
         for (fm, fp), (status, fbody, fh) in self.fail.items():
             if fm == m and path.startswith(fp):
                 return httpx.Response(status, json=fbody, headers=fh) if fbody is not None else \
@@ -312,9 +315,27 @@ class ContractCloud:
 
 
 # ================================================================== scratch edge app wired to the fake
+STAFF_PW = "orbit-tangerine-971-pytest"  # dummy, test-only
+
+
+def staff_headers(ctx: Any, username: str, roles: list[str]) -> dict[str, str]:
+    """A signed-in staff session (Authorization: Bearer) on the scratch edge's AuthService: staff_id s_<username>."""
+    from edge.auth.staff_ops import cli_principal
+
+    auth = ctx.auth
+    if not auth.staff_exists(f"s_{username}"):
+        auth.create_staff(cli_principal("pytest"), username, username.title(), roles, STAFF_PW,
+                          must_change_password=False)
+    token = auth.login_sync(username, STAFF_PW)[0]
+    return {"Authorization": f"Bearer {token}"}
+
+
 class Env:
     def __init__(self, c: TestClient, ctx: Any, cloud: ContractCloud) -> None:
         self.c, self.ctx, self.cloud = c, ctx, cloud
+
+    def staff(self, username: str = "guard01", roles: tuple[str, ...] = ("security_officer",)) -> dict[str, str]:
+        return staff_headers(self.ctx, username, list(roles))
 
     def force_offline(self) -> None:
         assert self.c.post("/v1/admin/mode", json={"force": "OFFLINE"}, headers=ADMIN).status_code == 200

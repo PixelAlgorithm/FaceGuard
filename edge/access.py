@@ -372,12 +372,27 @@ def user_row(ctx: EdgeContext, user_id: str, cloud_user: Mapping[str, Any] | Non
         return None
 
 
+READ_ONLY_CODES = ("OFFLINE", "NOT_CONFIGURED", "CLOUD_ERROR", "ENDPOINT_NOT_DEPLOYED", "CLOUD_ADMIN_TOKEN")
+
+
+def read_only_code(exc: ApiError) -> tuple[str, str | None]:
+    """(read_only_code, read_only_cloud_reason). A cloud 403 is the CLOUD_ADMIN_TOKEN class (the edge's outbound
+    credential was refused) and keeps the cloud's own reason unchanged (RBAC v2 D: ADMIN_KEY_INVALID,
+    MISSING_PERMISSION, KIOSK_NOT_BOUND, LEGACY_DISABLED ...)."""
+    reason = str(exc.extra.get("reason") or "")
+    if exc.code == "FORBIDDEN":
+        return "CLOUD_ADMIN_TOKEN", reason or None
+    return (reason if reason in READ_ONLY_CODES else "CLOUD_ERROR"), None
+
+
 async def list_view(ctx: EdgeContext) -> dict[str, Any]:
-    """GET /v1/admin/access/users (§3.18.1). Only 401 is an error: a cloud failure degrades to read-only."""
+    """GET /v1/admin/access/users (§3.18.1). Only the edge's own auth errors (401 / 403 / 503 AUTH_*, raised by
+    the route dependency) are errors: a cloud failure degrades to read-only (read_only_code says why)."""
     now = edge_now(ctx)
     cloud_payload: Mapping[str, Any] | None = None
     ro_code: str | None = None
     ro_reason: str | None = None
+    ro_cloud_reason: str | None = None
     try:
         require_online(ctx)
         got = await cloud_admin(ctx, "GET", "/v1/admin/users", label="GET /v1/admin/users")
@@ -386,9 +401,7 @@ async def list_view(ctx: EdgeContext) -> dict[str, Any]:
                            extra={"reason": "CLOUD_ERROR"})
         cloud_payload = got
     except ApiError as exc:
-        ro_code = str(exc.extra.get("reason") or "CLOUD_ERROR")
-        if ro_code not in ("OFFLINE", "NOT_CONFIGURED", "CLOUD_ERROR", "ENDPOINT_NOT_DEPLOYED", "CLOUD_ADMIN_TOKEN"):
-            ro_code = "CLOUD_ERROR"
+        ro_code, ro_cloud_reason = read_only_code(exc)
         ro_reason = exc.message
     lvb = _lvb(ctx)
     merged = _merged_lvb(ctx)
@@ -411,6 +424,7 @@ async def list_view(ctx: EdgeContext) -> dict[str, Any]:
         "source": "cloud+bundle" if cloud_payload is not None else "bundle",
         "read_only": cloud_payload is None,
         "read_only_code": ro_code,
+        "read_only_cloud_reason": ro_cloud_reason,
         "read_only_reason": ro_reason,
         "mode": edge_mode(ctx),
         "kiosk_id": ctx.settings.kiosk_id,
@@ -431,19 +445,29 @@ async def list_view(ctx: EdgeContext) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------------- cloud calls
+def connectivity_up(ctx: EdgeContext) -> bool:
+    """The cloud is reachable now: mode ONLINE, reason bundle_stale (a write is what refreshes the bundle) or the
+    monitor is SYNCING (EAE-10: connectivity is back while the offline queue drains; decisions still use the
+    offline rules, but an urgent revoke must not wait for that)."""
+    if edge_mode(ctx) == "ONLINE":
+        return True
+    status = _safe_call(ctx.runtime, "mode_status") or {}
+    if isinstance(status, Mapping) and status.get("reason") == "bundle_stale":
+        return True
+    return str(getattr(getattr(ctx.runtime, "monitor", None), "state", "")) == "SYNCING"
+
+
 def require_online(ctx: EdgeContext) -> None:
-    """ONLINE requirement of every write (§3.18): cloud configured (URL + admin token), not forced OFFLINE, and
-    mode ONLINE or reason bundle_stale (connectivity up; a write is what refreshes the bundle)."""
+    """ONLINE requirement of every write (§3.18): cloud configured (URL + outbound admin credential), not forced
+    OFFLINE, and the cloud reachable now (connectivity_up)."""
     if not ctx.cloud.enabled:
         raise ApiError("CLOUD_UNAVAILABLE", "cloud not configured (CLOUD_API_URL empty)",
                        extra={"reason": "NOT_CONFIGURED"})
-    if not ctx.settings.cloud_admin_token:
-        raise ApiError("CLOUD_UNAVAILABLE", "cloud not configured (no CLOUD_ADMIN_TOKEN / ADMIN_TOKEN for the cloud)",
-                       extra={"reason": "NOT_CONFIGURED"})
+    if not ctx.settings.cloud_admin_configured:
+        raise ApiError("CLOUD_UNAVAILABLE", "cloud not configured (no CLOUD_EDGE_PROXY_KEY / CLOUD_ADMIN_TOKEN for "
+                                            "the cloud)", extra={"reason": "NOT_CONFIGURED"})
     forced = bool(getattr(getattr(ctx.runtime, "monitor", None), "forced", False))
-    status = _safe_call(ctx.runtime, "mode_status") or {}
-    online = edge_mode(ctx) == "ONLINE" or (isinstance(status, Mapping) and status.get("reason") == "bundle_stale")
-    if forced or not online:
+    if forced or not connectivity_up(ctx):
         raise ApiError("CLOUD_UNAVAILABLE", "kiosk is OFFLINE" + (" (forced)" if forced else "")
                        + ": access changes need the cloud (the signed schedule is the source of truth)",
                        extra={"reason": "OFFLINE"})
@@ -471,9 +495,9 @@ async def cloud_admin(ctx: EdgeContext, method: str, path: str, body: dict[str, 
             raise ApiError("CLOUD_UNAVAILABLE", f"cloud endpoint {label} is not deployed on this cloud build "
                                                 "(redeploy needed)",
                            extra={"reason": "ENDPOINT_NOT_DEPLOYED", **base}) from exc
-        if exc.status == 403:
-            raise ApiError("FORBIDDEN", "cloud refused the admin token (CLOUD_ADMIN_TOKEN / ADMIN_TOKEN)",
-                           extra={"reason": "CLOUD_ADMIN_TOKEN", **base}) from exc
+        if exc.status == 403:  # RBAC v2 D: the cloud's reason (ADMIN_KEY_INVALID, MISSING_PERMISSION...) unchanged
+            raise ApiError("FORBIDDEN", f"cloud refused the edge's admin credential: {exc.message}",
+                           extra={**base, "reason": exc.reason or "CLOUD_ADMIN_TOKEN"}) from exc
         code = exc.code if exc.code in STATUS and STATUS[exc.code] == exc.status else {
             404: "NOT_FOUND", 409: "INVALID_STATE", 413: "PAYLOAD_TOO_LARGE", 422: "VALIDATION_ERROR",
             429: "RATE_LIMITED"}.get(exc.status, "VALIDATION_ERROR")
@@ -514,6 +538,7 @@ async def refresh_bundle(ctx: EdgeContext, expect_version: int | None = None) ->
     try:
         await _run(ctx, lambda: fn(expect_version=expect_version))
     except Exception as exc:  # noqa: BLE001 - CloudUnavailableError or anything else: report, never 500
+        await pull_feed(ctx)  # EAE-09: a revoke must apply to the next attempt even when the bundle pull failed
         return _refresh_out(prev, bundle_version(ctx), "failed", str(exc) or type(exc).__name__)
     await pull_feed(ctx)
     installed = bundle_version(ctx)
@@ -545,11 +570,16 @@ def _int_or_none(v: Any) -> int | None:
 
 
 # ---------------------------------------------------------------------------------- write handlers
-async def put_access(ctx: EdgeContext, user_id: str, body: AccessUpdate) -> dict[str, Any]:
+def with_actor(wire: dict[str, Any], actor: str) -> dict[str, Any]:
+    """RBAC v2 D / EAE-04: the actor is ALWAYS the authenticated principal; a client `actor` field is ignored."""
+    return {**{k: v for k, v in wire.items() if k != "actor"}, "actor": actor}
+
+
+async def put_access(ctx: EdgeContext, user_id: str, body: AccessUpdate, actor: str) -> dict[str, Any]:
     """§3.18.2: validation order model 422 -> 503 -> UNKNOWN_ROLE -> cloud -> bundle + feed pull."""
     require_online(ctx)
     check_role(body, _lvb(ctx))
-    cloud = await cloud_admin(ctx, "PUT", f"/v1/admin/users/{user_id}/access", body.wire(),
+    cloud = await cloud_admin(ctx, "PUT", f"/v1/admin/users/{user_id}/access", with_actor(body.wire(), actor),
                               label="PUT /v1/admin/users/{user_id}/access")
     cloud = cloud if isinstance(cloud, Mapping) else {}
     cbv = _int_or_none(cloud.get("bundle_version"))
@@ -580,12 +610,10 @@ async def put_access(ctx: EdgeContext, user_id: str, body: AccessUpdate) -> dict
             "user": row, "warnings": warnings}
 
 
-async def revoke(ctx: EdgeContext, user_id: str, req: RevokeRequest) -> dict[str, Any]:
+async def revoke(ctx: EdgeContext, user_id: str, req: RevokeRequest, actor: str) -> dict[str, Any]:
     """§3.18.3: cloud USER revocation (never `force`), then bundle + feed pull (SCHEDULE_REVOKED at once)."""
     require_online(ctx)
-    payload: dict[str, Any] = {"type": "USER", "target_id": user_id, "reason": req.reason}
-    if req.actor:
-        payload["actor"] = req.actor
+    payload: dict[str, Any] = {"type": "USER", "target_id": user_id, "reason": req.reason, "actor": actor}
     cloud = await cloud_admin(ctx, "POST", "/v1/admin/revocations", payload, label="POST /v1/admin/revocations")
     cloud = cloud if isinstance(cloud, Mapping) else {}
     cbv = _int_or_none(cloud.get("bundle_version"))
@@ -614,11 +642,12 @@ ROTATE_WARNING = ("Shown once: store these codes safely (each works once, for th
                   "only hashes; kiosks get them with the next bundle refresh.")
 
 
-async def rotate_codes(ctx: EdgeContext, req: CodesRotateRequest) -> dict[str, Any]:
+async def rotate_codes(ctx: EdgeContext, req: CodesRotateRequest, actor: str) -> dict[str, Any]:
     """§3.18.4: the cloud mints; the edge returns the plaintext FLAT, once (never logged / stored). Once minted it
     is always 200, also when the bundle pull fails (a shown-once secret must never be lost)."""
     require_online(ctx)
-    cloud = await cloud_admin(ctx, "POST", "/v1/admin/codes/rotate", req.wire(), label="POST /v1/admin/codes/rotate")
+    cloud = await cloud_admin(ctx, "POST", "/v1/admin/codes/rotate", with_actor(req.wire(), actor),
+                              label="POST /v1/admin/codes/rotate")
     cloud = cloud if isinstance(cloud, Mapping) else {}
     cbv = _int_or_none(cloud.get("bundle_version"))
     try:
@@ -658,6 +687,7 @@ async def refresh_route(ctx: EdgeContext) -> dict[str, Any]:
     try:
         await _run(ctx, fn)
     except Exception as exc:
+        await pull_feed(ctx)  # EAE-09: the revocation feed is independent of the bundle pull
         report = getattr(exc, "report", None) or {}
         status = str(report.get("bundle") or "")
         if status.startswith("rejected"):

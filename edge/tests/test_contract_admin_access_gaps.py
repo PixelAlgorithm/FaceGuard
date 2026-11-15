@@ -121,7 +121,7 @@ def test_revoke_rejects_padded_reason(make_env, reason):
 def test_unpadded_staff_id_and_reason_are_accepted(make_env):
     """Control: the same values without padding go through (so the 422s above are the whitespace)."""
     env = make_env()
-    r = env.c.post("/v1/admin/access/codes/rotate", json={"staff_id": "s_guard01", "count": 2}, headers=ADMIN)
+    r = env.c.post("/v1/admin/access/codes/rotate", json={"staff_id": "s_guard01", "count": 2}, headers=env.staff())
     assert r.status_code == 200, r.text
     assert env.cloud.calls("POST", "/v1/admin/codes/rotate")[0]["json"]["staff_id"] == "s_guard01"
     r = env.c.post("/v1/admin/access/users/u_3c4d/revoke", json={"reason": "ADMIN"}, headers=ADMIN)

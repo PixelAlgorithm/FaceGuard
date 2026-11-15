@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -16,19 +16,33 @@ class _In(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+# F10 / F5: every client field the edge stores or forwards is bounded to the contract (docs/API.md) so a bad value
+# is a 422 here, never a cloud 422 counted as a heartbeat miss, an unbounded string held for 600 s, or a 500.
+USER_ID_PATTERN = r"^u_[0-9a-z]{4}$"
+ATTEMPT_ID_PATTERN = r"^att_[0-9A-HJKMNP-TV-Z]{26}$"  # att_<ULID> (edge/session.py)
+KIOSK_ID_PATTERN = r"^[A-Z0-9_]{1,64}$"
+STAFF_ID_PATTERN = r"^s_[0-9a-z_]{2,32}$"
+LABEL_MAX = 256  # camera labels / user agents
+SHORT_TEXT_MAX = 128
+SECRET_TEXT_MAX = 64  # TOTP / e-mail OTP / staff codes / card ids
+EPOCH_MS_MAX = 10 ** 14  # year ~5138: any real client clock is far below; bounds latency arithmetic
+SCREEN_KEYS_MAX = 16
+EpochMs = Annotated[int, Field(ge=0, lt=EPOCH_MS_MAX)]
+
+
 # ---------------------------------------------------------------- session/start
 class ClientInfo(_In):
-    camera_label: str = ""
-    user_agent: str = ""
-    screen: dict[str, Any] = Field(default_factory=dict)
+    camera_label: str = Field(default="", max_length=LABEL_MAX)
+    user_agent: str = Field(default="", max_length=LABEL_MAX)
+    screen: dict[str, Any] = Field(default_factory=dict, max_length=SCREEN_KEYS_MAX)
 
 
 class SessionStartRequest(_In):
-    kiosk_id: str
-    claimed_user_id: str | None = None
+    kiosk_id: str = Field(pattern=KIOSK_ID_PATTERN)
+    claimed_user_id: str | None = Field(default=None, pattern=USER_ID_PATTERN)
     client: ClientInfo = Field(default_factory=ClientInfo)
     flash_enabled: bool = True
-    recapture_of: str | None = None
+    recapture_of: str | None = Field(default=None, pattern=ATTEMPT_ID_PATTERN)
 
 
 class FlashStep(BaseModel):
@@ -91,7 +105,7 @@ class ClientQuality(_In):
 
 
 class ClientSignals(_In):
-    camera_label: str = ""
+    camera_label: str = Field(default="", max_length=LABEL_MAX)
     virtual_camera_suspected: bool = False
     device_count: int | None = None
     track_settings: dict[str, Any] = Field(default_factory=dict)
@@ -101,16 +115,16 @@ class ClientSignals(_In):
 
 
 class FramesMeta(_In):
-    nonce: str
-    face_lock_at_ms: int
-    capture_started_at_ms: int
-    frame_timestamps_ms: list[int]
+    nonce: str = Field(max_length=SHORT_TEXT_MAX)
+    face_lock_at_ms: EpochMs
+    capture_started_at_ms: EpochMs
+    frame_timestamps_ms: list[EpochMs] = Field(max_length=32)
     flash_events: list[FlashEventIn] = Field(default_factory=list)
     chroma_series: list[ChromaSampleIn] = Field(default_factory=list)
     quality: ClientQuality = Field(default_factory=ClientQuality)
     client_signals: ClientSignals = Field(default_factory=ClientSignals)
     blendshapes: dict[str, float] = Field(default_factory=dict)
-    landmarks_hash: str | None = None
+    landmarks_hash: str | None = Field(default=None, max_length=SHORT_TEXT_MAX)
 
 
 # ---------------------------------------------------------------- challenge / fallback
@@ -125,9 +139,9 @@ class ChallengeMeta(BaseModel):
     (for TURN_* `baseline` is the signed yaw at the prompt; the policy evaluates the delta)."""
 
     model_config = ConfigDict(extra="forbid")
-    challenge_id: str
-    nonce: str
-    actions: list[ActionEvidence]
+    challenge_id: str = Field(max_length=SHORT_TEXT_MAX)
+    nonce: str = Field(max_length=SHORT_TEXT_MAX)
+    actions: list[ActionEvidence] = Field(max_length=8)
     same_track: bool
 
     @field_validator("actions", mode="before")
@@ -152,10 +166,12 @@ _FALLBACK_ALIASES = {
 
 class FallbackRequest(_In):
     method: FallbackMethodIn
-    code: str | None = None
-    card_id: str | None = None
-    staff_id: str | None = None
-    otp_id: str | None = None
+    code: str | None = Field(default=None, max_length=SECRET_TEXT_MAX)
+    card_id: str | None = Field(default=None, max_length=SECRET_TEXT_MAX)
+    # EA-3: any short string; a mistyped staff id is a normal wrong code for the verifier (counted toward the
+    # device backstop), never a 422 in the middle of a step-up
+    staff_id: str | None = Field(default=None, max_length=SHORT_TEXT_MAX)
+    otp_id: str | None = Field(default=None, max_length=SHORT_TEXT_MAX)
 
     @field_validator("method", mode="before")
     @classmethod
@@ -176,7 +192,7 @@ class EnrollMeta(_In):
     role: str | None = Field(default=None, max_length=32)
     consent: Literal[True]
     consent_version: str = Field(min_length=1, max_length=40)
-    card_id: str | None = None
+    card_id: str | None = Field(default=None, max_length=SECRET_TEXT_MAX)
     provision_totp: bool = True
 
 
@@ -205,8 +221,17 @@ class EnrollResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+FORCED_MODE_MAX_MINUTES = 240
+FORCED_REASON_MAX_CHARS = 200  # = the policy runtime's set_forced_mode reason limit (edge/policy/runtime_ops.py)
+
+
 class AdminModeRequest(_In):
+    """POST /v1/admin/mode (RBAC v2 D): forced OFFLINE auto-reverts to AUTO after max_minutes (runtime default
+    60); `reason` is recorded with the actor."""
+
     force: Literal["OFFLINE", "AUTO"]
+    reason: str | None = Field(default=None, max_length=FORCED_REASON_MAX_CHARS)
+    max_minutes: int | None = Field(default=None, ge=1, le=FORCED_MODE_MAX_MINUTES)
 
 
 class RandomChallengeRequest(_In):
@@ -215,8 +240,8 @@ class RandomChallengeRequest(_In):
 
 
 class RenderedRequest(_In):
-    face_lock_at_ms: int
-    rendered_at_ms: int
+    face_lock_at_ms: EpochMs
+    rendered_at_ms: EpochMs
 
 
 class EvalContext(_In):
@@ -229,13 +254,13 @@ class EvalContext(_In):
 
 class ClockRequest(_In):
     set_local: str | None = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
-    offset_s: float | None = None
+    offset_s: float | None = Field(default=None, allow_inf_nan=False)
     reset: bool = False
 
 
 class DepthFramesMeta(_In):
-    attempt_id: str
-    depth_nonce: str
+    attempt_id: str = Field(pattern=ATTEMPT_ID_PATTERN)
+    depth_nonce: str = Field(max_length=SHORT_TEXT_MAX)
     phase: Literal["PASSIVE", "CHALLENGE"] = "PASSIVE"
     depth_type: Literal["disparity", "depth"]
     dtype: Literal["float16", "float32"]

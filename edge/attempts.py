@@ -46,6 +46,7 @@ from edge.session import Attempt, AttemptStore
 log = logging.getLogger("edge.attempts")
 T0_PAST_TOLERANCE_S = 30.0  # face lock may precede session/start; older/future t0 -> server time
 T0_FUTURE_TOLERANCE_S = 2.0
+TERMINAL_DECISIONS = frozenset({"ALLOW", "DENY"})
 
 
 @dataclass
@@ -67,6 +68,9 @@ class EdgeContext:
     eval_context_since: str | None = None
     lan_server: Any = None
     lan_status: str = "disabled"
+    auth: Any = None  # edge.auth.service.AuthService (RBAC v2 D); None -> authenticated routes 503 AUTH_UNAVAILABLE
+    enrol_lock: Any = None  # asyncio.Lock created on first enrolment (EM-07)
+    user_locks: Any = None  # user_id -> asyncio.Lock: enrolment vs erasure of one user (EA-1)
 
 
 def _ms(t: float) -> int:
@@ -162,7 +166,7 @@ async def match_branch(ctx: EdgeContext, att: Attempt, frames: list[FrameAnalysi
     t = time.perf_counter()
     sel = select_match_frames(frames)
     best = max(sel, key=lambda i: frames[i].quality.laplacian_var) if sel else None
-    allowed = _entitled(ctx) if ctx.templates is not None else None
+    exclude = _match_exclusions(ctx) if ctx.templates is not None else NO_CANDIDATES
 
     async def embed_selected() -> dict[int, np.ndarray | None]:
         if ctx.templates is None:
@@ -176,8 +180,7 @@ async def match_branch(ctx: EdgeContext, att: Attempt, frames: list[FrameAnalysi
         embs = await asyncio.shield(emb_task)
         if ctx.templates is None:
             return {}
-        gallery = ctx.templates.gallery
-        return {i: search(e, gallery, allowed) for i, e in embs.items()}
+        return {i: local_search(ctx, e, exclude) for i, e in embs.items()}
 
     async def cloud() -> CloudMatch | None:
         # Ask the runtime first: if the next attempt is OFFLINE (heartbeat down, forced, stale bundle) or
@@ -186,7 +189,7 @@ async def match_branch(ctx: EdgeContext, att: Attempt, frames: list[FrameAnalysi
             cancel_probe(att)
             return None
         if att.probe is not None and att.probe.cloud_task is not None:
-            return await bind_probe(ctx, att, att.probe, emb_task, best, allowed)
+            return await bind_probe(ctx, att, att.probe, emb_task, best, exclude)
         if best is None:
             return CloudMatch(ok=False)
         # Upload a small face crop (~10-25 KB), not the full 1280 px frame: over the venue/hotspot
@@ -324,7 +327,7 @@ async def start_probe(ctx: EdgeContext, att: Attempt, jpeg: bytes) -> dict[str, 
 
 
 async def bind_probe(ctx: EdgeContext, att: Attempt, probe: ProbeState, frame_embs: asyncio.Future,
-                     best: int | None, allowed: set[str] | None) -> CloudMatch:
+                     best: int | None, exclude: frozenset[str] | None) -> CloudMatch:
     """Use the probe's cloud result only if it is provably the same person as the uploaded frames:
     probe local top-1 user == best frame local top-1 user AND cosine(probe, best frame) >=
     match.local.allow_min_cosine. Deadline = rekognition_probe_deadline - time since probe start (>= 0).
@@ -358,7 +361,7 @@ async def bind_probe(ctx: EdgeContext, att: Attempt, probe: ProbeState, frame_em
     cm, p_emb, f_emb = await asyncio.gather(cloud_result(), probe_emb(), best_emb())
     out = probe.outcome
     out.update({"waited_ms": _ms(t), "remaining_ms_at_frames": round(remaining * 1000)})
-    binding, cos = identity_binding(ctx, p_emb, f_emb, allowed)
+    binding, cos = identity_binding(ctx, p_emb, f_emb, exclude)
     out.update({"binding": binding, "cosine": cos})
     if cm is None:
         out["used"], result = False, CloudMatch(ok=False)
@@ -378,7 +381,7 @@ async def bind_probe(ctx: EdgeContext, att: Attempt, probe: ProbeState, frame_em
 
 
 def identity_binding(ctx: EdgeContext, p_emb: np.ndarray | None, f_emb: np.ndarray | None,
-                     allowed: set[str] | None) -> tuple[str, float | None]:
+                     exclude: frozenset[str] | None) -> tuple[str, float | None]:
     """("ok" | "no_templates" | "no_embedding" | "no_local_match" | "user_mismatch" | "low_cosine", cosine)."""
     if ctx.templates is None:
         return "no_templates", None
@@ -387,8 +390,7 @@ def identity_binding(ctx: EdgeContext, p_emb: np.ndarray | None, f_emb: np.ndarr
     pn = p_emb / (np.linalg.norm(p_emb) + 1e-9)
     fn = f_emb / (np.linalg.norm(f_emb) + 1e-9)
     cos = round(float(pn.astype(np.float32) @ fn.astype(np.float32)), 4)
-    gallery = ctx.templates.gallery
-    p_top, f_top = search(p_emb, gallery, allowed).top1_user, search(f_emb, gallery, allowed).top1_user
+    p_top, f_top = local_search(ctx, p_emb, exclude).top1_user, local_search(ctx, f_emb, exclude).top1_user
     if p_top is None or f_top is None:
         return "no_local_match", cos
     if p_top != f_top:
@@ -428,6 +430,28 @@ def register_erase_hook(ctx: EdgeContext) -> bool:
     return True
 
 
+def register_reconcile_hook(ctx: EdgeContext) -> bool:
+    """EM-01: once the runtime confirms an ONLINE bundle pull + applied erasures (runtime.add_reconcile_hook,
+    called with real UTC now), mark the template cache validated so its age counts from that reconcile. A failed
+    marker write is logged and the cache is NOT marked (it then ages out: fail-secure)."""
+    add = getattr(ctx.runtime, "add_reconcile_hook", None)
+    templates = ctx.templates
+    mark = getattr(templates, "mark_validated", None)
+    if not callable(add) or not callable(mark):
+        return False
+
+    def reconcile(now: datetime) -> None:
+        try:
+            mark(now)
+        except Exception as exc:  # noqa: BLE001 - TemplateStoreError: never mark on failure
+            log.error("template cache validation marker not written: %s", type(exc).__name__)
+            return
+        report_template_cache(ctx)
+
+    add(reconcile)
+    return True
+
+
 def _match_deadline_s(ctx: EdgeContext) -> float:
     """Total budget for the cloud match = latency_budget_ms.rekognition_timeout (YAML)."""
     v = getattr(ctx.cloud, "match_timeout_s", None)
@@ -461,20 +485,36 @@ def _face_crop_jpeg(fa: FrameAnalysis, *, margin: float = 0.6, max_side: int = 3
     return buf.tobytes() if ok else None
 
 
-def _entitled(ctx: EdgeContext) -> set[str] | None:
-    """Gallery filter = users entitled at this kiosk's zone (runtime.entitled_user_ids(): verified bundle
-    + revocation feed). Revoked / unentitled users are never a match candidate.
+NO_CANDIDATES = None  # _match_exclusions() result when the runtime cannot say who must never match
 
-    No last valid bundle (LVB) at all: the cache is searched unfiltered, only so the identity result
-    is honest; DECISION_POLICY §9.5 I1a/I2a then DENY SCHEDULE_BUNDLE_INVALID + CONTACT_DESK anyway (no
-    zone, no verified override list). LVB present (incl. the clock-rollback case I1b/I2b, STEP_UP staff
-    override only): filtered as usual. A runtime that cannot answer -> empty set (no candidate, fail-secure).
-    """
-    bundles = getattr(ctx.runtime, "bundles", None)
-    if bundles is not None and getattr(bundles, "lvb", None) is None:
-        return None
-    ids = _safe_call(ctx.runtime, "entitled_user_ids")
-    return set(ids) if ids is not None else set()
+
+def _match_exclusions(ctx: EdgeContext) -> frozenset[str] | None:
+    """F1: the local search ranks the FULL cached gallery; the policy applies entitlement to the winner
+    (schedule: revoked -> SCHEDULE_REVOKED, unentitled -> NO_ENTITLEMENT), so a revoked or expired look-alike is
+    the top-1 (and DENY) instead of being hidden while someone entitled is matched in its place. Only users that
+    must never be a candidate at all (DPDP-erased / erase pending: runtime.excluded_user_ids()) are dropped.
+
+    Returns the exclude set, or NO_CANDIDATES (None) when the runtime cannot answer (raises, or offers neither
+    excluded_user_ids nor the older entitled_user_ids API): no local candidate at all (fail-secure). A runtime
+    with only entitled_user_ids (pre-F1 API) gets an empty exclude set; erased users' templates are deleted by
+    the erase hook there."""
+    rt = ctx.runtime
+    fn = getattr(rt, "excluded_user_ids", None)
+    if callable(fn):
+        try:
+            ids = fn()
+        except Exception:
+            log.exception("runtime.excluded_user_ids failed")
+            return NO_CANDIDATES
+        return frozenset(str(i) for i in ids) if isinstance(ids, set | frozenset | list | tuple) else NO_CANDIDATES
+    return frozenset() if callable(getattr(rt, "entitled_user_ids", None)) else NO_CANDIDATES
+
+
+def local_search(ctx: EdgeContext, emb: np.ndarray | None, exclude: frozenset[str] | None) -> MatchScore:
+    """search() over the full cached gallery minus `exclude` (NO_CANDIDATES -> empty score)."""
+    if ctx.templates is None or exclude is NO_CANDIDATES:
+        return MatchScore(top1_user=None, top1=None, top2=None, n_users=0)
+    return search(emb, ctx.templates.gallery, exclude=exclude)
 
 
 def _safe_call(obj: Any, name: str, *args, **kw):
@@ -539,8 +579,9 @@ def finish(ctx: EdgeContext, att: Attempt, resp: dict[str, Any], *, kind: str) -
     cand = (resp.get("candidate") or {}).get("user_id") if isinstance(resp.get("candidate"), dict) else None
     if cand:
         att.candidate_user_id = cand
-    ctx.metrics.record(resp, att.eval_label, kind=kind)
-    ctx.events.publish("decision", {**resp, "eval": att.eval_tags})
+    _observe(ctx, att, resp, kind)
+    if resp.get("decision") in TERMINAL_DECISIONS:
+        _safe_call(ctx.depth, "drop", att.attempt_id)  # EAE-15: no depth state outlives the attempt
     log.info(json.dumps({
         "ts": datetime.now(UTC).isoformat().replace("+00:00", "Z"), "event": f"decision_{kind}",
         "attempt_id": att.attempt_id, "decision": resp.get("decision"), "mode": resp.get("mode"),
@@ -549,6 +590,19 @@ def finish(ctx: EdgeContext, att: Attempt, resp: dict[str, Any], *, kind: str) -
         "eval": att.eval_tags,
     }))
     return resp
+
+
+def _observe(ctx: EdgeContext, att: Attempt, resp: dict[str, Any], kind: str) -> None:
+    """Metrics + SSE for a decision that already exists (F10): an observer failure is logged, never turned into
+    an HTTP 500 after the runtime persisted the decision."""
+    try:
+        ctx.metrics.record(resp, att.eval_label, kind=kind)
+    except Exception:
+        log.exception("metrics.record failed for %s", att.attempt_id)
+    try:
+        ctx.events.publish("decision", {**resp, "eval": att.eval_tags})
+    except Exception:
+        log.exception("events.publish failed for %s", att.attempt_id)
 
 
 def _policy_version(ctx: EdgeContext) -> str:
@@ -734,15 +788,23 @@ async def process_challenge(ctx: EdgeContext, att: Attempt, meta: ChallengeMeta,
     return resp
 
 
+def offered_methods(att: Attempt) -> list[str]:
+    """Second-factor methods of the step the kiosk is answering (the edge's latest response, incl. R11
+    re-issues). The step's own offer decides the EMAIL_OTP branch, never the runtime's mode right now (F9)."""
+    methods = ((att.last_response or {}).get("next_action") or {}).get("methods") or []
+    return [str(m) for m in methods] if isinstance(methods, list) else []
+
+
 async def process_fallback(ctx: EdgeContext, att: Attempt, req: FallbackRequest) -> dict:
     t = time.perf_counter()
     verified = None
-    if req.method == "EMAIL_OTP" and ctx.cloud.enabled and str(_safe_call(ctx.runtime, "mode")) == "ONLINE":
+    if req.method == "EMAIL_OTP" and "EMAIL_OTP" in offered_methods(att):
         if not (req.otp_id and req.code):
             raise ApiError("VALIDATION_ERROR", "EMAIL_OTP needs otp_id and code", att.attempt_id)
-        verified = await ctx.cloud.otp_verify(att.attempt_id, req.otp_id, req.code)
-        if verified is None:  # R11: cloud verify timeout/error is not attack evidence
-            _safe_call(ctx.runtime, "record_cloud_result", False)
+        verified = await ctx.cloud.otp_verify(att.attempt_id, req.otp_id, req.code) if ctx.cloud.enabled else None
+        if verified is None:  # R11: the cloud cannot judge the code now (outage / mode flip): not attack evidence
+            if ctx.cloud.enabled:
+                _safe_call(ctx.runtime, "record_cloud_result", False)
             resp = await drop_method(ctx, att, "EMAIL_OTP")
             return finish(ctx, att, merge_latency(dict(resp), {"fallback_edge": _ms(t)}), kind="fallback")
     sub = FallbackSubmission(method=req.method, code=req.code, card_id=req.card_id, staff_id=req.staff_id,
