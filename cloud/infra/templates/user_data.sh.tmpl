@@ -1,7 +1,8 @@
 #!/bin/bash
 # EC2 user-data for the HID kiosk cloud API (Amazon Linux 2023, x86_64). Rendered by deploy_ec2.sh.
-# No AWS credentials are ever placed on the instance: code and app.env are fetched once over HTTPS via
-# short-lived presigned URLs; AWS access (if any) comes from the instance profile.
+# No AWS credentials and no secrets are ever placed in user-data: the code comes over HTTPS via a
+# short-lived presigned URL (verified against its SHA-256 before extraction) and the app env is read from the
+# SSM SecureString with the instance role. The root volume is encrypted (deploy_ec2.sh block-device mapping).
 set -euo pipefail
 exec > >(tee -a /var/log/hid-cloud-bootstrap.log) 2>&1
 echo "HID_BOOT start $(date -u +%FT%TZ)"
@@ -9,20 +10,19 @@ echo "HID_BOOT start $(date -u +%FT%TZ)"
 dnf install -y python3.11 openssl >/dev/null
 id hid >/dev/null 2>&1 || useradd --system --home-dir /opt/hid --shell /sbin/nologin hid
 mkdir -p /opt/hid/data
+chmod 700 /opt/hid/data
 cd /opt/hid
 curl -fsS --retry 5 --retry-delay 2 -o /opt/hid/app.tgz '${HID_ARTIFACT_URL}'
+echo '${HID_ARTIFACT_SHA256}  /opt/hid/app.tgz' | sha256sum -c - \
+  || { echo "HID_BOOT artifact sha256 mismatch" | tee /dev/console; exit 1; }
 ssm_param='${HID_SSM_PARAM}'
 umask 077
-if [ -n "$ssm_param" ]; then
-  # secrets: SSM SecureString read with the instance role (never in user-data, logs or stdout)
-  for _ in 1 2 3 4 5; do
-    aws ssm get-parameter --region '${HID_REGION}' --name "$ssm_param" --with-decryption \
-      --query Parameter.Value --output text > /opt/hid/app.env 2>/dev/null && break
-    sleep 3
-  done
-else
-  curl -fsS --retry 5 --retry-delay 2 -o /opt/hid/app.env '${HID_ENV_URL}'
-fi
+# secrets: SSM SecureString read with the instance role (never in user-data, logs or stdout)
+for _ in 1 2 3 4 5; do
+  aws ssm get-parameter --region '${HID_REGION}' --name "$ssm_param" --with-decryption \
+    --query Parameter.Value --output text > /opt/hid/app.env 2>/dev/null && break
+  sleep 3
+done
 umask 022
 test -s /opt/hid/app.env || { echo "HID_BOOT no app env" | tee /dev/console; exit 1; }
 chmod 600 /opt/hid/app.env
@@ -36,11 +36,11 @@ if [ "$tls_mode" = "selfsigned" ]; then
   pub_dns=$(curl -fsS -H "X-aws-ec2-metadata-token: $tok" http://169.254.169.254/latest/meta-data/public-hostname || true)
   san="IP:$pub_ip"
   [ -n "$pub_dns" ] && san="$san,DNS:$pub_dns"
-  openssl req -x509 -newkey rsa:2048 -nodes -days 7 -subj "/CN=hid-kiosk-cloud" \
+  openssl req -x509 -newkey rsa:2048 -nodes -days '${HID_TLS_CERT_DAYS}' -subj "/CN=hid-kiosk-cloud" \
     -addext "subjectAltName=$san" -keyout /opt/hid/tls.key -out /opt/hid/tls.crt 2>/dev/null
   chmod 600 /opt/hid/tls.key
   fp=$(openssl x509 -in /opt/hid/tls.crt -noout -fingerprint -sha256 | cut -d= -f2)
-  # visible via `aws ec2 get-console-output` -> the edge pins this certificate
+  # visible via `aws ec2 get-console-output` -> deploy_ec2.sh pins the certificate only on an exact match
   echo "HID_TLS_FINGERPRINT_SHA256=$fp" | tee /dev/console
   tls_args="--ssl-keyfile /opt/hid/tls.key --ssl-certfile /opt/hid/tls.crt"
 fi
@@ -60,6 +60,8 @@ EnvironmentFile=/opt/hid/app.env
 Environment=PYTHONPATH=/opt/hid/app:/opt/hid/vendor
 Environment=PYTHONUNBUFFERED=1
 Environment=CLOUD_LOAD_DOTENV=0
+# Port ${HID_APP_PORT} is reachable only from the security-group CIDR (deploy_ec2.sh --cidr). Behind API Gateway the
+# gateway -> instance hop is plain HTTP over the public network (see cloud/SANDBOX.md, "port 9000 exposure").
 ExecStart=/usr/bin/python3.11 -m uvicorn cloud.app.main:app --host 0.0.0.0 --port ${HID_APP_PORT} --workers 1 --no-access-log --timeout-keep-alive 75 $tls_args
 Restart=always
 RestartSec=2

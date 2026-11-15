@@ -8,7 +8,7 @@ ledger history with Synthetic=false at the original received_at minute, so dashb
     cloud/.venv/bin/python -m cloud.tools.backfill_metrics --cutover 2026-11-14T12:00:00Z --apply  # publish once
 
 --cutover = when the new server started serving (records/alerts at or after it were already emitted with the
-dimension). Idempotent: a marker item (hid_state pk=backfill) is written with a conditional put; a second
+dimension). Idempotent: a marker item (state table pk=backfill) is written with a conditional put; a second
 --apply refuses. PutMetricData accepts timestamps up to 14 days old.
 """
 
@@ -70,14 +70,18 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--profile", default="hid-sandbox")
     ap.add_argument("--region", default="us-east-1")
+    # per-stack table names (cloud/infra/common.sh; recorded in the stack state file)
+    ap.add_argument("--ddb-users", default="hid_users")
+    ap.add_argument("--ddb-decisions", default="hid_decisions")
+    ap.add_argument("--ddb-state", default="hid_state")
     a = ap.parse_args(argv)
     import boto3
 
     from cloud.app.services.kv import DynamoKV
 
     sess = boto3.session.Session(profile_name=a.profile, region_name=a.region)
-    kv = DynamoKV(sess.client("dynamodb"), users_table="hid_users", decisions_table="hid_decisions",
-                  state_table="hid_state")
+    kv = DynamoKV(sess.client("dynamodb"), users_table=a.ddb_users, decisions_table=a.ddb_decisions,
+                  state_table=a.ddb_state)
     dec, items, alerts = plan(kv, a.cutover)
     data = datums(dec, items, alerts)
     print(f"real decisions={sum(dec.values())} accepted-items={sum(items.values())} alerts={sum(alerts.values())} "

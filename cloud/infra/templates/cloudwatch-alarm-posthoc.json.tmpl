@@ -1,6 +1,6 @@
 {
-  "AlarmName": "${HID_PREFIX}-post-hoc-revoked",
-  "AlarmDescription": "An offline ALLOW was granted to a user whose revocation was already effective (SC2.6 ALERT_REVOKED_USER_ADMITTED).",
+  "AlarmName": "${ALARM_NAME}",
+  "AlarmDescription": "SC2.6 sync alert ${ALERT_NAME} raised by a kiosk sync (ALERT_REVOKED_USER_ADMITTED = an offline ALLOW for a user whose revocation was already effective).",
   "Namespace": "HIDKiosk",
   "MetricName": "SyncAlerts",
   "Dimensions": [
@@ -10,7 +10,7 @@
     },
     {
       "Name": "Alert",
-      "Value": "ALERT_REVOKED_USER_ADMITTED"
+      "Value": "${ALERT_NAME}"
     },
     {
       "Name": "Synthetic",
@@ -22,5 +22,8 @@
   "EvaluationPeriods": 1,
   "Threshold": 1,
   "ComparisonOperator": "GreaterThanOrEqualToThreshold",
-  "TreatMissingData": "notBreaching"
+  "TreatMissingData": "notBreaching",
+  "ActionsEnabled": true,
+  "AlarmActions": ${ALARM_ACTIONS_JSON},
+  "OKActions": ${ALARM_ACTIONS_JSON}
 }

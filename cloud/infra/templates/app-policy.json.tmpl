@@ -65,7 +65,22 @@
       "Action": [
         "ses:SendEmail"
       ],
-      "Resource": "*"
+      "Resource": "arn:aws:ses:${HID_REGION}:${ACCOUNT_ID}:identity/*",
+      "Condition": {
+        "StringEquals": {
+          "ses:FromAddress": "${SES_FROM_ADDRESS}"
+        }
+      }
+    },
+    {
+      "Sid": "AppDataKey",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:GenerateDataKey"
+      ],
+      "Resource": "${KMS_KEY_ARN}"
     },
     {
       "Sid": "Metrics",

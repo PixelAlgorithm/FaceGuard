@@ -6,10 +6,11 @@
   4. (optional --cleanup) DELETE /v1/enroll/<user> erasure
 
 Local (FACE_BACKEND=fake):  cloud/.venv/bin/python -m cloud.tools.smoke
-Deployed (Rekognition):     cloud/.venv/bin/python -m cloud.tools.smoke --base https://<api> \\
+Deployed (Rekognition):     cloud/.venv/bin/python -m cloud.tools.smoke --live --base https://<api> \\
                               --user u_smoke_<name> --images ~/consented/frames/ --probe ~/consented/probe.jpg --cleanup
 Real faces only of consenting team members; --cleanup deletes the Rekognition user + faces afterwards.
-Every request is echoed as a curl command (secrets as $ENV placeholders).
+Every request is echoed as a curl command (secrets as $ENV placeholders). A non-local --base needs --live
+(CIT-12: a CLOUD_API_URL left in the shell must never turn a local smoke into live traffic).
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from cloud.tools import redact, targets
 from cloud.tools.cloudclient import CloudClient, load_keys, sign_items
 from cloud.tools.fakeimg import make_fake_jpeg
 
@@ -39,7 +41,7 @@ def show(title: str, resp, curl: str, *, body_note: str | None = None) -> dict:
     except ValueError:
         data = {"raw": resp.text}
     print(f"HTTP {resp.status_code}  X-Latency-Ms: {resp.headers.get('x-latency-ms')}")
-    print(json.dumps(data, indent=2)[:3000])
+    print(json.dumps(redact.redact_json(data), indent=2)[:3000])
     return data
 
 
@@ -53,8 +55,10 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--probe", help="JPEG probe for /v1/match (real face)")
     ap.add_argument("--cleanup", action="store_true")
     ap.add_argument("--cafile")
+    targets.add_live_flag(ap)
     a = ap.parse_args(argv)
-    keys = load_keys()
+    targets.require_target(a.base, live=a.live)
+    keys = load_keys(a.kiosk)
     c = CloudClient(a.base, a.kiosk, keys, verify=a.cafile or True)
     ok = True
 

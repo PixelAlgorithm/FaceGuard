@@ -7,10 +7,13 @@
 #
 # Usage (from anywhere):  bash scripts/fetch_models.sh            # fetch missing / verify existing
 #                         bash scripts/fetch_models.sh --force    # re-download everything
+# FG_MODELS_DIR overrides the target directory (tests; default <repo>/models).
+# Downloads go to a randomised hidden temp file next to the destination (portable mktemp: the X's are
+# trailing, which BSD/macOS requires) and are removed on any exit, so an interrupted run never blocks the next.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODELS="$ROOT/models"
+MODELS="${FG_MODELS_DIR:-$ROOT/models}"
 FIXTURES="$MODELS/fixtures"
 FORCE="${1:-}"
 mkdir -p "$MODELS" "$FIXTURES"
@@ -33,6 +36,11 @@ EOF
 
 sha256_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
 
+tmp=""
+cleanup() { if [ -n "$tmp" ]; then rm -f "$tmp"; fi; }
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
+
 fail=0
 while IFS='|' read -r dest sha url; do
   [ -z "$dest" ] && continue
@@ -44,15 +52,16 @@ while IFS='|' read -r dest sha url; do
     fi
     echo "corrupt  $name (sha256 mismatch) -> re-downloading"
   fi
-  tmp="$(mktemp "$dest.XXXX.part")"
+  tmp="$(mktemp "$(dirname "$dest")/.$name.XXXXXX")"
   if ! curl -fsSL --retry 3 --max-time 300 -o "$tmp" "$url"; then
-    echo "FAILED   $name (download error: $url)"; rm -f "$tmp"; fail=1; continue
+    echo "FAILED   $name (download error: $url)"; rm -f "$tmp"; tmp=""; fail=1; continue
   fi
   got="$(sha256_of "$tmp")"
   if [ "$got" != "$sha" ]; then
-    echo "FAILED   $name sha256 $got != pinned $sha"; rm -f "$tmp"; fail=1; continue
+    echo "FAILED   $name sha256 $got != pinned $sha"; rm -f "$tmp"; tmp=""; fail=1; continue
   fi
   mv "$tmp" "$dest"
+  tmp=""
   echo "fetched  $name  sha256=$sha"
 done <<< "$FILES"
 

@@ -1,10 +1,11 @@
 """Measure client-side latency from this machine to the cloud API (keep-alive connection, like the edge).
 
-    cloud/.venv/bin/python -m cloud.tools.latency --base https://<api> --n 20 --image /tmp/noface.jpg
+    cloud/.venv/bin/python -m cloud.tools.latency --live --base https://<api> --n 20 --image /tmp/noface.jpg
 
 GET /v1/health (public) and POST /v1/match with a NON-FACE JPEG (Rekognition answers "no face"). Reports
 n, p50, p95 (nearest rank; with n=20 p95 is the 19th-smallest sample), min, max of client wall time, and
-the server-side X-Latency-Ms. The first request (TCP + TLS setup) is reported separately.
+the server-side X-Latency-Ms. The first request (TCP + TLS setup) is reported separately. A non-local --base
+needs --live (CIT-12).
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import sys
 import time
 import uuid
 
+from cloud.tools import targets
 from cloud.tools.cloudclient import CloudClient
 
 
@@ -41,7 +43,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--n", type=int, default=20)
     ap.add_argument("--image", required=True, help="non-face JPEG")
     ap.add_argument("--kiosk", default="KIOSK_MAIN_01")
+    targets.add_live_flag(ap)
     a = ap.parse_args(argv)
+    targets.require_target(a.base, live=a.live)
     c = CloudClient(a.base, a.kiosk)
     base = a.base.rstrip("/")
     img_b64 = base64.b64encode(open(a.image, "rb").read()).decode()
